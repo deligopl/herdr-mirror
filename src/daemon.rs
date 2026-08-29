@@ -406,40 +406,6 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     }
 }
 
-/// Does this local pane already have a live streamer?
-///
-/// Asks herdr what is actually running in the pane, rather than inferring it
-/// from a global `ps` scan and string-matching argv. That inference is what
-/// previously required a host-identity token in the argv, end-of-argument
-/// anchoring so `work` could not match `work-staging`, and a compatibility
-/// shim for streamers predating that token. None of it is needed to answer the
-/// only question that matters: is something already running in THIS pane.
-///
-/// Generation-agnostic by construction — every streamer ever shipped is
-/// `herdr-mirror pane …`, whatever flags follow.
-async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
-    let v = local.request("pane.process_info", json!({ "pane_id": pane_id })).await.ok()?;
-    let procs = v.pointer("/process_info/foreground_processes")?.as_array()?;
-    Some(procs.iter().any(|p| {
-        p.get("argv").and_then(|a| a.as_array()).is_some_and(|argv| is_streamer_argv(argv))
-    }))
-}
-
-fn streamer_recovery_needed(process_info_live: Option<bool>, pidfile_live: bool) -> bool {
-    process_info_live == Some(false) && !pidfile_live
-}
-
-/// Is this foreground process one of our pane wrappers?
-///
-/// argv[0] is the resolved exe path, which varies by install (release build,
-/// plugin checkout, `cargo run`), so it is matched by suffix. argv[1] pins the
-/// subcommand so an unrelated `herdr-mirror status` in the pane is not mistaken
-/// for a live stream.
-fn is_streamer_argv(argv: &[Value]) -> bool {
-    argv.first().and_then(|s| s.as_str()).is_some_and(|e| e.ends_with("herdr-mirror"))
-        && argv.get(1).and_then(|s| s.as_str()) == Some("pane")
-}
-
 /// After a local herdr server restart, session-restore resurrects mirror panes
 /// as plain shells: their ids match the map, but no streamer processes exist —
 /// and converge can't tell (the snapshot has no process info), so the mirrors
@@ -473,10 +439,11 @@ async fn heal_zombie_mirrors(
         // line into the user's live remote session instead.
         let mut dead: Vec<(String, String, Option<String>)> = Vec::new();
         for (remote_pane_id, local_pane_id, agent_hint) in panes {
-            let process_info_live = has_live_streamer(local, &local_pane_id).await;
+            let process_info_live =
+                crate::mirror::has_live_streamer(local, &local_pane_id).await;
             let pidfile_live = crate::util::streamer_alive(state_dir, &h.target, &remote_pane_id)
                 || crate::util::pane_streamer_alive(state_dir, &local_pane_id);
-            if streamer_recovery_needed(process_info_live, pidfile_live) {
+            if crate::mirror::streamer_exec_needed(process_info_live, pidfile_live) {
                 dead.push((remote_pane_id, local_pane_id, agent_hint));
             }
         }
@@ -967,68 +934,5 @@ mod tests {
         // a later success clears it, so a fixed host returns to the forward
         assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
         assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
-    }
-
-    fn argv(parts: &[&str]) -> Vec<Value> {
-        parts.iter().map(|s| json!(s)).collect()
-    }
-
-    /// Real argv, captured from `pane.process_info` on a live ssh mirror pane.
-    #[test]
-    fn recognises_a_live_streamer() {
-        let streamer = argv(&[
-            "/Users/niko/Documents/coding/herdr-mirror/target/release/herdr-mirror",
-            "pane",
-            "vps",
-            "wC:p1",
-            "--remote-bin",
-            "~/.local/bin/herdr",
-        ]);
-        assert!(is_streamer_argv(&streamer));
-
-        // the ssh child sharing the same pane is not itself a streamer
-        let ssh_child = argv(&["ssh", "-o", "BatchMode=yes", "vps", "exec ~/.local/bin/herdr ..."]);
-        assert!(!is_streamer_argv(&ssh_child));
-    }
-
-    /// A docker pane's wrapper looks the same to this check — the whole point
-    /// of asking herdr per pane instead of matching transport-specific flags.
-    #[test]
-    fn transport_and_flags_are_irrelevant() {
-        assert!(is_streamer_argv(&argv(&[
-            "/plugins/github/mirror-0015/target/release/herdr-mirror",
-            "pane",
-            "/Users/n/proj",
-            "w1:p1",
-            "--container-folder",
-            "/Users/n/proj",
-        ])));
-        // and a pre-v0.1.7 streamer, which carried no identity flag at all
-        assert!(is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "pane", "vps", "w1:p1"])));
-    }
-
-    /// A shell left behind by session-restore is what healing must act on.
-    #[test]
-    fn plain_shell_is_not_a_streamer() {
-        assert!(!is_streamer_argv(&argv(&["-zsh"])));
-        assert!(!is_streamer_argv(&argv(&["/bin/bash"])));
-        assert!(!is_streamer_argv(&argv(&[])));
-    }
-
-    /// Another subcommand in the pane must not read as a live stream.
-    #[test]
-    fn other_subcommands_are_not_streamers() {
-        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
-        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
-    }
-
-    /// The live failure reported no foreground streamer while its pidfile
-    /// already named the active wrapper. Recovery must trust either signal.
-    #[test]
-    fn a_live_pidfile_blocks_false_recovery() {
-        assert!(!streamer_recovery_needed(Some(false), true));
-        assert!(!streamer_recovery_needed(Some(true), false));
-        assert!(!streamer_recovery_needed(None, false));
-        assert!(streamer_recovery_needed(Some(false), false));
     }
 }

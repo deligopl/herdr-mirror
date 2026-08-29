@@ -256,9 +256,11 @@ pub fn streamer_spawn_pending_path(state_dir: &Path, local_pane_id: &str) -> Pat
     state_dir.join("streamer-spawns").join(format!("{}.pending", sane_component(local_pane_id)))
 }
 
-/// How long a `.pending` claim may block another launch. The retype loop is
-/// 3s+4s+4s; anything older is leftover from a crashed or abandoned attempt
-/// and must not freeze heal forever.
+/// How long a `.pending` claim may block another launch. The retype loop waits
+/// 3s+4s+8s and then settles for 4s — 19s, deliberately inside this window, so
+/// a claim outliving it is leftover from a crashed or abandoned attempt and
+/// must not freeze heal forever. A launch that stops early because herdr could
+/// not vouch for the pane also leaves its claim to expire here.
 const SPAWN_PENDING_TTL: Duration = Duration::from_secs(30);
 
 fn pending_is_fresh(path: &Path) -> bool {

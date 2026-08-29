@@ -669,6 +669,61 @@ async fn split_mirror_pane(
     Ok(split.pane.pane_id)
 }
 
+/// Does this local pane already have a live streamer?
+///
+/// Asks herdr what is actually running in the pane, rather than inferring it
+/// from a global `ps` scan and string-matching argv. That inference is what
+/// previously required a host-identity token in the argv, end-of-argument
+/// anchoring so `work` could not match `work-staging`, and a compatibility
+/// shim for streamers predating that token. None of it is needed to answer the
+/// only question that matters: is something already running in THIS pane.
+///
+/// Generation-agnostic by construction — every streamer ever shipped is
+/// `herdr-mirror pane …`, whatever flags follow.
+///
+/// `None` means herdr could not answer (socket blip, pane gone, an older
+/// server without `pane.process_info`). Callers must read that as "unknown",
+/// never as "nothing is running there".
+pub(crate) async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
+    let v = local.request("pane.process_info", json!({ "pane_id": pane_id })).await.ok()?;
+    let procs = v.pointer("/process_info/foreground_processes")?.as_array()?;
+    Some(procs.iter().any(|p| {
+        p.get("argv").and_then(|a| a.as_array()).is_some_and(|argv| is_streamer_argv(argv))
+    }))
+}
+
+/// May we type a streamer exec line into this local pane?
+///
+/// The one predicate behind both paths that type into an existing pane: the
+/// daemon healing zombie mirrors after a local server restart, and the startup
+/// retype in `spawn_streamer_pane`. Both fail SAFE — only a definite "nothing
+/// of ours is running there", from BOTH herdr's per-pane process info and our
+/// pidfiles, permits typing.
+///
+/// Anything else leaves the pane alone. A frozen mirror is visible and
+/// recoverable; typing into a pane whose streamer already owns stdin sends the
+/// line on to the REMOTE shell, where `exec herdr-mirror …` finds no such
+/// binary, kills that shell, and takes the remote pane — and with it a
+/// single-pane workspace — down with it. That is exactly what a 3-second
+/// pidfile-only timeout did to a Daytona sandbox on 2026-08-29: the owner's
+/// slow interactive shell had not yet run the first copy of the line, so the
+/// retype was queued in the local pty and forwarded by the streamer that
+/// started a moment later.
+pub(crate) fn streamer_exec_needed(process_info_live: Option<bool>, pidfile_live: bool) -> bool {
+    process_info_live == Some(false) && !pidfile_live
+}
+
+/// Is this foreground process one of our pane wrappers?
+///
+/// argv[0] is the resolved exe path, which varies by install (release build,
+/// plugin checkout, `cargo run`), so it is matched by suffix. argv[1] pins the
+/// subcommand so an unrelated `herdr-mirror status` in the pane is not mistaken
+/// for a live stream.
+fn is_streamer_argv(argv: &[Value]) -> bool {
+    argv.first().and_then(|s| s.as_str()).is_some_and(|e| e.ends_with("herdr-mirror"))
+        && argv.get(1).and_then(|s| s.as_str()) == Some("pane")
+}
+
 /// Exec the streamer into an already-created plain pane. Not `agent.start` (or a
 /// layout `command`), which set `launch_argv` and would surface every mirror pane
 /// as an agent row; a shell `exec` keeps it non-agent until a real agent is
@@ -725,22 +780,48 @@ pub(crate) async fn spawn_streamer_pane(
     // Typed input can be eaten by interactive shell startup (oh-my-zsh's
     // update prompt swallows the first key — in EVERY new shell until it's
     // answered). Verify the streamer registered its pidfile and retype the
-    // exec if not, off-loop so a slow shell never stalls reconcile. The
-    // alive-check right before each resend keeps a late-starting streamer
-    // from getting the line typed into its stdin (which would forward it to
-    // the remote pane as text).
+    // exec if not, off-loop so a slow shell never stalls reconcile.
+    //
+    // A missing pidfile alone does NOT mean the exec was eaten: an owner's
+    // plugin-laden zsh can take longer to reach the line than any timeout worth
+    // waiting, and the streamer publishes its pid only after that. So each
+    // resend is gated on herdr's own per-pane process info as well (the same
+    // question the zombie heal asks): retype only when herdr definitely reports
+    // a plain shell in the pane AND no pidfile is alive. Unknown is not
+    // permission — see `streamer_exec_needed`.
+    //
+    // The ladder is 3s+4s+8s so a slow shell gets a real chance before the last
+    // attempt, then a 4s settle; 19s total stays inside
+    // `util::SPAWN_PENDING_TTL` (30s), so an abandoned claim still expires.
     let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
     let pane_id = local_pane_id.to_string();
     tokio::spawn(async move {
-        for wait_ms in [3000u64, 4000] {
+        for wait_ms in [3000u64, 4000, 8000] {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
-                || crate::util::pane_streamer_alive(&state_dir, &pane_id)
-            {
+            let pidfile_live = crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+                || crate::util::pane_streamer_alive(&state_dir, &pane_id);
+            if pidfile_live {
+                return;
+            }
+            let process_info_live = has_live_streamer(&local, &pane_id).await;
+            if !streamer_exec_needed(process_info_live, pidfile_live) {
+                // Some(true): the streamer is running and simply has not
+                // published its pid yet. None: herdr could not tell us. Either
+                // way, stop typing and let the pending claim expire; a pane
+                // that really is a dead shell is healed on the daemon's next
+                // reconnect to the local server, which cannot hurt a live
+                // remote session.
+                log.log(&format!(
+                    "streamer for {pane_target} not up in {pane_id} but herdr reports {} — not retyping",
+                    match process_info_live {
+                        Some(true) => "a live streamer",
+                        _ => "no usable process info",
+                    }
+                ));
                 return;
             }
             log.log(&format!(
-                "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
+                "streamer for {pane_target} not up in {pane_id} and the pane is still a shell — retyping"
             ));
             if local
                 .request("pane.send_text", json!({ "pane_id": pane_id, "text": line }))
@@ -2367,5 +2448,87 @@ mod tests {
         });
         let info: AgentInfo = serde_json::from_value(data).unwrap();
         assert!(!info.has_agent());
+    }
+    fn argv(parts: &[&str]) -> Vec<Value> {
+        parts.iter().map(|s| json!(s)).collect()
+    }
+
+    /// Real argv, captured from `pane.process_info` on a live ssh mirror pane.
+    #[test]
+    fn recognises_a_live_streamer() {
+        let streamer = argv(&[
+            "/Users/niko/Documents/coding/herdr-mirror/target/release/herdr-mirror",
+            "pane",
+            "vps",
+            "wC:p1",
+            "--remote-bin",
+            "~/.local/bin/herdr",
+        ]);
+        assert!(is_streamer_argv(&streamer));
+
+        // the ssh child sharing the same pane is not itself a streamer
+        let ssh_child = argv(&["ssh", "-o", "BatchMode=yes", "vps", "exec ~/.local/bin/herdr ..."]);
+        assert!(!is_streamer_argv(&ssh_child));
+    }
+
+    /// A docker pane's wrapper looks the same to this check — the whole point
+    /// of asking herdr per pane instead of matching transport-specific flags.
+    #[test]
+    fn transport_and_flags_are_irrelevant() {
+        assert!(is_streamer_argv(&argv(&[
+            "/plugins/github/mirror-0015/target/release/herdr-mirror",
+            "pane",
+            "/Users/n/proj",
+            "w1:p1",
+            "--container-folder",
+            "/Users/n/proj",
+        ])));
+        // and a pre-v0.1.7 streamer, which carried no identity flag at all
+        assert!(is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "pane", "vps", "w1:p1"])));
+    }
+
+    /// A shell left behind by session-restore is what healing must act on.
+    #[test]
+    fn plain_shell_is_not_a_streamer() {
+        assert!(!is_streamer_argv(&argv(&["-zsh"])));
+        assert!(!is_streamer_argv(&argv(&["/bin/bash"])));
+        assert!(!is_streamer_argv(&argv(&[])));
+    }
+
+    /// Another subcommand in the pane must not read as a live stream.
+    #[test]
+    fn other_subcommands_are_not_streamers() {
+        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
+        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
+    }
+
+    /// The live failure reported no foreground streamer while its pidfile
+    /// already named the active wrapper. Recovery must trust either signal.
+    #[test]
+    fn a_live_pidfile_blocks_false_recovery() {
+        assert!(!streamer_exec_needed(Some(false), true));
+        assert!(!streamer_exec_needed(Some(true), false));
+        assert!(!streamer_exec_needed(None, false));
+        assert!(streamer_exec_needed(Some(false), false));
+    }
+
+    /// The startup retype asks the same question the zombie heal does, so the
+    /// only line that may be typed into a pane is one herdr says is a shell.
+    /// Live 2026-08-29: a Daytona mirror pane whose owner shell was still in
+    /// startup got a second copy of the exec line, the streamer forwarded it to
+    /// the remote shell, `exec herdr-mirror` failed with 127, and the remote
+    /// workspace's only pane died with it.
+    #[test]
+    fn retype_needs_both_a_dead_pidfile_and_a_shell() {
+        // a live pidfile is proof enough on its own — never type
+        assert!(!streamer_exec_needed(Some(false), true));
+        assert!(!streamer_exec_needed(Some(true), true));
+        // herdr sees our wrapper running: the pid is simply not published yet
+        assert!(!streamer_exec_needed(Some(true), false));
+        // herdr could not answer: unknown is not permission
+        assert!(!streamer_exec_needed(None, false));
+        assert!(!streamer_exec_needed(None, true));
+        // the only safe case: no pid of ours, and herdr sees a plain shell
+        assert!(streamer_exec_needed(Some(false), false));
     }
 }
