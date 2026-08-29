@@ -406,12 +406,36 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     }
 }
 
+/// How often the daemon sweeps for frozen mirrors, on top of the sweep it
+/// already does when it (re)subscribes to the local server.
+///
+/// A subscribe-only sweep heals exactly one cause: the local server restarting
+/// under us. It cannot see a streamer that died on its own — a killed pane, a
+/// transport cut, a supervisor whose child could not be replaced — and those
+/// panes then sit frozen until something unrelated restarts the daemon. Live on
+/// `caddypayio-vm`, 2026-08-29: several mirror panes stayed frozen for hours
+/// and came back only when the daemon was restarted for an unrelated reason.
+///
+/// Sweeping on a timer is only safe because the retype is gated on herdr's own
+/// per-pane process info (`streamer_exec_needed`): a live streamer is never
+/// typed into, whatever a pidfile says.
+const HEAL_SECONDS: u64 = 60;
+
+/// A minute, unless this daemon converges more slowly than that — healing more
+/// often than the mirror is reconciled would spend `pane.process_info` calls to
+/// discover the same thing twice.
+fn heal_interval_seconds(poll_seconds: u64) -> u64 {
+    HEAL_SECONDS.max(poll_seconds)
+}
+
 /// After a local herdr server restart, session-restore resurrects mirror panes
 /// as plain shells: their ids match the map, but no streamer processes exist —
 /// and converge can't tell (the snapshot has no process info), so the mirrors
-/// sit frozen forever. Heal = re-exec the streamer into each pane that is not
-/// already running one. A transient socket blip leaves wrappers running, so
-/// the check stays quiet then.
+/// sit frozen forever. A streamer can also die on its own long after that,
+/// leaving one frozen pane beside healthy ones. Heal = re-exec the streamer
+/// into each pane that is not already running one, on subscribe and then on a
+/// timer. A transient socket blip leaves wrappers running, so the check stays
+/// quiet then.
 async fn heal_zombie_mirrors(
     local: &ApiClient,
     state_dir: &std::path::Path,
@@ -619,6 +643,12 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut poll = tokio::time::interval(Duration::from_secs(config.poll_seconds.max(5)));
     poll.tick().await; // consume the immediate first tick (initial sync already runs)
+    // The subscribe-time sweep in local_events_task covers a local server
+    // restart. This one covers every other way a streamer dies while the daemon
+    // keeps running, which is what left panes frozen until an unrelated restart.
+    let mut heal =
+        tokio::time::interval(Duration::from_secs(heal_interval_seconds(config.poll_seconds)));
+    heal.tick().await; // consume the immediate first tick (subscribe just swept)
 
     loop {
         tokio::select! {
@@ -626,6 +656,14 @@ pub async fn cmd_run(env: Env) -> Result<()> {
                 for p in &pokers {
                     let _ = p.try_send(());
                 }
+            }
+            _ = heal.tick() => {
+                // Inline, not spawned: two overlapping sweeps would both see
+                // the same dead pane and race to claim its launch. Every step
+                // is a local socket request, and each pane it does revive is
+                // one the owner would otherwise have had to restart the daemon
+                // for.
+                heal_zombie_mirrors(&local, &env.state_dir, &config.hosts, &pokers, &log).await;
             }
             _ = sigusr1.recv() => {
                 // restore pokes us instead of converging itself — single writer
@@ -934,5 +972,34 @@ mod tests {
         // a later success clears it, so a fixed host returns to the forward
         assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
         assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+    }
+
+    /// The sweep is a backstop, not a second poll loop: a minute by default,
+    /// and never more often than the mirror is actually converged.
+    #[test]
+    fn the_heal_sweep_runs_a_minute_apart_but_never_faster_than_converge() {
+        assert_eq!(heal_interval_seconds(60), 60); // the shipped default
+        assert_eq!(heal_interval_seconds(30), 60);
+        assert_eq!(heal_interval_seconds(5), 60);
+        // a deliberately slow daemon heals on its own rhythm
+        assert_eq!(heal_interval_seconds(300), 300);
+    }
+
+    /// Healing on a timer is only safe because of the process-info gate: with a
+    /// live streamer in the pane, no sweep — however often it runs — may type.
+    #[test]
+    fn a_periodic_sweep_can_never_type_into_a_live_streamer() {
+        use crate::mirror::streamer_exec_needed;
+
+        // herdr sees our wrapper: never, whatever the pidfiles say
+        assert!(!streamer_exec_needed(Some(true), false));
+        assert!(!streamer_exec_needed(Some(true), true));
+        // herdr could not answer: still never
+        assert!(!streamer_exec_needed(None, false));
+        assert!(!streamer_exec_needed(None, true));
+        // the one case a sweep acts on: a pane that is provably a bare shell
+        assert!(streamer_exec_needed(Some(false), false));
+        // ...and not even that while a pidfile is still live
+        assert!(!streamer_exec_needed(Some(false), true));
     }
 }
