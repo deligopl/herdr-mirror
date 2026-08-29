@@ -225,6 +225,10 @@ async fn run_connected(
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
+    // A wake asked for exactly this. Retire it here, or a request made while the
+    // host was already up would also shorten the NEXT disconnect's backoff,
+    // which nobody asked for.
+    crate::state::take_wake(&ctx.env_state_dir, &ctx.host.name);
 
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
@@ -375,17 +379,24 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         // about now, and honouring them would skip the sleep entirely
         while poke.try_recv().is_ok() {}
         // Wake early only for a hidden host, whose close is genuinely waiting on
-        // us and would otherwise sit behind a 300s dormant sleep. Every other
-        // poke is ordinary local traffic — `local_events_task` fans one out to
-        // every host on every event, `layout.updated` included, so treating them
-        // all as urgent collapses the reconnect ladder and burns a dial (or a
-        // `docker ps`) per split drag.
+        // us and would otherwise sit behind a 300s dormant sleep, or for an
+        // explicit `herdr-mirror wake <host>`: someone has just started that
+        // container and is waiting on the mirror, and 300s of it is the
+        // difference between "it works" and "it is broken". Every other poke is
+        // ordinary local traffic — `local_events_task` fans one out to every
+        // host on every event, `layout.updated` included, so treating them all
+        // as urgent collapses the reconnect ladder and burns a dial (or a
+        // `docker ps`) per split drag. The marker is what keeps the ask apart
+        // from the traffic, and taking it spends it: a wake is one early retry,
+        // not a permanently shortened ladder.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(delay);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = poke.recv() => {
-                    if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
+                    if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name)
+                        || crate::state::take_wake(&ctx.env_state_dir, &ctx.host.name)
+                    {
                         break;
                     }
                 }

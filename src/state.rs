@@ -123,6 +123,39 @@ pub fn set_hidden(state_dir: &Path, host: &str, hidden: bool) -> std::io::Result
     }
 }
 
+/// An explicit "stop waiting and retry this host now", written by
+/// `herdr-mirror wake` and consumed by the host task.
+///
+/// A dormant host — a sandbox whose container is stopped — parks for
+/// `DORMANT_DELAY`, and ordinary pokes deliberately do not shorten that wait:
+/// `local_events_task` fans one out to every host on every local event, so
+/// honouring them would spend a `docker ps` per host on every split drag. A
+/// wake is different in kind: someone has just started that container and is
+/// waiting on the mirror. Marking the request keeps the two apart, so the
+/// backoff ladder still exists for everything that is not an explicit ask.
+///
+/// Its own file for the same reason `hidden` is: the map file is written
+/// without a lock by the daemon, by converge, and by every CLI subcommand, so
+/// a flag living inside it is silently reset by whoever saves last.
+pub fn wake_path(state_dir: &Path, host: &str) -> PathBuf {
+    state_dir.join(format!("{host}.wake"))
+}
+
+/// Returns the error rather than swallowing it: this one write is the entire
+/// request, so a read-only state dir would otherwise let `wake` claim success
+/// while the host sleeps out its full delay.
+pub fn request_wake(state_dir: &Path, host: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    std::fs::write(wake_path(state_dir, host), "")
+}
+
+/// Consume a pending wake. True only for the caller that took it, so one
+/// `wake` buys exactly one early retry and cannot be replayed into a loop that
+/// dials a stopped container forever.
+pub fn take_wake(state_dir: &Path, host: &str) -> bool {
+    std::fs::remove_file(wake_path(state_dir, host)).is_ok()
+}
+
 /// A one-line notice for one specific mirror pane to show.
 ///
 /// The interception runs in its own short-lived process and closes a plain
@@ -281,6 +314,26 @@ mod tests {
         assert!(!set_pane_agent_hint(&dir, "w1:p1", Some("codex")).unwrap());
         assert!(set_pane_agent_hint(&dir, "w1:p1", None).unwrap());
         assert_eq!(pane_agent_hint(&dir, "w1:p1"), Some(None));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_wake_is_consumed_by_exactly_one_taker() {
+        let dir = std::env::temp_dir().join(format!("hm-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!take_wake(&dir, "h"));
+        request_wake(&dir, "h").unwrap();
+        assert!(wake_path(&dir, "h").exists());
+        // exactly one early retry, however many tasks look
+        assert!(take_wake(&dir, "h"));
+        assert!(!take_wake(&dir, "h"));
+
+        // one host's wake never wakes another
+        request_wake(&dir, "a").unwrap();
+        assert!(!take_wake(&dir, "b"));
+        assert!(take_wake(&dir, "a"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -5,11 +5,13 @@ min_herdr_version = "0.7.2"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
 platforms = ["macos", "linux"]
 
-# Fetch the prebuilt herdr-mirror binary for this platform into
-# ./target/release/herdr-mirror — everything below invokes that binary.
-# (Dev installs via `herdr plugin link` build with cargo themselves.)
-[[build]]
-command = ["bash", "scripts/install.sh"]
+# No [[build]] step. This checkout is an OmniDev-managed local build: the
+# binary everything below invokes is produced by `bin/herdr-mirror-install`
+# with `cargo build --release`, and this tree is linked with
+# `herdr plugin link`, never installed from GitHub. Upstream's step fetches a
+# prebuilt release asset for the version in Cargo.toml, and no such release
+# exists for `0.4.1+omnidev.2` — leaving it in would either fail the link or,
+# worse, replace our build with an unpatched upstream binary.
 
 # No `placement` key: popup placement is herdr 0.7.4+, and an unknown variant
 # fails the whole manifest. The popup is requested at runtime instead.

@@ -420,6 +420,10 @@ pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
     report_failure(&env, "show", show(&env, host_arg).await).await
 }
 
+pub async fn wake_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "wake", wake(&env, host_arg).await).await
+}
+
 async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     let host = resolve_host(env, host_arg).await?;
     let already = crate::state::is_hidden(&env.state_dir, &host.name);
@@ -449,6 +453,31 @@ async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     }
     if already {
         println!("({} was already hidden — re-poked the daemon)", host.name);
+    }
+    Ok(())
+}
+
+/// Ask the daemon to retry ONE host now rather than sleeping out its current
+/// delay. Written as a marker first and only then poked, because the poke
+/// channel carries no payload and the daemon ignores anonymous pokes while a
+/// host is dormant — see `state::wake_path`.
+///
+/// Deliberately says nothing about whether the host comes back: the daemon owns
+/// dialling, and a container that is still stopped is dormant again a moment
+/// later. What this guarantees is that the attempt happens now.
+async fn wake(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = resolve_host(env, host_arg).await?;
+    crate::state::request_wake(&env.state_dir, &host.name)
+        .map_err(|e| err(format!("could not request a wake for {}: {e}", host.name)))?;
+    match crate::daemon::running_pid(env) {
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            println!("waking {} — its connection is being retried now", host.name);
+        }
+        None => println!(
+            "{} is marked for an immediate retry — it happens when the daemon starts (`herdr-mirror start`)",
+            host.name
+        ),
     }
     Ok(())
 }
