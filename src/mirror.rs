@@ -1620,7 +1620,9 @@ pub async fn push_pane_status(
             // remote fleet commonly repeats role names such as `conductor`,
             // so namespace the remote name with the stable Mirror host id.
             // Preserve an already-namespaced name to keep reconciliation
-            // idempotent when the remote deliberately uses the same identity.
+            // idempotent when the remote deliberately uses the same identity,
+            // and keep the result inside the local server's 32-character rule
+            // — a name it refuses is retried here on every single poll.
             let desired_name = mirrored_agent_name(host_name, agent.name.as_deref());
             if desired_name != entry.reported_name {
                 match local
@@ -1706,17 +1708,105 @@ pub async fn push_pane_status(
     }
 }
 
+/// The local Herdr server's rule for an agent name: start with a lowercase
+/// letter, then only lowercase letters, digits, `-` and `_`, 1-32 characters.
+/// A name that breaks it is refused outright — `agent.rename: agent name must
+/// start with a lowercase letter and contain only lowercase letters, digits,
+/// '-' or '_' (1-32 characters)` — and converge retries the same rename on
+/// every poll, so one bad name is a permanent log fire and a permanently
+/// unnamed agent row.
+const AGENT_NAME_MAX: usize = 32;
+
+/// The shortest host prefix worth keeping. Below three characters the prefix
+/// stops distinguishing fleets, which is the only reason it exists.
+const HOST_PREFIX_MIN: usize = 3;
+
+/// Fold one part of a name into the local server's alphabet: lowercase, and
+/// anything outside `[a-z0-9_-]` becomes `-`. Only a fold — a component is not
+/// a name, so nothing is dropped here for starting with a digit; the assembled
+/// name is what has to start with a letter.
+fn sanitize_agent_component(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Make an assembled name legal, or say there is no name to be had: a name
+/// starts with a lowercase letter, so leading digits and separators are
+/// dropped; a trailing `-` left by truncation is dropped for tidiness; and the
+/// whole thing is capped at `AGENT_NAME_MAX`. `None` when nothing usable is
+/// left, which is better than a rename the server refuses on every poll.
+fn legal_agent_name(name: &str) -> Option<String> {
+    let start = name.trim_start_matches(|c: char| !c.is_ascii_lowercase());
+    let capped: String = start.chars().take(AGENT_NAME_MAX).collect();
+    let trimmed = capped.trim_end_matches('-');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Is this name already namespaced by this host?
+///
+/// Checked against every prefix of the host the namespacing below can produce,
+/// not just the full one, because the host prefix is shortened when the
+/// combined name would not fit. Without that, feeding a shortened result back
+/// in would namespace it a second time and the name would drift on every
+/// converge.
+///
+/// The cost is that a remote agent genuinely named `cad-foo` counts as
+/// namespaced on a host called `caddypayio-vm` and keeps its own name. That is
+/// the right trade: the alternative is a name that changes every poll.
+fn is_host_namespaced(host: &str, name: &str) -> bool {
+    (HOST_PREFIX_MIN..=host.len()).any(|k| {
+        let prefix = &host[..k];
+        // `name == prefix` as well as `prefix-`: truncation can leave a name
+        // that IS the prefix (a remote name that folded away to nothing), and
+        // it has to stay put on the next converge like any other.
+        name == prefix || name.starts_with(&format!("{prefix}-"))
+    })
+}
+
+/// The local name for a mirrored remote agent: the remote's own name,
+/// namespaced by the Mirror host so two fleets can both run a `conductor`, and
+/// always a name the local server will accept.
+///
+/// Fitting order is deliberate. The remote name is what the owner recognises,
+/// so the host prefix gives up its characters first (down to
+/// `HOST_PREFIX_MIN`), and only then is the remote name truncated. Live on
+/// 2026-08-29, `caddypayio-vm` + `remote-conductor-rosie` came to 36
+/// characters and every rename was refused; it now fits as
+/// `caddypayi-remote-conductor-rosie`.
+///
+/// Deterministic and idempotent: the same pair always yields the same name, and
+/// feeding a result back in returns it unchanged.
 fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) -> Option<String> {
-    let remote_name = remote_name?.trim();
-    if remote_name.is_empty() {
+    let remote = sanitize_agent_component(remote_name?);
+    // A remote name of nothing but separators would collapse to the bare host
+    // prefix, and every such agent on that host would collapse to the SAME
+    // name. No name at all is better: the mirrored row keeps the remote's
+    // title and the local server is never asked for an impossible rename.
+    if !remote.chars().any(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    let namespace = format!("{host_name}-");
-    if remote_name.starts_with(&namespace) {
-        Some(remote_name.to_string())
-    } else {
-        Some(format!("{namespace}{remote_name}"))
+    let host = sanitize_agent_component(host_name);
+    if host.is_empty() || is_host_namespaced(&host, &remote) {
+        return legal_agent_name(&remote);
     }
+    // characters left for the host once the remote name and the separator are
+    // paid for; clamped so the prefix stays useful at one end and always leaves
+    // room for at least one character of the remote name at the other
+    let want = AGENT_NAME_MAX.saturating_sub(remote.len() + 1);
+    let prefix_len =
+        want.clamp(HOST_PREFIX_MIN.min(host.len()), host.len().min(AGENT_NAME_MAX - 2));
+    let prefix = host[..prefix_len].trim_end_matches('-');
+    let body = &remote[..remote.len().min(AGENT_NAME_MAX - prefix_len - 1)];
+    legal_agent_name(&format!("{prefix}-{body}"))
 }
 
 /// Authoritative close path: apply explicit remote `*.closed` events by closing
@@ -2007,6 +2097,86 @@ mod tests {
         );
         assert_eq!(mirrored_agent_name("greenroom", Some("  ")), None);
         assert_eq!(mirrored_agent_name("greenroom", None), None);
+    }
+
+    /// The live failure: `caddypayio-vm` + `remote-conductor-rosie` is 36
+    /// characters, and every `agent.rename` was refused, every poll, for hours.
+    #[test]
+    fn a_long_pair_is_shortened_at_the_host_prefix_first() {
+        let name = mirrored_agent_name("caddypayio-vm", Some("remote-conductor-rosie")).unwrap();
+
+        assert_eq!(name, "caddypayi-remote-conductor-rosie");
+        assert_eq!(name.len(), 32);
+        // the remote name — the half the owner recognises — survives intact
+        assert!(name.ends_with("remote-conductor-rosie"));
+    }
+
+    /// Whatever the pair, the result is a name the local server accepts.
+    #[test]
+    fn every_mirrored_agent_name_satisfies_the_local_rule() {
+        let legal = |name: &String| {
+            (1..=AGENT_NAME_MAX).contains(&name.len())
+                && name.starts_with(|c: char| c.is_ascii_lowercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        };
+        let cases = [
+            ("caddypayio-vm", "remote-conductor-rosie"),
+            ("caddypayio-vm", "a"),
+            ("a-very-long-mirror-host-name-indeed", "conductor"),
+            ("a-very-long-mirror-host-name-indeed", "an-equally-long-remote-agent-name"),
+            ("greenroom", "Conductor Rosie"),
+            ("Green Room", "conductor"),
+            ("greenroom", "9lives"),
+            ("greenroom", "_x_"),
+            ("9", "conductor"),
+        ];
+
+        for (host, remote) in cases {
+            let name = mirrored_agent_name(host, Some(remote))
+                .unwrap_or_else(|| panic!("{host} + {remote} produced no name"));
+            assert!(legal(&name), "{host} + {remote} produced {name:?}");
+            // idempotent: converge asks for this name again on every poll
+            assert_eq!(
+                mirrored_agent_name(host, Some(&name)),
+                Some(name.clone()),
+                "{host} + {remote} drifts on the second pass"
+            );
+        }
+    }
+
+    /// A remote name with nothing usable in it is no name at all — better an
+    /// unnamed mirrored agent than a rename refused on every poll.
+    #[test]
+    fn an_unusable_remote_name_yields_nothing() {
+        // nothing here survives the fold and the trim: `!!!` folds to `---`,
+        // and neither it nor a bare `--` leaves a character a name may carry
+        assert_eq!(mirrored_agent_name("greenroom", Some("!!!")), None);
+        assert_eq!(mirrored_agent_name("greenroom", Some("--")), None);
+        assert_eq!(mirrored_agent_name("greenroom", Some("_")), None);
+        assert_eq!(mirrored_agent_name("greenroom", Some("")), None);
+        assert_eq!(mirrored_agent_name("greenroom", Some("   ")), None);
+        // a digit-led remote name keeps its digits: the host prefix supplies
+        // the letter the local rule wants at the front
+        assert_eq!(
+            mirrored_agent_name("greenroom", Some("9lives")),
+            Some("greenroom-9lives".into())
+        );
+    }
+
+    /// Two remote agents whose names differ only past the truncation point
+    /// still collide — the local server keeps one name per agent. Recorded
+    /// rather than fixed: a hash suffix would trade a readable name for a
+    /// case nobody has hit.
+    #[test]
+    fn truncation_can_collide_and_that_is_deterministic() {
+        let host = "a-very-long-mirror-host-name-indeed";
+        let first = mirrored_agent_name(host, Some("conductor-for-the-first-workspace"));
+        let second = mirrored_agent_name(host, Some("conductor-for-the-first-workspace-two"));
+
+        assert_eq!(first, second);
+        assert_eq!(first.as_deref().map(str::len), Some(AGENT_NAME_MAX));
     }
 
     fn leaf(pane_id: &str) -> LayoutNode {
