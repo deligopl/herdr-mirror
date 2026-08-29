@@ -1407,14 +1407,114 @@ impl App {
 struct PidfileGuard(std::path::PathBuf);
 impl Drop for PidfileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // A replacement streamer can publish its pid before this process has
+        // finished unwinding. Remove only our own claim; never unlink the new
+        // owner's pidfile.
+        let ours = std::fs::read_to_string(&self.0)
+            .ok()
+            .is_some_and(|pid| pid.trim() == std::process::id().to_string());
+        if ours {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+fn spawn_supervised_streamer(agent: Option<&str>) -> Result<tokio::process::Child> {
+    let exe = std::env::current_exe()?;
+    let mut command = tokio::process::Command::new(exe);
+    command.arg("pane-stream").args(std::env::args_os().skip(2));
+    command.env("HERDR_MIRROR_SUPERVISED", "1");
+    match agent {
+        Some(agent) => {
+            command.env("HERDR_AGENT", agent);
+        }
+        None => {
+            command.env_remove("HERDR_AGENT");
+        }
+    }
+    Ok(command.spawn()?)
+}
+
+async fn stop_supervised_streamer(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
+/// Keep the local Herdr pane alive while swapping the child that actually
+/// streams the remote terminal. Herdr 0.8.0 caches wrapper detection for a
+/// foreground pid across exec(2), while exiting the pane's root process closes
+/// the pane. A stable unmarked supervisor plus replaceable marked child gives
+/// Herdr a new pid to inspect without touching the remote pane.
+pub async fn supervise(args: Args) -> Result<()> {
+    if args.dump {
+        return run(args).await;
+    }
+    let Ok(local_pane_id) = std::env::var("HERDR_PANE_ID") else {
+        return run(args).await;
+    };
+    let state_dir = crate::util::state_dir();
+    let pid_path = crate::util::pane_pid_path(&state_dir, &local_pane_id);
+    if let Some(dir) = pid_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&pid_path, std::process::id().to_string())?;
+    let _pane_pidfile = PidfileGuard(pid_path);
+    let _ = crate::state::take_pane_hint(&state_dir, &local_pane_id);
+
+    let mut desired = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
+    let mut child = spawn_supervised_streamer(desired.as_deref())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status?;
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(err(format!("streamer child exited: {status}")))
+                };
+            }
+            _ = sigusr1.recv() => {
+                let next = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
+                if next != desired {
+                    stop_supervised_streamer(&mut child).await;
+                    desired = next;
+                    child = spawn_supervised_streamer(desired.as_deref())?;
+                } else if let Some(pid) = child.id() {
+                    // No agent change: this is an ordinary addressed pane hint.
+                    unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+                }
+            }
+            _ = sigterm.recv() => {
+                stop_supervised_streamer(&mut child).await;
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                stop_supervised_streamer(&mut child).await;
+                return Ok(());
+            }
+            _ = sighup.recv() => {
+                stop_supervised_streamer(&mut child).await;
+                return Ok(());
+            }
+        }
     }
 }
 
 pub async fn run(args: Args) -> Result<()> {
+    let supervised = std::env::var("HERDR_MIRROR_SUPERVISED").as_deref() == Ok("1");
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
-    let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
+    let state_dir = crate::util::state_dir();
 
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
@@ -1441,7 +1541,7 @@ pub async fn run(args: Args) -> Result<()> {
     // is talking about and no way to write to it; this is how a hook reaches
     // the streamer sitting in that pane. HERDR_PANE_ID comes from herdr itself
     // and is inherited by whatever it starts in a pane, which is us.
-    let _pane_pidfile = local_pane_id.as_deref().map(|id| {
+    let _pane_pidfile = (!supervised).then(|| local_pane_id.as_deref().map(|id| {
         let path = crate::util::pane_pid_path(&state_dir, id);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1451,7 +1551,7 @@ pub async fn run(args: Args) -> Result<()> {
         // something that happened to a previous occupant
         let _ = crate::state::take_pane_hint(&state_dir, id);
         PidfileGuard(path)
-    });
+    })).flatten();
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback

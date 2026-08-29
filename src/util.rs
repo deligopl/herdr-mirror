@@ -16,6 +16,16 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
+/// Runtime state location. The override exists for isolated tests and
+/// side-by-side validation; normal installations keep the established path.
+pub fn state_dir() -> PathBuf {
+    std::env::var("HERDR_MIRROR_STATE_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local").join("state").join("herdr-mirror"))
+}
+
 /// Resolved runtime environment. Config is searched across candidate dirs so
 /// shell and plugin-action invocations agree (see `config_candidates`); state
 /// is ALWAYS the fixed path so both share one id map and pidfile.
@@ -29,7 +39,7 @@ pub struct Env {
 impl Env {
     pub fn resolve() -> Result<Env> {
         let config_search = config_candidates();
-        let state_dir = home_dir().join(".local").join("state").join("herdr-mirror");
+        let state_dir = state_dir();
         // create only the canonical dir; the others are probed, not owned
         fs::create_dir_all(default_config_dir())?;
         fs::create_dir_all(&state_dir)?;

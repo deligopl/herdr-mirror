@@ -10,6 +10,7 @@
 //   herdr-mirror remote-invoke <plugin>.<action>
 //   herdr-mirror remote-actions [host]              # discovery
 //   herdr-mirror bind|unbind ...                    # keybinding setup
+//   herdr-mirror --version                          # installed release identity
 
 mod api;
 mod binding;
@@ -61,6 +62,10 @@ fn run(cmd: &str, rest: &[String]) -> Result<()> {
 
 fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()> {
     match cmd {
+        "--version" | "version" => {
+            println!("herdr-mirror {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "daemon" | "run" => rt.block_on(daemon::cmd_run(Env::resolve()?)),
         "start" => {
             let env = Env::resolve()?;
@@ -92,6 +97,12 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         "hide" => rt.block_on(remote_action::hide_cmd(Env::resolve()?, rest.get(1).map(String::as_str))),
         "show" => rt.block_on(remote_action::show_cmd(Env::resolve()?, rest.get(1).map(String::as_str))),
         "pane" => {
+            let args = pane::parse_args(&rest[1..])?;
+            rt.block_on(pane::supervise(args))
+        }
+        // Internal child of the stable pane supervisor. Kept out of help and
+        // user-facing command lists; the supervisor reconstructs these args.
+        "pane-stream" => {
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
         }

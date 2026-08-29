@@ -149,7 +149,16 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
         }
         let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
         let agent = info.has_agent().then_some(&info);
-        push_pane_status(&ctx.local, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
+        push_pane_status(
+            &ctx.local,
+            &ctx.env_state_dir,
+            &ctx.host.name,
+            &remote_id,
+            entry,
+            agent,
+            &ctx.log,
+        )
+        .await;
     }
     if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
         ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
@@ -435,11 +444,11 @@ async fn heal_zombie_mirrors(
 ) {
     for (i, h) in hosts.iter().enumerate() {
         let state = load_state(state_dir, &h.name);
-        let panes: Vec<(String, String)> = state
+        let panes: Vec<(String, String, Option<String>)> = state
             .panes
             .iter()
             .filter(|(_, e)| !e.is_tombstoned())
-            .map(|(rid, e)| (rid.clone(), e.local_id.clone()))
+            .map(|(rid, e)| (rid.clone(), e.local_id.clone(), e.reported.clone()))
             .collect();
         if panes.is_empty() {
             continue;
@@ -451,13 +460,13 @@ async fn heal_zombie_mirrors(
         // treated as alive. Leaving a frozen mirror is recoverable and visible;
         // exec'ing into a pane whose streamer owns stdin writes the command
         // line into the user's live remote session instead.
-        let mut dead: Vec<(String, String)> = Vec::new();
-        for (remote_pane_id, local_pane_id) in panes {
+        let mut dead: Vec<(String, String, Option<String>)> = Vec::new();
+        for (remote_pane_id, local_pane_id, agent_hint) in panes {
             let process_info_live = has_live_streamer(local, &local_pane_id).await;
             let pidfile_live = crate::util::streamer_alive(state_dir, &h.target, &remote_pane_id)
                 || crate::util::pane_streamer_alive(state_dir, &local_pane_id);
             if streamer_recovery_needed(process_info_live, pidfile_live) {
-                dead.push((remote_pane_id, local_pane_id));
+                dead.push((remote_pane_id, local_pane_id, agent_hint));
             }
         }
         if dead.is_empty() {
@@ -478,9 +487,17 @@ async fn heal_zombie_mirrors(
         // Sizes live in the remote layout, which we don't have here; the wrapper
         // falls back to its default and the next converge reconciles.
         let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
-        for (remote_pane_id, local_pane_id) in dead {
+        for (remote_pane_id, local_pane_id, agent_hint) in dead {
             let argv = cmd_for(&remote_pane_id);
-            crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;
+            crate::mirror::spawn_streamer_pane(
+                local,
+                state_dir,
+                &local_pane_id,
+                &argv,
+                agent_hint.as_deref(),
+                log,
+            )
+            .await;
         }
         let _ = pokers[i].try_send(());
     }

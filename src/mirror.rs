@@ -518,6 +518,18 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn streamer_exec_line(
+    argv: &[String],
+    state_dir: &std::path::Path,
+) -> String {
+    let command = argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ");
+    let state = sh_quote(&state_dir.display().to_string());
+    // The pane's stable supervisor is deliberately not an agent. It launches
+    // a child streamer with the desired hint and can replace that child without
+    // letting Herdr close the pane when the remote agent changes.
+    format!("exec env -u HERDR_AGENT HERDR_MIRROR_STATE_DIR={state} {command}\n")
+}
+
 /// Reconcile one mirrored tab's geometry: exchange panes into the arrangement
 /// the remote has, then merge every split ratio three ways so a resize
 /// propagates in whichever direction it was actually made.
@@ -666,6 +678,7 @@ pub(crate) async fn spawn_streamer_pane(
     state_dir: &std::path::Path,
     local_pane_id: &str,
     argv: &[String],
+    agent_hint: Option<&str>,
     log: &Logger,
 ) {
     let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
@@ -694,10 +707,12 @@ pub(crate) async fn spawn_streamer_pane(
         }
     }
 
-    let line = format!(
-        "exec {}\n",
-        argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
-    );
+    if let Err(e) = crate::state::set_pane_agent_hint(state_dir, local_pane_id, agent_hint) {
+        crate::util::clear_streamer_spawn_pending(state_dir, local_pane_id);
+        log.log(&format!("store agent hint for {local_pane_id}: {e}"));
+        return;
+    }
+    let line = streamer_exec_line(argv, state_dir);
     if let Err(e) = local
         .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))
         .await
@@ -823,6 +838,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     let (remote_snap, local_snap) =
         tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local))?;
 
+    let remote_agent_by_pane: HashMap<&str, &AgentInfo> =
+        remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+    let agent_hint_for = |pane_id: &str| {
+        remote_agent_by_pane
+            .get(pane_id)
+            .and_then(|agent| agent.agent.as_deref())
+            .filter(|agent| !agent.is_empty())
+    };
 
     let mut local_ws_ids: HashSet<String> =
         local_snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
@@ -1215,7 +1238,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq,
+                            reported: None,
+                            reported_name: None,
+                        },
                     );
                     fresh.push(local_id.clone());
                     to_spawn.push((local_id, rid.clone()));
@@ -1223,7 +1252,15 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 note_mapped(deps, state, &fresh);
                 for (local_id, rid) in &to_spawn {
                     // plain pane created above; exec the streamer into it
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, local_id, &cmd_for(rid), &deps.log).await;
+                    spawn_streamer_pane(
+                        &deps.local,
+                        &deps.state_dir,
+                        local_id,
+                        &cmd_for(rid),
+                        agent_hint_for(rid),
+                        &deps.log,
+                    )
+                    .await;
                 }
             } else {
                 // tab exists — add mirrors for individual new remote panes as
@@ -1283,10 +1320,23 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     // unmapped placeholder panes 250ms after pane.created
                     state.panes.insert(
                         place.pane.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                            reported_name: None,
+                        },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
+                    spawn_streamer_pane(
+                        &deps.local,
+                        &deps.state_dir,
+                        &local_id,
+                        &cmd_for(&place.pane),
+                        agent_hint_for(&place.pane),
+                        &deps.log,
+                    )
                         .await;
                 }
                 // A pane whose remote sibling is a multi-pane subtree can't be
@@ -1319,10 +1369,23 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                            reported_name: None,
+                        },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
+                    spawn_streamer_pane(
+                        &deps.local,
+                        &deps.state_dir,
+                        &local_id,
+                        &cmd_for(&rp.pane_id),
+                        agent_hint_for(&rp.pane_id),
+                        &deps.log,
+                    )
                         .await;
                 }
             }
@@ -1412,6 +1475,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 /// full converge and the daemon's status fast-path.
 pub async fn push_pane_status(
     local: &ApiClient,
+    state_dir: &std::path::Path,
     host_name: &str,
     remote_id: &str,
     entry: &mut PaneEntry,
@@ -1454,6 +1518,44 @@ pub async fn push_pane_status(
             if let Err(e) = local.request("pane.report_agent", report).await {
                 log.log(&format!("report_agent {}: {e}", entry.local_id));
             }
+            // Herdr's typed agent operations validate the pane's real
+            // foreground process, not only lifecycle reports. Tell the local
+            // streamer which supported wrapper it represents; a changed hint
+            // makes that streamer cleanly re-exec itself and leaves the remote
+            // pane untouched.
+            match crate::state::set_pane_agent_hint(state_dir, &entry.local_id, Some(&label)) {
+                Ok(true) => {
+                    if !crate::util::poke_pane_streamer(state_dir, &entry.local_id) {
+                        log.log(&format!(
+                            "agent hint for {} changed to {label}, but its streamer was not signalable",
+                            entry.local_id
+                        ));
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => log.log(&format!("store agent hint for {}: {e}", entry.local_id)),
+            }
+            // Agent names are session-global on the local Herdr server. A
+            // remote fleet commonly repeats role names such as `conductor`,
+            // so namespace the remote name with the stable Mirror host id.
+            // Preserve an already-namespaced name to keep reconciliation
+            // idempotent when the remote deliberately uses the same identity.
+            let desired_name = mirrored_agent_name(host_name, agent.name.as_deref());
+            if desired_name != entry.reported_name {
+                match local
+                    .request(
+                        "agent.rename",
+                        json!({ "target": entry.local_id, "name": desired_name }),
+                    )
+                    .await
+                {
+                    Ok(_) => entry.reported_name = desired_name.clone(),
+                    Err(e) => log.log(&format!(
+                        "rename mirrored agent {} to {:?}: {e}",
+                        entry.local_id, desired_name
+                    )),
+                }
+            }
             // forward the remote's own tokens so a mirrored agent row carries the
             // same values a native one does, under whatever layout is configured
             // locally. Ignored by a pre-0.7.4 local server (no deny_unknown_fields).
@@ -1473,6 +1575,22 @@ pub async fn push_pane_status(
             entry.reported = Some(label);
         }
         None => {
+            if entry.reported_name.is_some() {
+                let _ = local
+                    .request(
+                        "agent.rename",
+                        json!({ "target": entry.local_id, "name": Value::Null }),
+                    )
+                    .await;
+                entry.reported_name = None;
+            }
+            match crate::state::set_pane_agent_hint(state_dir, &entry.local_id, None) {
+                Ok(true) => {
+                    let _ = crate::util::poke_pane_streamer(state_dir, &entry.local_id);
+                }
+                Ok(false) => {}
+                Err(e) => log.log(&format!("clear agent hint for {}: {e}", entry.local_id)),
+            }
             let Some(reported) = entry.reported.clone() else { return };
             // remote agent exited — retract our claim so the mirror pane doesn't
             // show a phantom agent row forever
@@ -1504,6 +1622,19 @@ pub async fn push_pane_status(
                 .await;
             entry.reported = None;
         }
+    }
+}
+
+fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) -> Option<String> {
+    let remote_name = remote_name?.trim();
+    if remote_name.is_empty() {
+        return None;
+    }
+    let namespace = format!("{host_name}-");
+    if remote_name.starts_with(&namespace) {
+        Some(remote_name.to_string())
+    } else {
+        Some(format!("{namespace}{remote_name}"))
     }
 }
 
@@ -1553,7 +1684,16 @@ pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &
         remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
     for (remote_id, entry) in state.panes.iter_mut() {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
-        push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, &deps.log).await;
+        push_pane_status(
+            &deps.local,
+            &deps.state_dir,
+            &deps.host.name,
+            remote_id,
+            entry,
+            agent,
+            &deps.log,
+        )
+        .await;
     }
 }
 
@@ -1765,6 +1905,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn streamer_supervisor_is_not_itself_an_agent() {
+        let argv = vec!["herdr-mirror".into(), "pane".into(), "host".into(), "w1:p1".into()];
+        assert_eq!(
+            streamer_exec_line(&argv, std::path::Path::new("/state")),
+            "exec env -u HERDR_AGENT HERDR_MIRROR_STATE_DIR='/state' 'herdr-mirror' 'pane' 'host' 'w1:p1'\n"
+        );
+    }
+
+    #[test]
+    fn remote_agent_names_are_namespaced_by_host() {
+        assert_eq!(
+            mirrored_agent_name("greenroom", Some("conductor")),
+            Some("greenroom-conductor".into())
+        );
+        assert_eq!(
+            mirrored_agent_name("greenroom", Some("greenroom-conductor")),
+            Some("greenroom-conductor".into())
+        );
+        assert_eq!(mirrored_agent_name("greenroom", Some("  ")), None);
+        assert_eq!(mirrored_agent_name("greenroom", None), None);
+    }
+
     fn leaf(pane_id: &str) -> LayoutNode {
         LayoutNode::Pane { pane_id: Some(pane_id.into()), label: None }
     }
@@ -1795,7 +1958,13 @@ mod tests {
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {
-        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+        PaneEntry {
+            local_id: local_id.into(),
+            tombstone: Some(true),
+            seq: 0,
+            reported: None,
+            reported_name: None,
+        }
     }
 
     /// A locally-closed (tombstoned) pane must not survive into the tree a tab
@@ -1809,7 +1978,13 @@ mod tests {
         let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
         panes.insert(
             "p1".into(),
-            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None },
+            PaneEntry {
+                local_id: "l1".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+                reported_name: None,
+            },
         );
         let mut ids = Vec::new();
         walk_pane_ids(&prune_closed(&tree, &panes).unwrap(), &mut ids);

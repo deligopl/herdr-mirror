@@ -25,6 +25,9 @@ pub struct PaneEntry {
     /// when the remote agent goes away, or it sticks forever
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported: Option<String>,
+    /// remote agent name last applied with `agent.rename`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_name: Option<String>,
 }
 
 impl PaneEntry {
@@ -141,6 +144,44 @@ pub fn set_pane_hint(state_dir: &Path, local_pane_id: &str, msg: &str) {
     let _ = std::fs::write(pane_hint_path(state_dir, local_pane_id), msg);
 }
 
+/// Desired `HERDR_AGENT` value for the streamer occupying a local mirror pane.
+///
+/// Herdr identifies wrapper processes from this environment variable.  The
+/// daemon owns the desired value (copied from the remote pane), while the
+/// streamer owns changing its own process environment by cleanly re-execing
+/// when this file changes.
+fn pane_agent_hint_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir
+        .join("pane-agent-hints")
+        .join(format!("{}.agent", crate::util::sane_component(local_pane_id)))
+}
+
+/// Store the desired wrapper hint. Returns true only when it changed.
+pub fn set_pane_agent_hint(
+    state_dir: &Path,
+    local_pane_id: &str,
+    agent: Option<&str>,
+) -> std::io::Result<bool> {
+    let path = pane_agent_hint_path(state_dir, local_pane_id);
+    let desired = agent.unwrap_or("");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(desired) {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, desired)?;
+    Ok(true)
+}
+
+/// `Some(None)` means the daemon explicitly wants no wrapper hint; `None`
+/// means it has not published a desired value for this pane yet.
+pub fn pane_agent_hint(state_dir: &Path, local_pane_id: &str) -> Option<Option<String>> {
+    let value = std::fs::read_to_string(pane_agent_hint_path(state_dir, local_pane_id)).ok()?;
+    let value = value.trim();
+    Some((!value.is_empty()).then(|| value.to_string()))
+}
+
 /// Read and consume this pane's notice, if any.
 pub fn take_pane_hint(state_dir: &Path, local_pane_id: &str) -> Option<String> {
     let path = pane_hint_path(state_dir, local_pane_id);
@@ -227,6 +268,21 @@ mod tests {
         set_hidden(&dir, "h", false).unwrap();
         assert!(!is_hidden(&dir, "h"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pane_agent_hint_distinguishes_agent_plain_and_unpublished() {
+        let dir = std::env::temp_dir().join(format!("hm-agent-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(pane_agent_hint(&dir, "w1:p1"), None);
+        assert!(set_pane_agent_hint(&dir, "w1:p1", Some("codex")).unwrap());
+        assert_eq!(pane_agent_hint(&dir, "w1:p1"), Some(Some("codex".into())));
+        assert!(!set_pane_agent_hint(&dir, "w1:p1", Some("codex")).unwrap());
+        assert!(set_pane_agent_hint(&dir, "w1:p1", None).unwrap());
+        assert_eq!(pane_agent_hint(&dir, "w1:p1"), Some(None));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
