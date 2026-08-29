@@ -1690,6 +1690,59 @@ impl Drop for PidfileGuard {
     }
 }
 
+/// Consecutive crash respawns the supervisor spends before it gives up and
+/// lets the pane close. Bounded because a streamer that cannot survive its own
+/// first second — a bad remote binary, a pane target that no longer exists —
+/// must not become an endless spawn loop; a tombstone the owner can `restore`
+/// is the better failure.
+const STREAMER_RESPAWN_LIMIT: u32 = 5;
+
+/// Ceiling on the doubling ladder (1s, 2s, 4s, 8s, 8s). Kept short: the whole
+/// budget is then under half a minute, so a transport blip costs a visible
+/// pause rather than a pane, and a genuinely broken streamer still fails fast.
+const STREAMER_RESPAWN_BACKOFF_CAP: Duration = Duration::from_secs(8);
+
+/// How long a child must have run for its predecessors' crashes to stop
+/// counting against it. Longer than the streamer's own connect ladder, so a
+/// child that only ever reconnects has not "run healthily"; short enough that
+/// a stream alive for a working session gets a fresh budget when it dies.
+const STREAMER_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
+
+/// A respawn the supervisor has decided to make.
+#[derive(Debug, PartialEq, Eq)]
+struct Respawn {
+    /// wait this long before starting the replacement
+    delay: Duration,
+    /// which attempt this is, to carry into the next decision
+    attempt: u32,
+}
+
+/// Whether to replace a streamer child that just exited, and after how long.
+///
+/// Pure so the ladder, the reset, and the give-up point are testable without a
+/// live pane. Three rules, in order:
+///
+/// - a child that exited *successfully* is never replaced. Zero means the
+///   stream ended deliberately — the remote pane closed, the user quit — and
+///   respawning would resurrect a pane the owner just closed.
+/// - a child that ran for `STREAMER_HEALTHY_UPTIME` before dying starts from a
+///   clean budget. The budget exists to catch a streamer that cannot come up
+///   at all; a stream that worked for an hour and then lost its transport is a
+///   different event and should not inherit an old crash's rung.
+/// - otherwise the ladder doubles and the budget is finite.
+fn respawn_decision(success: bool, ran_for: Duration, attempts: u32) -> Option<Respawn> {
+    if success {
+        return None;
+    }
+    let spent = if ran_for >= STREAMER_HEALTHY_UPTIME { 0 } else { attempts };
+    let attempt = spent + 1;
+    if attempt > STREAMER_RESPAWN_LIMIT {
+        return None;
+    }
+    let delay = Duration::from_secs(1u64 << (attempt - 1)).min(STREAMER_RESPAWN_BACKOFF_CAP);
+    Some(Respawn { delay, attempt })
+}
+
 fn spawn_supervised_streamer(agent: Option<&str>) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe()?;
     let mut command = tokio::process::Command::new(exe);
@@ -1745,6 +1798,10 @@ pub async fn supervise(args: Args) -> Result<()> {
 
     let mut desired = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
     let mut child = spawn_supervised_streamer(desired.as_deref())?;
+    // when the child now running was started, and how much of the crash budget
+    // its predecessors have already spent (see `respawn_decision`)
+    let mut started = Instant::now();
+    let mut attempts = 0u32;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -1758,12 +1815,47 @@ pub async fn supervise(args: Args) -> Result<()> {
         tokio::select! {
             status = child.wait() => {
                 let status = status?;
+                // Before anything else, and before any replacement: the dead
+                // child's remote `terminal session` client outlives it, and it
+                // would refuse the replacement's control attach on the same
+                // remote pane. Identity-guarded, like every other kill here.
                 reap_recorded_remote_client(&args, &state_dir).await;
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(err(format!("streamer child exited: {status}")))
+                let Some(respawn) = respawn_decision(status.success(), started.elapsed(), attempts)
+                else {
+                    // Budget spent, or a deliberate end of the stream. Leaving
+                    // is what closes the pane, which is the point: Mirror
+                    // tombstones it and `herdr-mirror restore` brings it back.
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(err(format!("streamer child exited: {status}")))
+                    };
                 };
+                attempts = respawn.attempt;
+                // One notice per respawn, addressed to this pane, collected by
+                // the replacement on its next poke — the same channel `pick`
+                // uses to say "closing the local tab". The log line is the
+                // durable half: a respawn that succeeds leaves no other trace.
+                let notice = format!(
+                    "stream died ({status}); restarting in {}s ({}/{})",
+                    respawn.delay.as_secs(),
+                    respawn.attempt,
+                    STREAMER_RESPAWN_LIMIT,
+                );
+                crate::state::set_pane_hint(&state_dir, &local_pane_id, &notice);
+                crate::util::Logger::new(&state_dir, false)
+                    .log(&format!("pane {local_pane_id}: {notice}"));
+                // Wait out the rung, but stay killable while doing it: the
+                // child is already gone and its client already reaped, so a
+                // shutdown signal here is simply an exit.
+                tokio::select! {
+                    _ = tokio::time::sleep(respawn.delay) => {}
+                    _ = sigterm.recv() => return Ok(()),
+                    _ = sigint.recv() => return Ok(()),
+                    _ = sighup.recv() => return Ok(()),
+                }
+                started = Instant::now();
+                child = spawn_supervised_streamer(desired.as_deref())?;
             }
             _ = sigusr1.recv() => {
                 let next = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
@@ -1774,6 +1866,10 @@ pub async fn supervise(args: Args) -> Result<()> {
                     reap_recorded_remote_client(&args, &state_dir).await;
                     desired = next;
                     child = spawn_supervised_streamer(desired.as_deref())?;
+                    // a deliberate replacement is not a crash: fresh clock,
+                    // fresh budget
+                    started = Instant::now();
+                    attempts = 0;
                 } else if let Some(pid) = child.id() {
                     // No agent change: this is an ordinary addressed pane hint.
                     unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
@@ -2628,4 +2724,48 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         assert!(!pending.contains(&1));
     }
 
+    #[test]
+    fn a_streamer_that_ends_cleanly_is_not_respawned() {
+        // exit 0 is the remote pane closing or the user quitting: replacing it
+        // would resurrect a pane that was deliberately ended
+        assert_eq!(respawn_decision(true, Duration::from_secs(1), 0), None);
+        assert_eq!(respawn_decision(true, Duration::from_secs(9999), 4), None);
+    }
+
+    #[test]
+    fn a_crash_on_a_fresh_budget_climbs_the_ladder() {
+        let ladder: Vec<u64> = (0..STREAMER_RESPAWN_LIMIT)
+            .map(|attempts| {
+                let d = respawn_decision(false, Duration::from_secs(1), attempts)
+                    .expect("budget not spent");
+                assert_eq!(d.attempt, attempts + 1);
+                d.delay.as_secs()
+            })
+            .collect();
+
+        assert_eq!(ladder, vec![1, 2, 4, 8, 8]);
+    }
+
+    #[test]
+    fn a_crash_after_a_long_healthy_run_gets_a_fresh_budget() {
+        // the case this exists for: a stream that worked all afternoon and
+        // then lost its transport must not inherit a rung from this morning
+        let d = respawn_decision(false, STREAMER_HEALTHY_UPTIME, STREAMER_RESPAWN_LIMIT)
+            .expect("a healthy run resets the counter");
+
+        assert_eq!(d, Respawn { delay: Duration::from_secs(1), attempt: 1 });
+        // one second short of healthy still counts against the budget
+        assert!(respawn_decision(
+            false,
+            STREAMER_HEALTHY_UPTIME - Duration::from_secs(1),
+            STREAMER_RESPAWN_LIMIT,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_exhausted_budget_gives_up_and_lets_the_pane_close() {
+        assert!(respawn_decision(false, Duration::from_secs(1), STREAMER_RESPAWN_LIMIT).is_none());
+        assert!(respawn_decision(false, Duration::ZERO, STREAMER_RESPAWN_LIMIT + 7).is_none());
+    }
 }
