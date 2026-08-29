@@ -166,6 +166,13 @@ pub fn config_candidates() -> Vec<PathBuf> {
     dirs
 }
 
+/// Size at which `daemon.log` is rolled over, and how many old generations are
+/// kept afterwards. The daemon appends to one file for the whole life of a
+/// login session and nothing outside it ever truncates that file, so without
+/// this the log is unbounded.
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_KEPT_GENERATIONS: u32 = 5;
+
 /// Append-to-file logger (best-effort), optionally echoing to stdout.
 #[derive(Clone)]
 pub struct Logger {
@@ -178,8 +185,34 @@ impl Logger {
         Logger { file: state_dir.join("daemon.log"), also_stdout }
     }
 
+    fn generation(&self, index: u32) -> PathBuf {
+        let mut path = self.file.clone().into_os_string();
+        path.push(format!(".{index}"));
+        PathBuf::from(path)
+    }
+
+    /// Roll `daemon.log` over once it passes the limit: it becomes `.1`, the
+    /// existing `.1`..`.4` shift down, and `.5` is dropped. Every step is
+    /// best-effort, like the append itself — a logger must never be the reason
+    /// the daemon stops.
+    fn rotate_if_large(&self) {
+        let oversized = match fs::metadata(&self.file) {
+            Ok(meta) => meta.len() > LOG_MAX_BYTES,
+            Err(_) => false,
+        };
+        if !oversized {
+            return;
+        }
+        let _ = fs::remove_file(self.generation(LOG_KEPT_GENERATIONS));
+        for index in (1..LOG_KEPT_GENERATIONS).rev() {
+            let _ = fs::rename(self.generation(index), self.generation(index + 1));
+        }
+        let _ = fs::rename(&self.file, self.generation(1));
+    }
+
     pub fn log(&self, msg: &str) {
         let line = format!("{} {}\n", now_iso(), msg);
+        self.rotate_if_large();
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&self.file) {
             let _ = f.write_all(line.as_bytes());
         }
