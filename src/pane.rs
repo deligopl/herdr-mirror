@@ -23,6 +23,12 @@
 // Every stream gets its own direct ssh connection (no shared ControlMaster):
 // isolated, and nothing persists to go stale on a flaky network.
 //
+// The streamer OWNS the remote client it attaches. The remote
+// `herdr … terminal session …` process is not a child of the ssh (or docker
+// exec) that carries its stdio and does not die with it, so every path out of
+// this process — and every reconnect — terminates it explicitly through the
+// same transport. See `remote_session_script` and `kill_remote_client`.
+//
 // One owner of all state, message-driven: frames, keystrokes, timers, and
 // ssh-child exits arrive on one channel; a session generation number tags
 // every message so stale ones are dropped.
@@ -200,6 +206,8 @@ struct Frame {
 
 enum Msg {
     Frame { gen: u64, frame: Frame },
+    /// pid of the remote client this session attached (its first stdout line)
+    RemotePid { gen: u64, pid: i32 },
     SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
     Stdin(Vec<u8>),
     /// result of a background foreground poll; None=poll failed (keep the last
@@ -212,7 +220,12 @@ enum Msg {
 struct Session {
     gen: u64,
     mode: Mode,
+    /// local transport child (ssh, or `docker exec`)
     pid: i32,
+    /// remote `herdr … terminal session …` client, once it has announced
+    /// itself. `None` until that line arrives — the attach may fail before the
+    /// wrapper ever runs — so every cleanup treats it as optional.
+    remote_pid: Option<i32>,
     stdin: ChildStdin,
 }
 
@@ -221,7 +234,44 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+/// Prefix the remote wrapper prints, on its own line, before it becomes the
+/// client. Chosen to be inert to the frame reader (not JSON) and unmistakable
+/// in a transcript.
+const REMOTE_PID_MARKER: &str = "herdr-mirror-remote-pid";
+
+/// Read the marker line the remote wrapper prints. `None` for every other line,
+/// so an unpatched remote, a login banner, or a herdr frame passes through.
+fn remote_pid_from_line(line: &str) -> Option<i32> {
+    let mut parts = line.trim().split_whitespace();
+    (parts.next()? == REMOTE_PID_MARKER)
+        .then(|| parts.next())
+        .flatten()
+        .filter(|_| parts.next().is_none())
+        .and_then(|pid| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+}
+
+/// Run a script under a POSIX `sh` we name, whatever the remote login shell is.
+///
+/// `ssh host <string>` hands the string to the account's login shell, which may
+/// be fish or csh. Both keep single quotes literal and both have `exec`, so the
+/// only thing they parse is `exec sh -c '<literal>'`; everything inside — `$$`,
+/// `$(…)`, `case` — is then read by `sh`. This is the same reasoning that put
+/// `config::remote_herdr_expr`'s resolver behind `sh -c`. `exec` keeps it to
+/// one process, so the pid `$$` reports is the pid that survives.
+fn sh_wrapped(script: &str) -> String {
+    format!("exec sh -c {}", sh_quote(script))
+}
+
+/// The remote script for one attach: announce the pid, then become the client.
+///
+/// `$$` is the wrapper shell's pid and `exec` gives that same pid to herdr, so
+/// the number printed is the pid of the process that ends up attached — not of
+/// a parent that exits a moment later. Knowing it is what lets this streamer
+/// terminate its own client; without it the client outlives every transport
+/// failure and every local pane close, and the leftovers hold the terminal
+/// against the next streamer.
+fn remote_session_script(args: &Args, mode: Mode, cols: usize, rows: usize) -> String {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -229,20 +279,99 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         args.remote_bin.as_deref(),
         args.session.as_deref(),
     );
-    let cmd = format!(
-        "exec {} terminal session {} {} --cols {} --rows {}",
-        bin,
-        mode.as_str(),
-        sh_quote(&args.pane_target),
-        cols,
-        rows
-    );
+    format!(
+        "echo {marker} $$; exec {bin} terminal session {mode} {target} --cols {cols} --rows {rows}",
+        marker = REMOTE_PID_MARKER,
+        mode = mode.as_str(),
+        target = sh_quote(&args.pane_target),
+    )
+}
+
+/// Terminate one remote attach client, identified before it is signalled.
+///
+/// `ps` is asked what the pid actually is and only a process whose argv still
+/// carries `terminal session` is signalled. A recorded pid can be minutes or
+/// hours old, remote pids get reused, and the same host runs the herdr *server*
+/// — so an unguarded `kill` is how a cleanup turns into an outage. A remote
+/// without `ps` (a stripped container) falls back to the plain kill: there the
+/// pid was recorded by this process and the reuse window is the seconds since.
+fn remote_kill_script(pid: i32) -> String {
+    format!(
+        "p={pid}; if command -v ps >/dev/null 2>&1; then \
+case \"$(ps -o args= -p \"$p\" 2>/dev/null)\" in *\"terminal session\"*) kill -TERM \"$p\" ;; esac; \
+else kill -TERM \"$p\" 2>/dev/null || true; fi"
+    )
+}
+
+/// How long one remote-client kill may take. Short on purpose: this runs on
+/// exit paths (SIGTERM from the supervisor, a closing pane) and before each
+/// reconnect, and a cleanup that delays either is worse than one that misses.
+const REMOTE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Kill a remote client through the same transport that started it. Best
+/// effort: `true` only when the command ran and reported success, so a caller
+/// can keep an unresolved pid for the next attempt instead of leaking it.
+async fn kill_remote_client(args: &Args, pid: i32) -> bool {
+    if pid <= 1 {
+        return true;
+    }
+    let script = remote_kill_script(pid);
+    let mut builder = match &args.container {
+        Some(ct) => {
+            // async resolve, like the foreground poll: this can run while the
+            // streamer is still drawing, and a wedged Docker daemon must not
+            // freeze rendering or the exit path
+            let Some(id) = crate::docker::resolve(&ct.docker_bin, &ct.kind)
+                .await
+                .ok()
+                .and_then(|ids| ids.into_iter().next())
+            else {
+                return false;
+            };
+            let mut c = tokio::process::Command::new(&ct.docker_bin);
+            c.args(["exec", &id, "sh", "-c", &script]);
+            c
+        }
+        None => {
+            let mut c = tokio::process::Command::new("ssh");
+            // reuse the daemon's ControlMaster when we were given one: this is
+            // a sub-second command and a fresh handshake would dominate it
+            if let Some(path) = &args.ctl_path {
+                c.arg("-S").arg(path);
+            }
+            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(sh_wrapped(&script));
+            c
+        }
+    };
+    // never onto the pane's tty: this runs while the streamer is drawing
+    let child = builder
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    matches!(tokio::time::timeout(REMOTE_KILL_TIMEOUT, child).await, Ok(Ok(status)) if status.success())
+}
+
+/// Clear a remote client recorded by a streamer that is no longer running.
+/// Used by the supervisor, whose child can be SIGKILLed before it cleans up.
+async fn reap_recorded_remote_client(args: &Args, state_dir: &std::path::Path) {
+    let Some(pid) =
+        crate::util::take_remote_client(state_dir, &args.ssh_target, &args.pane_target)
+    else {
+        return;
+    };
+    let _ = kill_remote_client(args, pid).await;
+}
+
+fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+    let cmd = remote_session_script(args, mode, cols, rows);
     // ssh and docker differ only in how the command is carried; the streaming
     // contract (piped stdio, herdr's frames on stdout) is identical
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(cmd);
+            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(sh_wrapped(&cmd));
             c
         }
         Some(ct) => {
@@ -292,6 +421,12 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let mut close_reason = String::new();
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(remote_pid) = remote_pid_from_line(&line) {
+                if tx.send(Msg::RemotePid { gen, pid: remote_pid }).await.is_err() {
+                    break;
+                }
+                continue;
+            }
             let Ok(frame) = serde_json::from_str::<Frame>(&line) else { continue };
             if frame.kind == "terminal.closed" {
                 if let Some(r) = &frame.reason {
@@ -309,7 +444,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, pid, stdin })
+    Ok(Session { gen, mode, pid, remote_pid: None, stdin })
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +771,30 @@ const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 /// restarting renumbers pane ids while session restore runs.
 const GONE_BACKOFF_MS: u64 = 60_000;
 
+/// herdr's refusal when something else already holds the terminal
+/// ("terminal … already has an attached client; retry").
+const ATTACH_CONFLICT: &str = "already has an attached client";
+
+/// How many unconfirmed remote clients to carry. One per failed cleanup; a
+/// transport that has been down long enough to make eight of them will not be
+/// helped by a ninth, and the record on disk still names the last one.
+const MAX_PENDING_REMOTE_KILLS: usize = 8;
+
+/// Which of our own orphaned clients to clear before retrying a refused
+/// control attach — `None` for "handle this like any other failure".
+///
+/// Deliberately narrow. Only a client THIS streamer created is ever a
+/// candidate: another Herdr client attached to the same remote pane is a
+/// person, and the answer to a person holding the terminal is to stay in
+/// observe, not to evict them. One attempt only, so a genuine second client
+/// cannot be fought over in a loop.
+fn attach_conflict_pid(reason: &str, ours: Option<i32>, already_retried: bool) -> Option<i32> {
+    if already_retried || !reason.to_ascii_lowercase().contains(ATTACH_CONFLICT) {
+        return None;
+    }
+    ours.filter(|pid| *pid > 1)
+}
+
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
 
@@ -678,6 +837,8 @@ fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
 
 struct App {
     args: Args,
+    /// where the remote-client record for this mirror pane lives
+    state_dir: std::path::PathBuf,
     tty: bool,
     grid: Grid,
     renderer: Renderer,
@@ -692,6 +853,12 @@ struct App {
 
     backoff_idx: usize,
     reconnect_at: Option<(Instant, Mode)>,
+    /// remote attach clients we started and have not confirmed dead. Cleared
+    /// before every attach, so a retrying streamer replaces its own client
+    /// instead of stacking a new one beside it every rung of the ladder.
+    pending_remote_kills: Vec<i32>,
+    /// one-shot recovery from a control attach our own orphan is holding
+    attach_conflict_retried: bool,
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
@@ -897,8 +1064,60 @@ impl App {
 
     /// Stop the child (clean release first for control) — never leave an
     /// orphan holding the remote attach lock.
+    /// Remember a remote client we started so the next attach clears it.
+    /// Capped and de-duplicated: this list is retried, not accumulated.
+    fn queue_remote_kill(&mut self, pid: Option<i32>) {
+        let Some(pid) = pid.filter(|p| *p > 1) else { return };
+        if self.pending_remote_kills.contains(&pid) {
+            return;
+        }
+        if self.pending_remote_kills.len() >= MAX_PENDING_REMOTE_KILLS {
+            self.pending_remote_kills.remove(0);
+        }
+        self.pending_remote_kills.push(pid);
+    }
+
+    /// Take the current session, queueing the remote client it owns. Every
+    /// path that drops a session goes through here, which is what makes "the
+    /// streamer owns its remote client" true rather than aspirational.
+    fn retire_session(&mut self) -> Option<Session> {
+        let session = self.session.take()?;
+        self.queue_remote_kill(session.remote_pid);
+        Some(session)
+    }
+
+    /// Terminate the remote clients we have queued, oldest first, under one
+    /// deadline for the whole batch. Anything not confirmed dead stays queued
+    /// for the next attempt rather than being dropped or retried forever here.
+    async fn reap_remote_clients(&mut self) {
+        if self.pending_remote_kills.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + REMOTE_KILL_TIMEOUT;
+        let mut unresolved: Vec<i32> = Vec::new();
+        for (i, pid) in std::mem::take(&mut self.pending_remote_kills).into_iter().enumerate() {
+            // the first one always gets its try; later ones only while there
+            // is time left, so a dead transport costs one timeout, not eight
+            if i > 0 && Instant::now() >= deadline {
+                unresolved.push(pid);
+                continue;
+            }
+            if !kill_remote_client(&self.args, pid).await {
+                unresolved.push(pid);
+            }
+        }
+        if unresolved.is_empty() {
+            crate::util::clear_remote_client(
+                &self.state_dir,
+                &self.args.ssh_target,
+                &self.args.pane_target,
+            );
+        }
+        self.pending_remote_kills = unresolved;
+    }
+
     fn stop_session(&mut self) {
-        if let Some(mut s) = self.session.take() {
+        if let Some(mut s) = self.retire_session() {
             tokio::spawn(async move {
                 if s.mode == Mode::Control {
                     let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
@@ -920,9 +1139,15 @@ impl App {
             Mode::Observe => self.observe_size(),
             Mode::Control => self.control_size(),
         };
-        if let Some(s) = self.session.take() {
+        if let Some(s) = self.retire_session() {
             unsafe { libc::kill(s.pid, libc::SIGTERM) };
         }
+        // Before attaching, not after: the client we are replacing still holds
+        // the remote terminal, and a control attach beside it is refused
+        // outright ("already has an attached client"). This is also what stops
+        // a reconnect ladder against a half-broken transport from leaving one
+        // more remote client per rung.
+        self.reap_remote_clients().await;
         self.next_gen += 1;
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
@@ -1016,6 +1241,8 @@ impl App {
         }
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
+        // frames are flowing, so whatever was holding the terminal is gone
+        self.attach_conflict_retried = false;
         self.renderer.status("");
         let (fw, fh) = (
             frame.width.unwrap_or(self.grid.width),
@@ -1052,13 +1279,57 @@ impl App {
         }
     }
 
+    /// Adopt the pid the remote wrapper announced for this session, and publish
+    /// it so a streamer that replaces us can clean up if we are killed before
+    /// we can. A pid from a session we already replaced is still ours — queue
+    /// it for the kill rather than discarding it.
+    fn handle_remote_pid(&mut self, gen: u64, pid: i32) {
+        match self.session.as_mut() {
+            Some(session) if session.gen == gen => {
+                session.remote_pid = Some(pid);
+                crate::util::record_remote_client(
+                    &self.state_dir,
+                    &self.args.ssh_target,
+                    &self.args.pane_target,
+                    pid,
+                );
+            }
+            _ => self.queue_remote_kill(Some(pid)),
+        }
+    }
+
     fn handle_exit(&mut self, gen: u64, exited_mode: Mode, reason: String, uptime: Duration) {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
             return; // an old child we already replaced/killed
         }
-        self.session = None;
+        // The transport died; the remote client did not. It ignores the EOF
+        // (SIGPIPE is ignored by default in Rust), so it sits attached until
+        // this streamer clears it.
+        self.retire_session();
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        // A control attach refused because OUR previous client still holds the
+        // terminal is not a failing host: clear that client and try once more,
+        // rather than dropping the pane to read-only over our own leftovers.
+        if exited_mode == Mode::Control {
+            if let Some(pid) = attach_conflict_pid(
+                &reason_line,
+                self.pending_remote_kills.last().copied(),
+                self.attach_conflict_retried,
+            ) {
+                self.attach_conflict_retried = true;
+                self.control_failures = 0;
+                self.schedule_reconnect(Mode::Control, &reason_line);
+                // longer than the usual flash: the user did not cause this
+                self.hint_for(
+                    &format!(
+                        "control was held by our own stale remote client ({pid}) — clearing it"
+                    ),
+                    Duration::from_secs(3),
+                );
+                return;
+            }
+        }
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
@@ -1435,11 +1706,17 @@ fn spawn_supervised_streamer(agent: Option<&str>) -> Result<tokio::process::Chil
     Ok(command.spawn()?)
 }
 
+/// How long a stopped child may take to exit before it is SIGKILLed. Wider
+/// than the streamer's own remote-client cleanup deadline
+/// (`REMOTE_KILL_TIMEOUT`) plus its control release, so a child that is doing
+/// exactly what it should is not killed halfway through.
+const STREAMER_STOP_GRACE: Duration = Duration::from_secs(5);
+
 async fn stop_supervised_streamer(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
-    if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+    if tokio::time::timeout(STREAMER_STOP_GRACE, child.wait()).await.is_err() {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
@@ -1473,10 +1750,15 @@ pub async fn supervise(args: Args) -> Result<()> {
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
 
+    // Every exit from here is also an exit for the child's remote attach
+    // client. The child normally clears its own record on the way out, so
+    // these sweeps are no-ops; they matter exactly when it could not — a
+    // SIGKILL after the stop grace, or a panic.
     loop {
         tokio::select! {
             status = child.wait() => {
                 let status = status?;
+                reap_recorded_remote_client(&args, &state_dir).await;
                 return if status.success() {
                     Ok(())
                 } else {
@@ -1487,6 +1769,9 @@ pub async fn supervise(args: Args) -> Result<()> {
                 let next = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
                 if next != desired {
                     stop_supervised_streamer(&mut child).await;
+                    // the replacement attaches to the same remote pane, so an
+                    // orphan of the child we just stopped would refuse it
+                    reap_recorded_remote_client(&args, &state_dir).await;
                     desired = next;
                     child = spawn_supervised_streamer(desired.as_deref())?;
                 } else if let Some(pid) = child.id() {
@@ -1496,14 +1781,17 @@ pub async fn supervise(args: Args) -> Result<()> {
             }
             _ = sigterm.recv() => {
                 stop_supervised_streamer(&mut child).await;
+                reap_recorded_remote_client(&args, &state_dir).await;
                 return Ok(());
             }
             _ = sigint.recv() => {
                 stop_supervised_streamer(&mut child).await;
+                reap_recorded_remote_client(&args, &state_dir).await;
                 return Ok(());
             }
             _ = sighup.recv() => {
                 stop_supervised_streamer(&mut child).await;
+                reap_recorded_remote_client(&args, &state_dir).await;
                 return Ok(());
             }
         }
@@ -1595,6 +1883,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut app = App {
         args,
+        state_dir: state_dir.clone(),
         tty,
         grid: Grid::new(),
         renderer: Renderer::new(),
@@ -1606,6 +1895,8 @@ pub async fn run(args: Args) -> Result<()> {
         next_gen: 0,
         backoff_idx: 0,
         reconnect_at: None,
+        pending_remote_kills: Vec::new(),
+        attach_conflict_retried: false,
         control_failures: 0,
         control_sticky: false,
         pending_input: Vec::new(),
@@ -1626,6 +1917,21 @@ pub async fn run(args: Args) -> Result<()> {
         paste_queue: Vec::new(),
         paste_original: None,
     };
+    // A streamer that was killed before it could clean up (a daemon restart, a
+    // closed pane, a SIGKILL) leaves its remote client attached and its pid on
+    // disk. We are the next streamer for that same mirror pane, so the record
+    // is ours to spend: `connect` clears it before asking for the terminal the
+    // orphan is still holding. `--dump` never publishes a record and must not
+    // consume one.
+    if !app.args.dump {
+        let adopted = crate::util::take_remote_client(
+            &state_dir,
+            &app.args.ssh_target,
+            &app.args.pane_target,
+        );
+        app.queue_remote_kill(adopted);
+    }
+
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
     // entering Control with a size we cannot vouch for is what let a local herdr
@@ -1677,6 +1983,7 @@ pub async fn run(args: Args) -> Result<()> {
                 match msg {
                     None => break,
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
+                    Some(Msg::RemotePid { gen, pid }) => app.handle_remote_pid(gen, pid),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
@@ -1759,14 +2066,20 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // clean shutdown: release control if held, kill the ssh child, restore tty
-    if let Some(mut s) = app.session.take() {
+    // clean shutdown: release control if held, kill the ssh child AND the
+    // remote client it was carrying, restore tty. Killing only the local side
+    // is what left fifteen attached clients on `caddypayio-vm`.
+    if let Some(mut s) = app.retire_session() {
         if s.mode == Mode::Control {
             let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         unsafe { libc::kill(s.pid, libc::SIGTERM) };
     }
+    // Bounded by REMOTE_KILL_TIMEOUT for the batch: a supervisor waiting to
+    // replace this child, or a pane closing, must not be held up. Whatever is
+    // left unconfirmed stays recorded for the next streamer of this pane.
+    app.reap_remote_clients().await;
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
@@ -2188,6 +2501,131 @@ mod tests {
         let (_, idx) = reconnect_delay(false, 0);
         let (_, idx) = reconnect_delay(true, idx);
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
+    fn test_args(container: Option<ContainerArg>) -> Args {
+        Args {
+            ssh_target: "omnidev-greenroom".into(),
+            pane_target: "w1:p3".into(),
+            remote_bin: Some("/opt/herdr".into()),
+            cols: 240,
+            rows: 72,
+            dump: false,
+            session: Some("default".into()),
+            control_idle_secs: 3600,
+            always_control: true,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: None,
+            container,
+        }
+    }
+
+    /// The pid line is the whole handle on the remote client. It has to be
+    /// recognisable in a stream that also carries herdr's JSON frames, and
+    /// nothing else may be mistaken for it.
+    #[test]
+    fn the_remote_pid_line_is_read_and_nothing_else_is() {
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid 4703"), Some(4703));
+        // ssh can deliver it with the line ending still attached
+        assert_eq!(remote_pid_from_line("  herdr-mirror-remote-pid 4703\r"), Some(4703));
+
+        // a frame, a banner, a truncated line, and a pid we must never signal
+        assert_eq!(remote_pid_from_line(r#"{"type":"terminal.frame","seq":1}"#), None);
+        assert_eq!(remote_pid_from_line("Welcome to Ubuntu 24.04"), None);
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid"), None);
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid nope"), None);
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid 4703 extra"), None);
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid 1"), None);
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid 0"), None);
+        assert_eq!(remote_pid_from_line("herdr-mirror-remote-pid -1"), None);
+    }
+
+    /// `$$` must be the pid of the process that ends up attached: the wrapper
+    /// announces it and then `exec`s the client over itself.
+    #[test]
+    fn the_remote_script_announces_the_pid_it_then_becomes() {
+        let script = remote_session_script(&test_args(None), Mode::Control, 100, 40);
+
+        assert_eq!(
+            script,
+            "echo herdr-mirror-remote-pid $$; \
+exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 --rows 40"
+        );
+        // one process, so the announced pid is the one that survives
+        assert_eq!(script.matches("exec ").count(), 1);
+    }
+
+    /// The remote login shell may be fish or csh, where `$$` is not a pid and
+    /// `$(…)` does not parse. Everything unportable has to sit inside single
+    /// quotes that only the `sh` we name ever opens.
+    #[test]
+    fn unportable_syntax_is_hidden_from_the_remote_login_shell() {
+        let wrapped = sh_wrapped("echo herdr-mirror-remote-pid $$; exec herdr terminal session");
+
+        assert_eq!(
+            wrapped,
+            "exec sh -c 'echo herdr-mirror-remote-pid $$; exec herdr terminal session'"
+        );
+        // a quote in the payload cannot break out of the wrapper
+        assert_eq!(sh_wrapped("a 'b' c"), r#"exec sh -c 'a '\''b'\'' c'"#);
+    }
+
+    /// A recorded pid can be hours old and remote pids get reused, and the same
+    /// host runs the herdr SERVER. The kill must identify its target first.
+    #[test]
+    fn a_remote_kill_identifies_its_target_before_signalling_it() {
+        let script = remote_kill_script(4703);
+
+        assert!(script.contains("ps -o args= -p"));
+        assert!(script.contains(r#"*"terminal session"*"#));
+        assert!(script.contains("kill -TERM"));
+        // no unguarded kill except on a host with no ps at all
+        assert_eq!(script.matches("kill -TERM").count(), 2);
+        assert!(script.contains("command -v ps"));
+    }
+
+    /// Evicting a client is only ever right for one we created ourselves.
+    #[test]
+    fn only_our_own_orphan_is_cleared_off_a_refused_control_attach() {
+        let refused = "terminal attach failed: terminal 7 already has an attached client; retry";
+
+        assert_eq!(attach_conflict_pid(refused, Some(4703), false), Some(4703));
+        // a person on the other end, with nothing of ours to blame
+        assert_eq!(attach_conflict_pid(refused, None, false), None);
+        // once only: two streamers must not fight over one terminal
+        assert_eq!(attach_conflict_pid(refused, Some(4703), true), None);
+        // any other failure keeps the ordinary control fallback
+        assert_eq!(attach_conflict_pid("ssh: connect timed out", Some(4703), false), None);
+        assert_eq!(attach_conflict_pid("", Some(4703), false), None);
+        // never a pid that cannot be one of ours
+        assert_eq!(attach_conflict_pid(refused, Some(1), false), None);
+    }
+
+    /// The queue is a retry list, not a leak: bounded, de-duplicated, and
+    /// oldest-first so the pid most likely to still be attached is kept.
+    #[test]
+    fn queued_remote_kills_are_bounded_and_deduplicated() {
+        let mut pending: Vec<i32> = Vec::new();
+        let mut queue = |pending: &mut Vec<i32>, pid: i32| {
+            if pid <= 1 || pending.contains(&pid) {
+                return;
+            }
+            if pending.len() >= MAX_PENDING_REMOTE_KILLS {
+                pending.remove(0);
+            }
+            pending.push(pid);
+        };
+        for pid in 100..100 + MAX_PENDING_REMOTE_KILLS as i32 + 2 {
+            queue(&mut pending, pid);
+        }
+        queue(&mut pending, 105);
+        queue(&mut pending, 1);
+
+        assert_eq!(pending.len(), MAX_PENDING_REMOTE_KILLS);
+        assert_eq!(pending.first().copied(), Some(102));
+        assert_eq!(pending.iter().filter(|p| **p == 105).count(), 1);
+        assert!(!pending.contains(&1));
     }
 
 }

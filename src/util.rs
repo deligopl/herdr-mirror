@@ -278,6 +278,56 @@ pub enum StreamerSpawnClaim {
     Pending,
 }
 
+/// Where a streamer records the pid of the remote `herdr … terminal session …`
+/// client it attached, so something else can terminate it if the streamer
+/// cannot.
+///
+/// That client is a child of the remote Coder agent (or of dockerd), not of
+/// the ssh process carrying its stdio, and it does not exit when that stdio
+/// dies: Rust ignores SIGPIPE by default, so a write to a dead transport is an
+/// error the client logs rather than a signal that kills it. Nothing on the
+/// remote reaps it. Measured on `caddypayio-vm` on 2026-08-29: fifteen stale
+/// clients over seven hours, two of them *controlling* clients, which is what
+/// made the next streamer read "terminal … already has an attached client".
+///
+/// Addressed by host and remote pane, like `streamer_pid_path`, because that
+/// is the identity the *next* streamer for the same mirror pane shares with
+/// the one that died — a supervisor's replacement child, or one the daemon's
+/// heal types back in. Whoever runs next adopts the record and clears the
+/// client its predecessor left behind.
+pub fn remote_client_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
+    state_dir
+        .join("remote-clients")
+        .join(format!("{}--{}.pid", sane_component(ssh_target), sane_component(pane_target)))
+}
+
+/// Publish the remote client pid for this mirror pane (best effort: the record
+/// is a recovery aid, and a streamer that cannot write it still kills its own
+/// client on the way out).
+pub fn record_remote_client(state_dir: &Path, ssh_target: &str, pane_target: &str, pid: i32) {
+    let path = remote_client_pid_path(state_dir, ssh_target, pane_target);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, pid.to_string());
+}
+
+/// Adopt a recorded remote client: read it and drop the record in one step, so
+/// two streamers racing to clean up after a third cannot both try.
+///
+/// `> 1` is the same guard the pane poke uses: pid 1 and 0 are never ours, and
+/// a truncated or half-written file must not resolve to a signal target.
+pub fn take_remote_client(state_dir: &Path, ssh_target: &str, pane_target: &str) -> Option<i32> {
+    let path = remote_client_pid_path(state_dir, ssh_target, pane_target);
+    let pid = fs::read_to_string(&path).ok()?.trim().parse::<i32>().ok().filter(|p| *p > 1);
+    let _ = fs::remove_file(&path);
+    pid
+}
+
+pub fn clear_remote_client(state_dir: &Path, ssh_target: &str, pane_target: &str) {
+    let _ = fs::remove_file(remote_client_pid_path(state_dir, ssh_target, pane_target));
+}
+
 /// Where the streamer of a given LOCAL herdr pane announces its pid.
 ///
 /// `streamer_pid_path` addresses a streamer by what it is showing (host + remote
@@ -403,6 +453,48 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn a_remote_client_record_is_adopted_once() {
+        let state_dir = test_state_dir("remote-client");
+
+        assert_eq!(take_remote_client(&state_dir, "host", "w1:p1"), None);
+        record_remote_client(&state_dir, "host", "w1:p1", 4242);
+        assert_eq!(take_remote_client(&state_dir, "host", "w1:p1"), Some(4242));
+        // taking it removes it: a second streamer must not chase the same pid
+        assert_eq!(take_remote_client(&state_dir, "host", "w1:p1"), None);
+
+        // a nonsense record resolves to nothing rather than to a signal target
+        let path = remote_client_pid_path(&state_dir, "host", "w1:p1");
+        fs::write(&path, "1").unwrap();
+        assert_eq!(take_remote_client(&state_dir, "host", "w1:p1"), None);
+        fs::write(&path, "not a pid").unwrap();
+        assert_eq!(take_remote_client(&state_dir, "host", "w1:p1"), None);
+
+        record_remote_client(&state_dir, "host", "w1:p1", 7);
+        clear_remote_client(&state_dir, "host", "w1:p1");
+        assert_eq!(take_remote_client(&state_dir, "host", "w1:p1"), None);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    /// Two mirror panes on one host, and one remote pane on two hosts, must
+    /// not share a record — the pid only means anything on its own transport.
+    #[test]
+    fn remote_client_records_are_per_host_and_pane() {
+        let state_dir = test_state_dir("remote-client-ids");
+        assert_ne!(
+            remote_client_pid_path(&state_dir, "host", "w1:p1"),
+            remote_client_pid_path(&state_dir, "host", "w1:p2")
+        );
+        assert_ne!(
+            remote_client_pid_path(&state_dir, "host", "w1:p1"),
+            remote_client_pid_path(&state_dir, "other", "w1:p1")
+        );
+        assert_ne!(
+            remote_client_pid_path(&state_dir, "host", "w1:p1"),
+            streamer_pid_path(&state_dir, "host", "w1:p1")
+        );
     }
 
     #[test]
