@@ -72,6 +72,25 @@ struct HostCtx {
     closes: crate::closes::Closes,
 }
 
+#[derive(Debug)]
+enum HostSignal {
+    Converge,
+    LocalPaneUpdated(String),
+}
+
+async fn capture_local_update(ctx: &HostCtx, signal: HostSignal) {
+    if let HostSignal::LocalPaneUpdated(pane_id) = signal {
+        crate::mirror::capture_local_rosemary_clear(
+            &ctx.local,
+            &ctx.env_state_dir,
+            &ctx.host.name,
+            &pane_id,
+            &ctx.log,
+        )
+        .await;
+    }
+}
+
 const BROADCAST_SUBS: &[&str] = &[
     "workspace.created",
     "workspace.renamed",
@@ -140,7 +159,7 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
     let mut state = load_state(&ctx.env_state_dir, &ctx.host.name);
     let mut need_converge = false;
     for (remote_id, data) in pending {
-        let Some(entry) = state.panes.get_mut(&remote_id) else {
+        let Some(entry) = state.panes.get(&remote_id) else {
             need_converge = true; // unknown pane → let a full pass create it
             continue;
         };
@@ -149,13 +168,21 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
         }
         let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
         let agent = info.has_agent().then_some(&info);
+        let desired_name = agent.and_then(|agent| {
+            crate::mirror::mirrored_agent_name(&ctx.host.name, agent.name.as_deref())
+        });
+        if entry.reported_name != desired_name {
+            need_converge = true; // rebuild the complete collision map first
+            continue;
+        }
         push_pane_status(
             &ctx.local,
             &ctx.env_state_dir,
             &ctx.host.name,
             &remote_id,
-            entry,
+            &mut state,
             agent,
+            desired_name,
             &ctx.log,
         )
         .await;
@@ -195,7 +222,7 @@ fn remember_transport(
 /// until the connection drops (returns Err).
 async fn run_connected(
     ctx: &HostCtx,
-    poke: &mut mpsc::Receiver<()>,
+    poke: &mut mpsc::Receiver<HostSignal>,
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
@@ -269,7 +296,10 @@ async fn run_connected(
                     }
                 }
             }
-            Some(()) = poke.recv() => {
+            Some(signal) = poke.recv() => {
+                // This host task is the single writer: observe and durably
+                // suppress a local clear before any later projection.
+                capture_local_update(ctx, signal).await;
                 converge_at.get_or_insert(Instant::now());
             }
             _ = sleep => {
@@ -319,7 +349,7 @@ async fn run_connected(
 const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
 const DORMANT_DELAY: u64 = 300;
 
-async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
+async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
     let mut backoff_idx = 0usize;
     let mut was_dormant = false;
     // persists across reconnects for the daemon's whole lifetime — the
@@ -377,7 +407,9 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         was_dormant = dormant;
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
         // about now, and honouring them would skip the sleep entirely
-        while poke.try_recv().is_ok() {}
+        while let Ok(signal) = poke.try_recv() {
+            capture_local_update(&ctx, signal).await;
+        }
         // Wake early only for a hidden host, whose close is genuinely waiting on
         // us and would otherwise sit behind a 300s dormant sleep, or for an
         // explicit `herdr-mirror wake <host>`: someone has just started that
@@ -393,7 +425,10 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
-                _ = poke.recv() => {
+                signal = poke.recv() => {
+                    if let Some(signal) = signal {
+                        capture_local_update(&ctx, signal).await;
+                    }
                     if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name)
                         || crate::state::take_wake(&ctx.env_state_dir, &ctx.host.name)
                     {
@@ -402,7 +437,9 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
                 }
             }
         }
-        while poke.try_recv().is_ok() {}
+        while let Ok(signal) = poke.try_recv() {
+            capture_local_update(&ctx, signal).await;
+        }
     }
 }
 
@@ -440,7 +477,7 @@ async fn heal_zombie_mirrors(
     local: &ApiClient,
     state_dir: &std::path::Path,
     hosts: &[HostConfig],
-    pokers: &[mpsc::Sender<()>],
+    pokers: &[mpsc::Sender<HostSignal>],
     log: &Logger,
 ) {
     for (i, h) in hosts.iter().enumerate() {
@@ -501,7 +538,7 @@ async fn heal_zombie_mirrors(
             )
             .await;
         }
-        let _ = pokers[i].try_send(());
+        let _ = pokers[i].try_send(HostSignal::Converge);
     }
 }
 
@@ -509,7 +546,7 @@ async fn heal_zombie_mirrors(
 /// next converge records the user's intent promptly.
 async fn local_events_task(
     local: ApiClient,
-    pokers: Vec<mpsc::Sender<()>>,
+    pokers: Vec<mpsc::Sender<HostSignal>>,
     prefixes: Vec<String>,
     hosts: Vec<HostConfig>,
     state_dir: PathBuf,
@@ -521,6 +558,9 @@ async fn local_events_task(
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
+            // Rosemary clears run metadata in place. The event is only a
+            // doorbell; each host task re-reads the authoritative pane.
+            json!({ "type": "pane.updated" }),
             // closing a TAB emits only tab_closed — no pane_closed for the
             // panes inside it — so without this a tab close never counts as
             // user intent and close-through silently degrades to tombstoning
@@ -559,8 +599,19 @@ async fn local_events_task(
                             }
                         }
                     }
+                    let pane_updated = (e.event == "pane_updated")
+                        .then(|| e.data.get("pane_id").and_then(|value| value.as_str()))
+                        .flatten()
+                        .map(str::to_string);
                     for p in &pokers {
-                        let _ = p.try_send(());
+                        if let Some(pane_id) = &pane_updated {
+                            // A bounded suppression signal is never optional:
+                            // backpressure this one event rather than dropping
+                            // it behind cosmetic layout traffic.
+                            let _ = p.send(HostSignal::LocalPaneUpdated(pane_id.clone())).await;
+                        } else {
+                            let _ = p.try_send(HostSignal::Converge);
+                        }
                     }
                     // a workspace appeared/left — keep hosts grouped (no-op if already)
                     regroup_sidebar(&local, &prefixes, &log).await;
@@ -612,7 +663,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             .await;
     }
     let closes = crate::closes::new_closes();
-    let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
+    let mut pokers: Vec<mpsc::Sender<HostSignal>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
         let (tx, rx) = mpsc::channel(8);
@@ -654,7 +705,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         tokio::select! {
             _ = poll.tick() => {
                 for p in &pokers {
-                    let _ = p.try_send(());
+                    let _ = p.try_send(HostSignal::Converge);
                 }
             }
             _ = heal.tick() => {
@@ -669,7 +720,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
                 // restore pokes us instead of converging itself — single writer
                 log.log("sync poke received");
                 for p in &pokers {
-                    let _ = p.try_send(());
+                    let _ = p.try_send(HostSignal::Converge);
                 }
             }
             _ = sigterm.recv() => break,

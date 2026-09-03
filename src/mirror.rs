@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::api::ApiClient;
 use crate::config::HostConfig;
-use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
+use crate::state::{load_state, save_state, HostState, PaneEntry, RosemaryRun, WsEntry};
 use crate::util::{Logger, Result};
 
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
@@ -85,6 +86,19 @@ pub struct AgentInfo {
     /// `default` on purpose: a pre-0.7.4 remote never sends this.
     #[serde(default)]
     pub tokens: HashMap<String, String>,
+    /// True only when the remote Herdr has verified that the harness can
+    /// accept a typed prompt. Missing on older remotes means not ready.
+    #[serde(default)]
+    pub interactive_ready: bool,
+    /// Harness-session evidence observed by the remote Herdr. Mirror forwards
+    /// the public id only when the remote also says the pane is ready.
+    #[serde(default)]
+    pub agent_session: Option<AgentSessionInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentSessionInfo {
+    pub value: String,
 }
 
 impl AgentInfo {
@@ -1325,6 +1339,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             seq,
                             reported: None,
                             reported_name: None,
+                            remote_agent_name: None,
+                            projected_rosemary_run: None,
                         },
                     );
                     fresh.push(local_id.clone());
@@ -1407,6 +1423,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             seq: 0,
                             reported: None,
                             reported_name: None,
+                            remote_agent_name: None,
+                            projected_rosemary_run: None,
                         },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
@@ -1456,6 +1474,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             seq: 0,
                             reported: None,
                             reported_name: None,
+                            remote_agent_name: None,
+                            projected_rosemary_run: None,
                         },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
@@ -1554,18 +1574,128 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 /// Push one pane's authoritative status (or retract it when the remote agent
 /// is gone). Mutates only its own entry (seq/reported). Reused by both the
 /// full converge and the daemon's status fast-path.
+const ROSEMARY_RUN_KEYS: [&str; 4] = [
+    "rosemary_binding",
+    "rosemary_outcome",
+    "rosemary_commit",
+    "rosemary_summary",
+];
+
+fn rosemary_run(tokens: &HashMap<String, String>) -> Option<RosemaryRun> {
+    let binding = tokens.get(ROSEMARY_RUN_KEYS[0])?.trim();
+    if binding.is_empty() {
+        return None;
+    }
+    Some(RosemaryRun {
+        binding: binding.to_string(),
+        outcome: tokens.get(ROSEMARY_RUN_KEYS[1]).cloned(),
+        commit: tokens.get(ROSEMARY_RUN_KEYS[2]).cloned(),
+        summary: tokens.get(ROSEMARY_RUN_KEYS[3]).cloned(),
+    })
+}
+
+fn projected_tokens(
+    state: &mut HostState,
+    remote_name: Option<&str>,
+    tokens: &HashMap<String, String>,
+) -> (BTreeMap<String, Value>, BTreeMap<String, Value>, Option<RosemaryRun>) {
+    let mut ordinary: BTreeMap<String, Value> = tokens
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+    for key in ROSEMARY_RUN_KEYS {
+        // Revision 6 projected everything under mirror:<host>. Nulling these
+        // keys retires that legacy ownership before rosemary-run takes over.
+        ordinary.insert(key.to_string(), Value::Null);
+    }
+    let cleared = || {
+        ROSEMARY_RUN_KEYS
+            .into_iter()
+            .map(|key| (key.to_string(), Value::Null))
+            .collect()
+    };
+    let Some(remote_name) = remote_name.filter(|name| !name.is_empty()) else {
+        return (ordinary, cleared(), rosemary_run(tokens));
+    };
+    let run = rosemary_run(tokens);
+    if let (Some(suppressed), Some(current)) =
+        (state.rosemary_suppressions.get(remote_name), run.as_ref())
+    {
+        if current.binding != suppressed.binding {
+            state.rosemary_suppressions.remove(remote_name);
+        } else if current == suppressed {
+            return (ordinary, cleared(), None);
+        }
+    }
+    let rosemary = ROSEMARY_RUN_KEYS
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_string(),
+                tokens.get(key).map(|value| json!(value)).unwrap_or(Value::Null),
+            )
+        })
+        .collect();
+    (ordinary, rosemary, run)
+}
+
+/// A local `pane.updated` is only a doorbell. Read the authoritative pane and,
+/// when Rosemary removed the exact tuple we most recently projected, persist
+/// suppression before the host task is allowed to reconcile again.
+pub async fn capture_local_rosemary_clear(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    local_pane_id: &str,
+    log: &Logger,
+) {
+    let mut state = load_state(state_dir, host_name);
+    let Some(entry) = state.panes.values().find(|entry| entry.local_id == local_pane_id) else {
+        return;
+    };
+    let (Some(remote_name), Some(projected)) =
+        (entry.remote_agent_name.clone(), entry.projected_rosemary_run.clone())
+    else {
+        return;
+    };
+    let Ok(snapshot) = fetch_snapshot(local).await else {
+        return;
+    };
+    let tokens = snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == local_pane_id)
+        .map(|agent| &agent.tokens);
+    let cleared = tokens.is_some_and(|tokens| {
+        ROSEMARY_RUN_KEYS.iter().all(|key| !tokens.contains_key(*key))
+    });
+    if !cleared {
+        return;
+    }
+    state.rosemary_suppressions.insert(remote_name.clone(), projected);
+    if let Err(error) = save_state(state_dir, host_name, &state) {
+        log.log(&format!("[{host_name}] could not persist Rosemary suppression for {remote_name}: {error}"));
+    }
+}
+
 pub async fn push_pane_status(
     local: &ApiClient,
     state_dir: &std::path::Path,
     host_name: &str,
     remote_id: &str,
-    entry: &mut PaneEntry,
+    state: &mut HostState,
     agent: Option<&AgentInfo>,
+    desired_name: Option<String>,
     log: &Logger,
 ) {
-    if entry.is_tombstoned() {
+    if state.panes.get(remote_id).is_none_or(PaneEntry::is_tombstoned) {
         return;
     }
+    let remote_name = agent.and_then(|agent| agent.name.as_deref()).filter(|name| !name.is_empty());
+    let (projected_agent_tokens, projected_rosemary_tokens, projected_run) = agent
+        .map(|agent| projected_tokens(state, remote_name, &agent.tokens))
+        .unwrap_or_default();
+    let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
     let source = mirror_source(host_name);
     match agent {
         Some(agent) => {
@@ -1593,6 +1723,11 @@ pub async fn push_pane_status(
                 "state": map_status(status),
                 "seq": entry.seq,
             });
+            report["agent_session_id"] = if agent.interactive_ready {
+                agent.agent_session.as_ref().map(|session| json!(session.value)).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
             if let Some(c) = &custom {
                 report["custom_status"] = json!(c);
             }
@@ -1619,11 +1754,10 @@ pub async fn push_pane_status(
             // Agent names are session-global on the local Herdr server. A
             // remote fleet commonly repeats role names such as `conductor`,
             // so namespace the remote name with the stable Mirror host id.
-            // Preserve an already-namespaced name to keep reconciliation
-            // idempotent when the remote deliberately uses the same identity,
-            // and keep the result inside the local server's 32-character rule
-            // — a name it refuses is retried here on every single poll.
-            let desired_name = mirrored_agent_name(host_name, agent.name.as_deref());
+            // Resolve the whole snapshot before this call, and keep the result
+            // inside the local server's 32-character rule. A refused or
+            // residual-collision name is cleared instead of leaving an older
+            // dispatch identity behind.
             if desired_name != entry.reported_name {
                 match local
                     .request(
@@ -1633,10 +1767,25 @@ pub async fn push_pane_status(
                     .await
                 {
                     Ok(_) => entry.reported_name = desired_name.clone(),
-                    Err(e) => log.log(&format!(
-                        "rename mirrored agent {} to {:?}: {e}",
-                        entry.local_id, desired_name
-                    )),
+                    Err(e) => {
+                        log.log(&format!(
+                            "rename mirrored agent {} to {:?}: {e}",
+                            entry.local_id, desired_name
+                        ));
+                        let _ = local.request(
+                            "agent.rename",
+                            json!({ "target": entry.local_id, "name": Value::Null }),
+                        ).await;
+                        let _ = local.request(
+                            "pane.clear_agent_authority",
+                            json!({ "pane_id": entry.local_id, "source": source }),
+                        ).await;
+                        entry.reported_name = None;
+                        entry.reported = None;
+                        entry.remote_agent_name = None;
+                        entry.projected_rosemary_run = None;
+                        return;
+                    }
                 }
             }
             // forward the remote's own tokens so a mirrored agent row carries the
@@ -1648,13 +1797,31 @@ pub async fn push_pane_status(
                 "display_agent": display,
                 "title": agent.effective_title(),
                 "state_labels": agent.state_labels.clone().unwrap_or_default(),
-                "tokens": agent.tokens.clone(),
+                "tokens": projected_agent_tokens,
                 "seq": entry.seq,
             });
             if custom.is_none() {
                 meta["clear_custom_status"] = json!(true);
             }
-            let _ = local.request("pane.report_metadata", meta).await;
+            if let Err(error) = local.request("pane.report_metadata", meta).await {
+                log.log(&format!("report_metadata {}: {error}", entry.local_id));
+            }
+            let rosemary_meta = json!({
+                "pane_id": entry.local_id,
+                "source": "rosemary-run",
+                "tokens": projected_rosemary_tokens,
+                "seq": entry.seq,
+            });
+            match local.request("pane.report_metadata", rosemary_meta).await {
+                Ok(_) => {
+                    entry.remote_agent_name = remote_name.map(str::to_string);
+                    entry.projected_rosemary_run = projected_run;
+                }
+                Err(error) => log.log(&format!(
+                    "report Rosemary metadata {}: {error}",
+                    entry.local_id
+                )),
+            }
             entry.reported = Some(label);
         }
         None => {
@@ -1703,7 +1870,21 @@ pub async fn push_pane_status(
                     }),
                 )
                 .await;
+            let _ = local
+                .request(
+                    "pane.report_metadata",
+                    json!({
+                        "pane_id": entry.local_id,
+                        "source": "rosemary-run",
+                        "tokens": ROSEMARY_RUN_KEYS.into_iter()
+                            .map(|key| (key, Value::Null)).collect::<BTreeMap<_, _>>(),
+                        "seq": entry.seq,
+                    }),
+                )
+                .await;
             entry.reported = None;
+            entry.remote_agent_name = None;
+            entry.projected_rosemary_run = None;
         }
     }
 }
@@ -1751,42 +1932,20 @@ fn legal_agent_name(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Is this name already namespaced by this host?
-///
-/// Checked against every prefix of the host the namespacing below can produce,
-/// not just the full one, because the host prefix is shortened when the
-/// combined name would not fit. Without that, feeding a shortened result back
-/// in would namespace it a second time and the name would drift on every
-/// converge.
-///
-/// The cost is that a remote agent genuinely named `cad-foo` counts as
-/// namespaced on a host called `caddypayio-vm` and keeps its own name. That is
-/// the right trade: the alternative is a name that changes every poll.
-fn is_host_namespaced(host: &str, name: &str) -> bool {
-    (HOST_PREFIX_MIN..=host.len()).any(|k| {
-        let prefix = &host[..k];
-        // `name == prefix` as well as `prefix-`: truncation can leave a name
-        // that IS the prefix (a remote name that folded away to nothing), and
-        // it has to stay put on the next converge like any other.
-        name == prefix || name.starts_with(&format!("{prefix}-"))
-    })
-}
-
 /// The local name for a mirrored remote agent: the remote's own name,
 /// namespaced by the Mirror host so two fleets can both run a `conductor`, and
 /// always a name the local server will accept.
 ///
-/// Fitting order is deliberate. The remote name is what the owner recognises,
-/// so the host prefix gives up its characters first (down to
-/// `HOST_PREFIX_MIN`), and only then is the remote name truncated. Live on
-/// 2026-08-29, `caddypayio-vm` + `remote-conductor-rosie` came to 36
-/// characters and every rename was refused; it now fits as
-/// `caddypayi-remote-conductor-rosie`.
-///
-/// Deterministic and idempotent: the same pair always yields the same name, and
-/// feeding a result back in returns it unchanged.
-fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) -> Option<String> {
-    let remote = sanitize_agent_component(remote_name?);
+/// An already-legal full name is retained. Only names that need shortening get
+/// a digest, derived from the exact source pair before either half is folded.
+/// The complete Rosemary conductor suffix is kept because it is dispatch
+/// identity, not decoration.
+pub(crate) fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) -> Option<String> {
+    let exact_remote = remote_name?;
+    if exact_remote.trim().is_empty() {
+        return None;
+    }
+    let remote = sanitize_agent_component(exact_remote);
     // A remote name of nothing but separators would collapse to the bare host
     // prefix, and every such agent on that host would collapse to the SAME
     // name. No name at all is better: the mirrored row keeps the remote's
@@ -1795,18 +1954,56 @@ fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) -> Option<Str
         return None;
     }
     let host = sanitize_agent_component(host_name);
-    if host.is_empty() || is_host_namespaced(&host, &remote) {
-        return legal_agent_name(&remote);
+    if host.is_empty() {
+        return None;
     }
-    // characters left for the host once the remote name and the separator are
-    // paid for; clamped so the prefix stays useful at one end and always leaves
-    // room for at least one character of the remote name at the other
-    let want = AGENT_NAME_MAX.saturating_sub(remote.len() + 1);
-    let prefix_len =
-        want.clamp(HOST_PREFIX_MIN.min(host.len()), host.len().min(AGENT_NAME_MAX - 2));
-    let prefix = host[..prefix_len].trim_end_matches('-');
-    let body = &remote[..remote.len().min(AGENT_NAME_MAX - prefix_len - 1)];
-    legal_agent_name(&format!("{prefix}-{body}"))
+    let full = format!("{host}-{remote}");
+    if full.len() <= AGENT_NAME_MAX {
+        return legal_agent_name(&full);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(host_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(exact_remote.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let digest = &digest[..8];
+    const ROSIE_SUFFIX: &str = "-conductor-rosie";
+    let suffix = remote.ends_with(ROSIE_SUFFIX).then_some(ROSIE_SUFFIX).unwrap_or("");
+    let prefix_budget = AGENT_NAME_MAX - 1 - digest.len() - suffix.len();
+    let readable = full
+        .trim_start_matches(|c: char| !c.is_ascii_lowercase())
+        .chars()
+        .take(prefix_budget.max(HOST_PREFIX_MIN))
+        .collect::<String>();
+    let readable = readable.trim_end_matches(['-', '_']);
+    if readable.is_empty() || readable.len() > prefix_budget {
+        return None;
+    }
+    legal_agent_name(&format!("{readable}-{digest}{suffix}"))
+}
+
+/// Resolve every name before any pane is advertised. A residual duplicate is
+/// deliberately represented as no name for every affected pane.
+fn mirrored_agent_names<'a>(
+    host_name: &str,
+    agents: impl Iterator<Item = &'a AgentInfo>,
+) -> HashMap<String, Option<String>> {
+    let mut planned = HashMap::new();
+    let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+    for agent in agents {
+        let candidate = mirrored_agent_name(host_name, agent.name.as_deref());
+        if let Some(name) = &candidate {
+            owners.entry(name.clone()).or_default().push(agent.pane_id.clone());
+        }
+        planned.insert(agent.pane_id.clone(), candidate);
+    }
+    for panes in owners.values().filter(|panes| panes.len() > 1) {
+        for pane in panes {
+            planned.insert(pane.clone(), None);
+        }
+    }
+    planned
 }
 
 /// Authoritative close path: apply explicit remote `*.closed` events by closing
@@ -1853,15 +2050,18 @@ pub async fn apply_remote_closes(
 pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
     let agent_by_pane: HashMap<&str, &AgentInfo> =
         remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
-    for (remote_id, entry) in state.panes.iter_mut() {
+    let names = mirrored_agent_names(&deps.host.name, remote_snap.agents.iter());
+    let remote_ids: Vec<String> = state.panes.keys().cloned().collect();
+    for remote_id in remote_ids {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
         push_pane_status(
             &deps.local,
             &deps.state_dir,
             &deps.host.name,
-            remote_id,
-            entry,
+            &remote_id,
+            state,
             agent,
+            names.get(&remote_id).cloned().flatten(),
             &deps.log,
         )
         .await;
@@ -2060,6 +2260,110 @@ mod tests {
     }
     use super::*;
 
+    struct FakePeer {
+        path: PathBuf,
+        snapshot: std::sync::Arc<std::sync::Mutex<Value>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakePeer {
+        async fn start(label: &str, snapshot: Value) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            use tokio::net::UnixListener;
+
+            let path = std::env::temp_dir().join(format!(
+                "herdr-mirror-rosemary-{}-{label}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).unwrap();
+            let snapshot = std::sync::Arc::new(std::sync::Mutex::new(snapshot));
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let snapshots = snapshot.clone();
+            let captured = requests.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else { break };
+                    let snapshots = snapshots.clone();
+                    let captured = captured.clone();
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut lines = BufReader::new(read).lines();
+                        let Ok(Some(line)) = lines.next_line().await else { return };
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        captured.lock().unwrap().push(request.clone());
+                        let result = if request["method"] == "session.snapshot" {
+                            json!({"snapshot": snapshots.lock().unwrap().clone()})
+                        } else {
+                            json!({"type": "ok"})
+                        };
+                        let response = json!({"id": request["id"], "result": result});
+                        write.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+                    });
+                }
+            });
+            Self { path, snapshot, requests, task }
+        }
+
+        fn set_snapshot(&self, snapshot: Value) {
+            *self.snapshot.lock().unwrap() = snapshot;
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakePeer {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn remote_rosemary_snapshot(binding: &str) -> Value {
+        json!({
+            "workspaces": [{"workspace_id": "rw", "label": "feature", "tab_count": 1,
+                "pane_count": 1, "active_tab_id": "rt", "tokens": {"rosemary_project": "garden"}}],
+            "tabs": [{"tab_id": "rt", "workspace_id": "rw", "label": "main"}],
+            "panes": [{"pane_id": "rp", "tab_id": "rt", "workspace_id": "rw",
+                "label": null, "cwd": "/project", "foreground_cwd": "/project"}],
+            "agents": [{"pane_id": "rp", "agent": "codex", "display_agent": "Codex",
+                "name": "conductor-rosie", "agent_status": "idle", "interactive_ready": true,
+                "agent_session": {"agent": "codex", "kind": "id", "source": "herdr:codex",
+                    "value": "remote-session"},
+                "tokens": {"rosemary_binding": binding, "rosemary_outcome": "complete",
+                    "rosemary_commit": "abc123", "rosemary_summary": "done"}}],
+            "layouts": []
+        })
+    }
+
+    fn local_rosemary_snapshot(local_pane: &str, include_run: bool) -> Value {
+        let tokens = if include_run {
+            json!({"rosemary_binding": "run-1", "rosemary_outcome": "complete",
+                "rosemary_commit": "abc123", "rosemary_summary": "done"})
+        } else {
+            json!({})
+        };
+        json!({
+            "workspaces": [
+                {"workspace_id": "lw", "label": "vps: feature", "tab_count": 1, "pane_count": 1, "active_tab_id": "lt"},
+                {"workspace_id": "native-w", "label": "native", "tab_count": 1, "pane_count": 1, "active_tab_id": "native-t"}],
+            "tabs": [{"tab_id": "lt", "workspace_id": "lw", "label": "main"},
+                {"tab_id": "native-t", "workspace_id": "native-w", "label": "main"}],
+            "panes": [{"pane_id": local_pane, "tab_id": "lt", "workspace_id": "lw", "label": null,
+                    "cwd": "/tmp", "foreground_cwd": "/tmp"},
+                {"pane_id": "native-p", "tab_id": "native-t", "workspace_id": "native-w", "label": null,
+                    "cwd": "/native", "foreground_cwd": "/native"}],
+            "agents": [{"pane_id": local_pane, "agent": "codex", "name": "vps-conductor-rosie",
+                    "agent_status": "idle", "tokens": tokens},
+                {"pane_id": "native-p", "agent": "codex", "name": "native-agent", "agent_status": "idle",
+                    "interactive_ready": true, "agent_session": {"value": "native-session"}, "tokens": {}}],
+            "layouts": []
+        })
+    }
+
     fn ssh_host() -> HostConfig {
         HostConfig {
             name: "vps".into(),
@@ -2085,35 +2389,10 @@ mod tests {
         );
     }
 
+    /// One focused table covers the public naming contract. Generated outputs
+    /// are deliberately absent: they are not source identities.
     #[test]
-    fn remote_agent_names_are_namespaced_by_host() {
-        assert_eq!(
-            mirrored_agent_name("greenroom", Some("conductor")),
-            Some("greenroom-conductor".into())
-        );
-        assert_eq!(
-            mirrored_agent_name("greenroom", Some("greenroom-conductor")),
-            Some("greenroom-conductor".into())
-        );
-        assert_eq!(mirrored_agent_name("greenroom", Some("  ")), None);
-        assert_eq!(mirrored_agent_name("greenroom", None), None);
-    }
-
-    /// The live failure: `caddypayio-vm` + `remote-conductor-rosie` is 36
-    /// characters, and every `agent.rename` was refused, every poll, for hours.
-    #[test]
-    fn a_long_pair_is_shortened_at_the_host_prefix_first() {
-        let name = mirrored_agent_name("caddypayio-vm", Some("remote-conductor-rosie")).unwrap();
-
-        assert_eq!(name, "caddypayi-remote-conductor-rosie");
-        assert_eq!(name.len(), 32);
-        // the remote name — the half the owner recognises — survives intact
-        assert!(name.ends_with("remote-conductor-rosie"));
-    }
-
-    /// Whatever the pair, the result is a name the local server accepts.
-    #[test]
-    fn every_mirrored_agent_name_satisfies_the_local_rule() {
+    fn mirrored_name_table_is_legal_stable_and_collision_resistant() {
         let legal = |name: &String| {
             (1..=AGENT_NAME_MAX).contains(&name.len())
                 && name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -2122,28 +2401,48 @@ mod tests {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
         };
         let cases = [
-            ("caddypayio-vm", "remote-conductor-rosie"),
-            ("caddypayio-vm", "a"),
-            ("a-very-long-mirror-host-name-indeed", "conductor"),
-            ("a-very-long-mirror-host-name-indeed", "an-equally-long-remote-agent-name"),
-            ("greenroom", "Conductor Rosie"),
-            ("Green Room", "conductor"),
-            ("greenroom", "9lives"),
-            ("greenroom", "_x_"),
-            ("9", "conductor"),
+            ("greenroom", "conductor", "greenroom-conductor"),
+            (
+                "caddypayio-vm",
+                "remote-conductor-rosie",
+                "caddypa-bf6d3195-conductor-rosie",
+            ),
+            (
+                "a-very-long-mirror-host-name-indeed",
+                "conductor-for-the-first-workspace",
+                "a-very-long-mirror-host-3761cc1f",
+            ),
+            (
+                "a-very-long-mirror-host-name-indeed",
+                "conductor-for-the-first-workspace-two",
+                "a-very-long-mirror-host-269339fa",
+            ),
         ];
 
-        for (host, remote) in cases {
+        for (host, remote, expected) in cases {
             let name = mirrored_agent_name(host, Some(remote))
                 .unwrap_or_else(|| panic!("{host} + {remote} produced no name"));
+            assert_eq!(name, expected);
             assert!(legal(&name), "{host} + {remote} produced {name:?}");
-            // idempotent: converge asks for this name again on every poll
             assert_eq!(
-                mirrored_agent_name(host, Some(&name)),
+                mirrored_agent_name(host, Some(remote)),
                 Some(name.clone()),
-                "{host} + {remote} drifts on the second pass"
+                "{host} + {remote} is not deterministic"
             );
         }
+        assert!(cases[1].2.ends_with("-conductor-rosie"));
+        assert_ne!(cases[2].2, cases[3].2, "the formerly colliding pairs must differ");
+
+        let duplicate = AgentInfo {
+            pane_id: "p1".into(),
+            name: Some("same".into()),
+            ..AgentInfo::default()
+        };
+        let mut other = duplicate.clone();
+        other.pane_id = "p2".into();
+        let plan = mirrored_agent_names("host", [&duplicate, &other].into_iter());
+        assert_eq!(plan["p1"], None);
+        assert_eq!(plan["p2"], None);
     }
 
     /// A remote name with nothing usable in it is no name at all — better an
@@ -2165,18 +2464,192 @@ mod tests {
         );
     }
 
-    /// Two remote agents whose names differ only past the truncation point
-    /// still collide — the local server keeps one name per agent. Recorded
-    /// rather than fixed: a hash suffix would trade a readable name for a
-    /// case nobody has hit.
     #[test]
-    fn truncation_can_collide_and_that_is_deterministic() {
-        let host = "a-very-long-mirror-host-name-indeed";
-        let first = mirrored_agent_name(host, Some("conductor-for-the-first-workspace"));
-        let second = mirrored_agent_name(host, Some("conductor-for-the-first-workspace-two"));
+    fn rosemary_suppression_is_exact_durable_and_retires_only_for_a_new_binding() {
+        let dir = std::env::temp_dir().join(format!("hm-rosemary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = HostState::default();
+        let first = HashMap::from([
+            ("rosemary_binding".into(), "run-1".into()),
+            ("rosemary_outcome".into(), "complete".into()),
+            ("rosemary_commit".into(), "abc123".into()),
+            ("rosemary_summary".into(), "done".into()),
+            ("model".into(), "gpt".into()),
+        ]);
+        let (projected, rosemary, remembered) =
+            projected_tokens(&mut state, Some("conductor"), &first);
+        assert_eq!(projected["model"], "gpt");
+        assert!(ROSEMARY_RUN_KEYS.iter().all(|key| projected[*key].is_null()));
+        assert_eq!(rosemary["rosemary_binding"], "run-1");
+        let remembered = remembered.unwrap();
+        state.rosemary_suppressions.insert("conductor".into(), remembered.clone());
+        save_state(&dir, "host", &state).unwrap();
 
-        assert_eq!(first, second);
-        assert_eq!(first.as_deref().map(str::len), Some(AGENT_NAME_MAX));
+        let mut restarted = load_state(&dir, "host");
+        let (suppressed, cleared, projected_run) =
+            projected_tokens(&mut restarted, Some("conductor"), &first);
+        assert_eq!(suppressed["model"], "gpt");
+        assert!(ROSEMARY_RUN_KEYS.iter().all(|key| cleared[*key].is_null()));
+        assert_eq!(projected_run, None);
+
+        let (missing, cleared, _) =
+            projected_tokens(&mut restarted, Some("conductor"), &HashMap::new());
+        assert!(ROSEMARY_RUN_KEYS.iter().all(|key| missing[*key].is_null()));
+        assert!(ROSEMARY_RUN_KEYS.iter().all(|key| cleared[*key].is_null()));
+        assert_eq!(restarted.rosemary_suppressions["conductor"], remembered);
+
+        let mut changed = first.clone();
+        changed.insert("rosemary_binding".into(), "run-2".into());
+        let (projected, rosemary, run) =
+            projected_tokens(&mut restarted, Some("conductor"), &changed);
+        assert_eq!(projected["model"], "gpt");
+        assert!(ROSEMARY_RUN_KEYS.iter().all(|key| projected[*key].is_null()));
+        assert_eq!(rosemary["rosemary_binding"], "run-2");
+        assert_eq!(run.unwrap().binding, "run-2");
+        assert!(!restarted.rosemary_suppressions.contains_key("conductor"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remote_readiness_requires_remote_session_evidence() {
+        let ready: AgentInfo = serde_json::from_value(json!({
+            "pane_id": "p1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "interactive_ready": true,
+            "agent_session": {"agent": "codex", "kind": "id", "source": "herdr:codex", "value": "session-1"}
+        })).unwrap();
+        assert!(ready.interactive_ready);
+        assert_eq!(ready.agent_session.unwrap().value, "session-1");
+
+        let absent: AgentInfo = serde_json::from_value(json!({
+            "pane_id": "p2", "agent": "codex", "agent_status": "idle"
+        })).unwrap();
+        assert!(!absent.interactive_ready);
+        assert!(absent.agent_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn production_converge_journey_preserves_clear_and_native_agent() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-rosemary-journey-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let remote = FakePeer::start("remote", remote_rosemary_snapshot("run-1")).await;
+        let local = FakePeer::start("local", local_rosemary_snapshot("lp", true)).await;
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let remote_api = ApiClient::connect(&remote.path).await.unwrap();
+        let mut state = HostState::default();
+        state.workspaces.insert(
+            "rw".into(),
+            WsEntry {
+                local_id: "lw".into(),
+                tombstone: None,
+                root_tab_local_id: None,
+                last_remote_label: Some("feature".into()),
+            },
+        );
+        state.tabs.insert(
+            "rt".into(),
+            crate::state::TabEntry {
+                local_id: "lt".into(),
+                last_remote_label: Some("main".into()),
+            },
+        );
+        state.panes.insert(
+            "rp".into(),
+            PaneEntry {
+                local_id: "lp".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+                reported_name: None,
+                remote_agent_name: None,
+                projected_rosemary_run: None,
+            },
+        );
+        save_state(&state_dir, "vps", &state).unwrap();
+        let deps = ConvergeDeps {
+            local: local_api.clone(),
+            remote: remote_api,
+            host: ssh_host(),
+            state_dir: state_dir.clone(),
+            log: Logger::new(&state_dir, false),
+            close_remote_on_local_close: false,
+            closes: crate::closes::new_closes(),
+        };
+
+        converge(&deps).await.unwrap();
+        let requests = local.requests();
+        let first_report = requests
+            .iter()
+            .find(|request| request["method"] == "pane.report_agent")
+            .unwrap();
+        assert_eq!(first_report["params"]["agent_session_id"], "remote-session");
+        assert_eq!(first_report["params"]["state"], "idle");
+        assert!(requests.iter().any(|request| {
+            request["method"] == "agent.rename"
+                && request["params"]["name"] == "vps-conductor-rosie"
+        }));
+
+        // The fake accepts the same public typed prompt Rosemary uses. Mirror
+        // has not replaced or invented a second routing protocol.
+        local_api
+            .request("agent.prompt", json!({"target": "lp", "text": "continue"}))
+            .await
+            .unwrap();
+        assert!(local.requests().iter().any(|request| request["method"] == "agent.prompt"));
+
+        // Rosemary clears locally; pane.updated is a doorbell in the daemon,
+        // and this is the production handler it calls after that doorbell.
+        local.set_snapshot(local_rosemary_snapshot("lp", false));
+        capture_local_rosemary_clear(&local_api, &state_dir, "vps", "lp", &deps.log).await;
+        let suppressed = load_state(&state_dir, "vps");
+        assert_eq!(suppressed.rosemary_suppressions["conductor-rosie"].binding, "run-1");
+
+        // Restart/reconnect plus local pane recreation: the source-keyed record
+        // survives while the local id changes, and the exact tuple stays out.
+        let mut recreated = load_state(&state_dir, "vps");
+        recreated.panes.get_mut("rp").unwrap().local_id = "lp2".into();
+        save_state(&state_dir, "vps", &recreated).unwrap();
+        local.set_snapshot(local_rosemary_snapshot("lp2", false));
+        converge(&deps).await.unwrap();
+        let reports: Vec<Value> = local
+            .requests()
+            .into_iter()
+            .filter(|request| request["method"] == "pane.report_metadata")
+            .collect();
+        let after_recreate = reports.last().unwrap();
+        assert_eq!(after_recreate["params"]["source"], "rosemary-run");
+        assert!(ROSEMARY_RUN_KEYS
+            .iter()
+            .all(|key| after_recreate["params"]["tokens"][*key].is_null()));
+
+        // A genuinely newer binding retires only this source pair's record.
+        remote.set_snapshot(remote_rosemary_snapshot("run-2"));
+        converge(&deps).await.unwrap();
+        let reports: Vec<Value> = local
+            .requests()
+            .into_iter()
+            .filter(|request| request["method"] == "pane.report_metadata")
+            .collect();
+        assert_eq!(reports.last().unwrap()["params"]["tokens"]["rosemary_binding"], "run-2");
+        assert!(load_state(&state_dir, "vps").rosemary_suppressions.is_empty());
+
+        // The native row was never a projection target and stays byte-for-byte
+        // the same in the fake local server throughout the journey.
+        let snapshot = local.snapshot.lock().unwrap().clone();
+        let native = snapshot["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["pane_id"] == "native-p")
+            .unwrap();
+        assert_eq!(native["name"], "native-agent");
+        assert_eq!(native["agent_session"]["value"], "native-session");
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     fn leaf(pane_id: &str) -> LayoutNode {
@@ -2215,6 +2688,8 @@ mod tests {
             seq: 0,
             reported: None,
             reported_name: None,
+            remote_agent_name: None,
+            projected_rosemary_run: None,
         }
     }
 
@@ -2235,6 +2710,8 @@ mod tests {
                 seq: 0,
                 reported: None,
                 reported_name: None,
+                remote_agent_name: None,
+                projected_rosemary_run: None,
             },
         );
         let mut ids = Vec::new();

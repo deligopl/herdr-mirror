@@ -28,6 +28,12 @@ pub struct PaneEntry {
     /// remote agent name last applied with `agent.rename`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported_name: Option<String>,
+    /// exact remote name that produced the local dispatch identity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_agent_name: Option<String>,
+    /// exact Rosemary tuple most recently written onto this local pane
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_rosemary_run: Option<RosemaryRun>,
 }
 
 impl PaneEntry {
@@ -89,6 +95,22 @@ pub struct HostState {
     /// permanent winner and revert the other side's drag.
     #[serde(default)]
     pub ratios: BTreeMap<String, f64>,
+    /// One durable completion suppression per exact remote agent name. The host
+    /// is the state-file key, so together these form the source-pair identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rosemary_suppressions: BTreeMap<String, RosemaryRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RosemaryRun {
+    pub binding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Marker for `hide`: this host's mirrors are off the sidebar until `show`.
