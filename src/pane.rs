@@ -229,6 +229,24 @@ struct Session {
     stdin: ChildStdin,
 }
 
+async fn write_terminal_input(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let line = json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }).to_string()
+        + "\n";
+    stdin.write_all(line.as_bytes()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_typed_prompt_through_data_plane(bytes: &[u8]) -> serde_json::Value {
+    let (mut pane_side, remote_side) = tokio::io::duplex(4096);
+    write_terminal_input(&mut pane_side, bytes).await.unwrap();
+    drop(pane_side);
+    let mut lines = BufReader::new(remote_side).lines();
+    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+}
+
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
 pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -242,7 +260,7 @@ const REMOTE_PID_MARKER: &str = "herdr-mirror-remote-pid";
 /// Read the marker line the remote wrapper prints. `None` for every other line,
 /// so an unpatched remote, a login banner, or a herdr frame passes through.
 fn remote_pid_from_line(line: &str) -> Option<i32> {
-    let mut parts = line.trim().split_whitespace();
+    let mut parts = line.split_whitespace();
     (parts.next()? == REMOTE_PID_MARKER)
         .then(|| parts.next())
         .flatten()
@@ -1155,8 +1173,7 @@ impl App {
                     self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
                     for buf in std::mem::take(&mut self.pending_input) {
-                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
-                        let _ = s.stdin.write_all(line.as_bytes()).await;
+                        let _ = write_terminal_input(&mut s.stdin, &buf).await;
                     }
                 } else {
                     self.pending_input.clear();
@@ -1624,8 +1641,9 @@ impl App {
             // `dismiss`, not `clear`: a press may have been buffered earlier in
             // this very read, and cancelling it would eat the click.
             sel_changed |= self.select.dismiss();
-            let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
-            self.send(msg).await;
+            if let Some(session) = self.session.as_mut() {
+                let _ = write_terminal_input(&mut session.stdin, &rest).await;
+            }
             // optimistic local echo: draw the keystroke now, verify on frame
             if self.predict.on_input(&rest, &self.grid) {
                 self.paint();
@@ -1652,7 +1670,9 @@ impl App {
             }
             return;
         }
-        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
+        if let Some(session) = self.session.as_mut() {
+            let _ = write_terminal_input(&mut session.stdin, &buf).await;
+        }
     }
 
     async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
@@ -2703,7 +2723,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
     #[test]
     fn queued_remote_kills_are_bounded_and_deduplicated() {
         let mut pending: Vec<i32> = Vec::new();
-        let mut queue = |pending: &mut Vec<i32>, pid: i32| {
+        let queue = |pending: &mut Vec<i32>, pid: i32| {
             if pid <= 1 || pending.contains(&pid) {
                 return;
             }

@@ -27,7 +27,7 @@ use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
     apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    teardown, AgentInfo, ConvergeDeps,
+    teardown, AgentInfo, ConvergeDeps, PaneStatusDeps, RosemaryProjectionGate,
 };
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
@@ -71,6 +71,12 @@ struct HostCtx {
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
     names: crate::mirror::SessionNamePlanner,
+    rosemary_gate: RosemaryProjectionGate,
+    // Hermetic acceptance can drive the production host lifecycle against a
+    // public-protocol peer without invoking ssh. Production always leaves it
+    // unset and uses RemoteHost below.
+    #[cfg(test)]
+    remote_override: Option<ApiClient>,
 }
 
 #[derive(Debug)]
@@ -80,6 +86,12 @@ enum HostSignal {
         pane_id: String,
         acknowledged: oneshot::Sender<()>,
     },
+}
+
+#[derive(Clone)]
+struct LocalEventGuards {
+    closes: crate::closes::Closes,
+    rosemary_gate: RosemaryProjectionGate,
 }
 
 async fn capture_local_update(ctx: &HostCtx, signal: HostSignal) {
@@ -199,14 +211,17 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
             continue;
         }
         push_pane_status(
-            &ctx.local,
-            &ctx.env_state_dir,
-            &ctx.host.name,
+            &PaneStatusDeps {
+                local: &ctx.local,
+                state_dir: &ctx.env_state_dir,
+                host_name: &ctx.host.name,
+                log: &ctx.log,
+                rosemary_gate: &ctx.rosemary_gate,
+            },
             &remote_id,
             &mut state,
             agent,
             desired_name,
-            &ctx.log,
         )
         .await;
     }
@@ -256,6 +271,11 @@ async fn run_connected(
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Some(remote) = &ctx.remote_override {
+        *backoff_idx = 0;
+        return connected_session(ctx, poke, remote.clone()).await;
+    }
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
     // time (specifically: an auto host that fell back to the exec relay)
@@ -282,6 +302,7 @@ async fn connected_session(
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
         names: ctx.names.clone(),
+        rosemary_gate: ctx.rosemary_gate.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
@@ -600,7 +621,7 @@ async fn local_events_task(
     hosts: Vec<HostConfig>,
     state_dir: PathBuf,
     log: Logger,
-    closes: crate::closes::Closes,
+    guards: LocalEventGuards,
 ) {
     loop {
         let subs = vec![
@@ -643,7 +664,7 @@ async fn local_events_task(
                     };
                     if let Some(k) = key {
                         if let Some(lid) = e.data.get(k).and_then(|v| v.as_str()) {
-                            if let Ok(mut t) = closes.lock() {
+                            if let Ok(mut t) = guards.closes.lock() {
                                 t.note_close_event(lid);
                             }
                         }
@@ -652,6 +673,11 @@ async fn local_events_task(
                         .then(|| e.data.get("pane_id").and_then(|value| value.as_str()))
                         .flatten()
                         .map(str::to_string);
+                    if let Some(pane_id) = &pane_updated {
+                        // Enter the gate before queueing. An already-running
+                        // converge checks it at the Rosemary write boundary.
+                        guards.rosemary_gate.note_local_update(pane_id);
+                    }
                     let mut acknowledgements = Vec::new();
                     for p in &pokers {
                         if let Some(pane_id) = &pane_updated {
@@ -671,6 +697,9 @@ async fn local_events_task(
                     }
                     for acknowledgement in acknowledgements {
                         let _ = acknowledgement.await;
+                    }
+                    if let Some(pane_id) = &pane_updated {
+                        guards.rosemary_gate.finish_local_update(pane_id);
                     }
                     // a workspace appeared/left — keep hosts grouped (no-op if already)
                     regroup_sidebar(&local, &prefixes, &log).await;
@@ -725,6 +754,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     let names = crate::mirror::SessionNamePlanner::new(
         config.hosts.iter().map(|host| host.name.clone()),
     );
+    let rosemary_gate = RosemaryProjectionGate::default();
     let mut pokers: Vec<mpsc::Sender<HostSignal>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
@@ -738,6 +768,9 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
             names: names.clone(),
+            rosemary_gate: rosemary_gate.clone(),
+            #[cfg(test)]
+            remote_override: None,
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -749,7 +782,10 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         config.hosts.clone(),
         env.state_dir.clone(),
         log.clone(),
-        closes.clone(),
+        LocalEventGuards {
+            closes: closes.clone(),
+            rosemary_gate,
+        },
     )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -966,6 +1002,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     let names = crate::mirror::SessionNamePlanner::new(
         connected.iter().map(|(host, _, _)| host.name.clone()),
     );
+    let rosemary_gate = RosemaryProjectionGate::default();
     // First pass supplies every configured source snapshot to the shared plan;
     // the second applies that complete plan to hosts encountered before it was
     // ready. RemoteHost owners stay alive for both passes.
@@ -983,6 +1020,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
                 // closes a remote object, which is the correct conservative default
                 closes: crate::closes::new_closes(),
                 names: names.clone(),
+                rosemary_gate: rosemary_gate.clone(),
             })
             .await?;
         }
@@ -1073,13 +1111,21 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
     use std::sync::{Arc, Mutex};
+
+    type MetadataPause =
+        Arc<Mutex<Option<(String, oneshot::Sender<()>, Arc<tokio::sync::Notify>)>>>;
 
     struct ProtocolPeer {
         path: PathBuf,
         snapshot: Arc<Mutex<Value>>,
         requests: Arc<Mutex<Vec<Value>>>,
-        routes: Arc<Mutex<HashMap<String, (PathBuf, String)>>>,
+        routes: Arc<Mutex<HashMap<String, String>>>,
+        terminal_inputs: Arc<Mutex<Vec<Value>>>,
+        metadata_pause: MetadataPause,
+        events: tokio::sync::broadcast::Sender<Value>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1096,12 +1142,16 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let snapshot = Arc::new(Mutex::new(snapshot));
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let routes: Arc<Mutex<HashMap<String, (PathBuf, String)>>> =
+            let routes: Arc<Mutex<HashMap<String, String>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            let terminal_inputs = Arc::new(Mutex::new(Vec::new()));
+            let metadata_pause: MetadataPause = Arc::new(Mutex::new(None));
             let (events, _) = tokio::sync::broadcast::channel::<Value>(32);
             let snapshots = snapshot.clone();
             let captured = requests.clone();
             let prompt_routes = routes.clone();
+            let pane_inputs = terminal_inputs.clone();
+            let pauses = metadata_pause.clone();
             let event_bus = events.clone();
             let task = tokio::spawn(async move {
                 loop {
@@ -1109,6 +1159,8 @@ mod tests {
                     let snapshots = snapshots.clone();
                     let captured = captured.clone();
                     let prompt_routes = prompt_routes.clone();
+                    let pane_inputs = pane_inputs.clone();
+                    let pauses = pauses.clone();
                     let mut event_rx = event_bus.subscribe();
                     let event_tx = event_bus.clone();
                     tokio::spawn(async move {
@@ -1121,6 +1173,9 @@ mod tests {
                             let response = json!({"id": request["id"], "result": {"type": "subscription_started"}});
                             write.write_all(format!("{response}\n").as_bytes()).await.unwrap();
                             while let Ok(event) = event_rx.recv().await {
+                                if event["disconnect"] == true {
+                                    break;
+                                }
                                 if write.write_all(format!("{event}\n").as_bytes()).await.is_err() {
                                     break;
                                 }
@@ -1130,22 +1185,67 @@ mod tests {
 
                         let method = request["method"].as_str().unwrap_or("");
                         let params = &request["params"];
+                        let pause = if method == "pane.report_metadata" {
+                            let source = params["source"].as_str().unwrap_or("");
+                            let mut pause = pauses.lock().unwrap();
+                            if pause.as_ref().is_some_and(|(expected, _, _)| expected == source) {
+                                pause.take().map(|(_, started, release)| {
+                                    let _ = started.send(());
+                                    release
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(release) = pause {
+                            release.notified().await;
+                        }
                         let result = if method == "session.snapshot" {
                             json!({"snapshot": snapshots.lock().unwrap().clone()})
                         } else {
                             if method == "agent.prompt" {
                                 if let Some(target) = params["target"].as_str() {
                                     let route = prompt_routes.lock().unwrap().get(target).cloned();
-                                    if let Some((route, remote_target)) = route {
-                                        if let Ok(remote) = ApiClient::connect(&route).await {
-                                            let mut routed = params.clone();
-                                            routed["target"] = json!(remote_target);
-                                            let _ = remote.request("agent.prompt", routed).await;
-                                        }
+                                    if let Some(remote_target) = route {
+                                        let text = params["text"].as_str().unwrap_or("");
+                                        let mut bytes = text.as_bytes().to_vec();
+                                        bytes.push(b'\r');
+                                        let mut terminal = crate::pane::test_typed_prompt_through_data_plane(&bytes).await;
+                                        terminal["pane_id"] = json!(remote_target);
+                                        pane_inputs.lock().unwrap().push(terminal);
                                     }
                                 }
                             }
                             let mut snapshot = snapshots.lock().unwrap();
+                            if method == "workspace.report_metadata" {
+                                let workspace_id = params["workspace_id"].as_str();
+                                if let (Some(workspace_id), Some(workspaces), Some(tokens)) = (
+                                    workspace_id,
+                                    snapshot["workspaces"].as_array_mut(),
+                                    params["tokens"].as_object(),
+                                ) {
+                                    if let Some(workspace) = workspaces.iter_mut().find(|workspace| {
+                                        workspace["workspace_id"] == workspace_id
+                                    }) {
+                                        let target = workspace
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .entry("tokens")
+                                            .or_insert_with(|| json!({}))
+                                            .as_object_mut()
+                                            .unwrap();
+                                        for (key, value) in tokens {
+                                            if value.is_null() {
+                                                target.remove(key);
+                                            } else {
+                                                target.insert(key.clone(), value.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let pane_id = params["pane_id"]
                                 .as_str()
                                 .or_else(|| params["target"].as_str());
@@ -1206,22 +1306,50 @@ mod tests {
                     });
                 }
             });
-            Self { path, snapshot, requests, routes, task }
+            Self {
+                path,
+                snapshot,
+                requests,
+                routes,
+                terminal_inputs,
+                metadata_pause,
+                events,
+                task,
+            }
         }
 
         fn set_snapshot(&self, snapshot: Value) {
             *self.snapshot.lock().unwrap() = snapshot;
         }
 
-        fn route_prompt(&self, local_pane: &str, remote_pane: &str, remote: &ProtocolPeer) {
-            self.routes.lock().unwrap().insert(
-                local_pane.to_string(),
-                (remote.path.clone(), remote_pane.to_string()),
-            );
+        fn attach_pane_streamer(&self, local_pane: &str, remote_pane: &str) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert(local_pane.to_string(), remote_pane.to_string());
         }
 
         fn requests(&self) -> Vec<Value> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn terminal_inputs(&self) -> Vec<Value> {
+            self.terminal_inputs.lock().unwrap().clone()
+        }
+
+        fn disconnect_subscribers(&self) {
+            let _ = self.events.send(json!({"disconnect": true}));
+        }
+
+        fn pause_next_metadata_from(
+            &self,
+            source: &str,
+        ) -> (oneshot::Receiver<()>, Arc<tokio::sync::Notify>) {
+            let (started, observed) = oneshot::channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            *self.metadata_pause.lock().unwrap() =
+                Some((source.to_string(), started, release.clone()));
+            (observed, release)
         }
     }
 
@@ -1266,6 +1394,8 @@ mod tests {
 
     fn local_facade_snapshot() -> Value {
         json!({
+            "reachability": "connected",
+            "compatible": true,
             "workspaces": [
                 {"workspace_id": "lw-a", "label": "alpha: feature", "tab_count": 1, "pane_count": 1, "active_tab_id": "lt-a"},
                 {"workspace_id": "lw-b", "label": "alpha-beta: feature", "tab_count": 1, "pane_count": 1, "active_tab_id": "lt-b"},
@@ -1279,10 +1409,10 @@ mod tests {
                 {"pane_id": "lp-b", "tab_id": "lt-b", "workspace_id": "lw-b", "cwd": "/tmp", "foreground_cwd": "/tmp"},
                 {"pane_id": "native-p", "tab_id": "native-t", "workspace_id": "native-w", "cwd": "/native", "foreground_cwd": "/native"}],
             "agents": [
-                {"pane_id": "lp-a", "agent": "codex", "agent_status": "unknown", "tokens": {}},
-                {"pane_id": "lp-b", "agent": "codex", "agent_status": "unknown", "tokens": {}},
+                {"pane_id": "lp-a", "agent": "codex", "agent_status": "unknown", "present": true, "tokens": {}},
+                {"pane_id": "lp-b", "agent": "codex", "agent_status": "unknown", "present": true, "tokens": {}},
                 {"pane_id": "native-p", "agent": "codex", "name": "native-agent", "agent_status": "idle",
-                    "interactive_ready": true, "agent_session": {"value": "native-session"}, "tokens": {}}],
+                    "interactive_ready": true, "agent_session": {"value": "native-session"}, "present": true, "tokens": {}}],
             "layouts": []
         })
     }
@@ -1316,7 +1446,7 @@ mod tests {
     }
 
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..200 {
+        for _ in 0..400 {
             if predicate() {
                 return;
             }
@@ -1325,18 +1455,63 @@ mod tests {
         panic!("condition did not become true");
     }
 
-    fn available_rosemary_conductors(snapshot: &Value) -> usize {
-        snapshot["agents"]
+    /// Test-local transcription of Rosemary's `derive_observed` availability
+    /// predicates. Keep this deliberately literal: the journey is evidence
+    /// for Rosemary semantics, not a looser Mirror-specific approximation.
+    fn exact_rosemary_available_conductors(
+        snapshot: &Value,
+        project: &str,
+        active_bindings: &[&str],
+    ) -> usize {
+        let workspaces: HashMap<&str, &Value> = snapshot["workspaces"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|agent| {
-                agent["name"]
+            .filter(|workspace| workspace["tokens"]["rosemary_project"] == project)
+            .filter_map(|workspace| {
+                Some((workspace["workspace_id"].as_str()?, workspace))
+            })
+            .collect();
+        let panes: HashMap<&str, &str> = snapshot["panes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pane| {
+                Some((pane["pane_id"].as_str()?, pane["workspace_id"].as_str()?))
+            })
+            .collect();
+        let candidates: Vec<&Value> = snapshot["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|endpoint| endpoint["present"] == true)
+            .filter(|endpoint| {
+                endpoint["name"]
                     .as_str()
                     .is_some_and(|name| name.ends_with("-conductor-rosie"))
-                    && agent["interactive_ready"] == true
-                    && matches!(agent["agent_status"].as_str(), Some("idle" | "done"))
-                    && !agent["agent_session"].is_null()
+            })
+            .filter(|endpoint| {
+                endpoint["pane_id"]
+                    .as_str()
+                    .and_then(|pane| panes.get(pane))
+                    .is_some_and(|workspace| workspaces.contains_key(workspace))
+            })
+            .collect();
+
+        candidates
+            .iter()
+            .filter(|endpoint| {
+                let name = endpoint["name"].as_str().unwrap();
+                let live_endpoints = candidates
+                    .iter()
+                    .filter(|candidate| candidate["name"] == name)
+                    .count();
+                !active_bindings.contains(&name)
+                    && live_endpoints == 1
+                    && snapshot["reachability"] == "connected"
+                    && snapshot["compatible"] == true
+                    && endpoint["interactive_ready"] == true
+                    && matches!(endpoint["agent_status"].as_str(), Some("idle" | "done"))
             })
             .count()
     }
@@ -1362,7 +1537,7 @@ mod tests {
         remote_b_snapshot["agents"][0]["agent_session"] = Value::Null;
         let remote_b = ProtocolPeer::start("remote-b", remote_b_snapshot).await;
         let local = ProtocolPeer::start("local", local_facade_snapshot()).await;
-        local.route_prompt("lp-a", "rp-a", &remote_a);
+        local.attach_pane_streamer("lp-a", "rp-a");
         let local_api = ApiClient::connect(&local.path).await.unwrap();
         let native_before = local.snapshot.lock().unwrap()["agents"][2].clone();
         let closes = crate::closes::new_closes();
@@ -1371,8 +1546,11 @@ mod tests {
             "alpha-beta".to_string(),
         ]);
         let log = Logger::new(&state_dir, false);
-        let (tx_a, mut rx_a) = mpsc::channel(8);
-        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let rosemary_gate = RosemaryProjectionGate::default();
+        let remote_a_api = ApiClient::connect(&remote_a.path).await.unwrap();
+        let remote_b_api = ApiClient::connect(&remote_b.path).await.unwrap();
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
         let ctx_a = HostCtx {
             env_state_dir: state_dir.clone(),
             host: test_host("alpha"),
@@ -1381,6 +1559,8 @@ mod tests {
             close_remote_on_local_close: false,
             closes: closes.clone(),
             names: names.clone(),
+            rosemary_gate: rosemary_gate.clone(),
+            remote_override: Some(remote_a_api.clone()),
         };
         let ctx_b = HostCtx {
             env_state_dir: state_dir.clone(),
@@ -1390,15 +1570,11 @@ mod tests {
             close_remote_on_local_close: false,
             closes: closes.clone(),
             names: names.clone(),
+            rosemary_gate: rosemary_gate.clone(),
+            remote_override: Some(remote_b_api.clone()),
         };
-        let remote_a_api = ApiClient::connect(&remote_a.path).await.unwrap();
-        let remote_b_api = ApiClient::connect(&remote_b.path).await.unwrap();
-        let task_a = tokio::spawn(async move {
-            let _ = connected_session(&ctx_a, &mut rx_a, remote_a_api).await;
-        });
-        let task_b = tokio::spawn(async move {
-            let _ = connected_session(&ctx_b, &mut rx_b, remote_b_api).await;
-        });
+        let task_a = tokio::spawn(host_task(ctx_a, rx_a));
+        let task_b = tokio::spawn(host_task(ctx_b, rx_b));
         let event_task = tokio::spawn(local_events_task(
             local_api.clone(),
             vec![tx_a.clone(), tx_b.clone()],
@@ -1406,7 +1582,10 @@ mod tests {
             vec![test_host("alpha"), test_host("alpha-beta")],
             state_dir.clone(),
             log.clone(),
-            closes.clone(),
+            LocalEventGuards {
+                closes: closes.clone(),
+                rosemary_gate: rosemary_gate.clone(),
+            },
         ));
 
         wait_until(|| {
@@ -1426,18 +1605,29 @@ mod tests {
             .await
             .unwrap();
         wait_until(|| {
-            remote_a.requests().iter().any(|request| {
-                request["method"] == "agent.prompt"
-                    && request["params"]["target"] == "rp-a"
-                    && request["params"]["text"] == "continue"
+            local.terminal_inputs().iter().any(|input| {
+                input["type"] == "terminal.input"
+                    && input["pane_id"] == "rp-a"
+                    && input["bytes"] == B64.encode(b"continue\r")
             })
         })
         .await;
 
+        // Force the clear to overlap a converge which has already taken its
+        // snapshots but has not reached the Rosemary write. This is the exact
+        // ordering which used to let that pass restore the tuple before the
+        // queued pane.updated signal could be consumed.
+        let (projection_started, release_projection) =
+            local.pause_next_metadata_from("plugin:mirror:alpha");
+        tx_a.send(HostSignal::Converge).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), projection_started)
+            .await
+            .unwrap()
+            .unwrap();
+
         // Use the same public metadata request Rosemary uses. The fake local
-        // Herdr mutates its snapshot and emits pane_updated; local_events_task
-        // serializes that doorbell through both host writers and waits for the
-        // durable acknowledgement before returning to projection traffic.
+        // Herdr mutates its snapshot and emits pane_updated while the earlier
+        // converge remains suspended inside its ordinary metadata projection.
         local_api
             .request(
                 "pane.report_metadata",
@@ -1455,6 +1645,8 @@ mod tests {
             )
             .await
             .unwrap();
+        wait_until(|| rosemary_gate.has_local_update("lp-a")).await;
+        release_projection.notify_one();
         wait_until(|| {
             load_state(&state_dir, "alpha")
                 .rosemary_suppressions
@@ -1492,13 +1684,13 @@ mod tests {
         pane.local_id = "lp-a2".into();
         restarted_state.panes.insert("rp-a2".into(), pane);
         save_state(&state_dir, "alpha", &restarted_state).unwrap();
-        local.route_prompt("lp-a2", "rp-a2", &remote_a);
+        local.attach_pane_streamer("lp-a2", "rp-a2");
 
         let names = crate::mirror::SessionNamePlanner::new([
             "alpha".to_string(),
             "alpha-beta".to_string(),
         ]);
-        let (tx_a2, mut rx_a2) = mpsc::channel(8);
+        let (tx_a2, rx_a2) = mpsc::channel(8);
         let (ack_tx, ack_rx) = oneshot::channel();
         tx_a2
             .send(HostSignal::LocalPaneUpdated {
@@ -1507,24 +1699,22 @@ mod tests {
             })
             .await
             .unwrap();
-        let (tx_b2, mut rx_b2) = mpsc::channel(8);
+        let (tx_b2, rx_b2) = mpsc::channel(8);
         let ctx_a2 = HostCtx {
             env_state_dir: state_dir.clone(), host: test_host("alpha"), local: local_api.clone(),
             log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
+            rosemary_gate: rosemary_gate.clone(),
+            remote_override: Some(remote_a_api.clone()),
         };
         let ctx_b2 = HostCtx {
             env_state_dir: state_dir.clone(), host: test_host("alpha-beta"), local: local_api.clone(),
             log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
+            rosemary_gate: rosemary_gate.clone(),
+            remote_override: Some(remote_b_api.clone()),
         };
         let restart_request_index = local.requests().len();
-        let remote_a_api = ApiClient::connect(&remote_a.path).await.unwrap();
-        let remote_b_api = ApiClient::connect(&remote_b.path).await.unwrap();
-        let task_a2 = tokio::spawn(async move {
-            let _ = connected_session(&ctx_a2, &mut rx_a2, remote_a_api).await;
-        });
-        let task_b2 = tokio::spawn(async move {
-            let _ = connected_session(&ctx_b2, &mut rx_b2, remote_b_api).await;
-        });
+        let task_a2 = tokio::spawn(host_task(ctx_a2, rx_a2));
+        let task_b2 = tokio::spawn(host_task(ctx_b2, rx_b2));
         tokio::time::timeout(Duration::from_secs(2), ack_rx).await.unwrap().unwrap();
         wait_until(|| {
             local.requests()[restart_request_index..]
@@ -1545,19 +1735,11 @@ mod tests {
         assert!(capture_snapshot < first_projection);
         assert!(load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie"));
 
-        // A disconnect/reconnect is a new connected task and subscription, not
-        // a direct converge call. Suppression remains through it.
-        task_a2.abort();
-        let (tx_a3, mut rx_a3) = mpsc::channel(8);
-        let ctx_a3 = HostCtx {
-            env_state_dir: state_dir.clone(), host: test_host("alpha"), local: local_api.clone(),
-            log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
-        };
+        // Drop the remote event stream under the full host task. Its ordinary
+        // disconnect/backoff/reconnect loop must open a new subscription and
+        // preserve suppression without a direct connected_session call.
         let subscriptions_before = remote_a.requests().iter().filter(|r| r["method"] == "events.subscribe").count();
-        let remote_a_api = ApiClient::connect(&remote_a.path).await.unwrap();
-        let task_a3 = tokio::spawn(async move {
-            let _ = connected_session(&ctx_a3, &mut rx_a3, remote_a_api).await;
-        });
+        remote_a.disconnect_subscribers();
         wait_until(|| {
             remote_a.requests().iter().filter(|r| r["method"] == "events.subscribe").count()
                 > subscriptions_before
@@ -1566,7 +1748,7 @@ mod tests {
         assert!(load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie"));
 
         remote_a.set_snapshot(remote_snapshot("rp-a2", "beta-conductor-rosie", "run-2"));
-        tx_a3.send(HostSignal::Converge).await.unwrap();
+        tx_a2.send(HostSignal::Converge).await.unwrap();
         wait_until(|| {
             !load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie")
                 && local.snapshot.lock().unwrap()["agents"]
@@ -1580,9 +1762,73 @@ mod tests {
         .await;
 
         let final_snapshot = local.snapshot.lock().unwrap().clone();
-        assert_eq!(available_rosemary_conductors(&final_snapshot), 1);
+        let conductor_name = final_snapshot["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["pane_id"] == "lp-a2")
+            .and_then(|agent| agent["name"].as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            exact_rosemary_available_conductors(&final_snapshot, "garden", &[]),
+            1
+        );
+
+        let mut wrong_project = final_snapshot.clone();
+        wrong_project["workspaces"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|workspace| workspace["workspace_id"] == "lw-a")
+            .unwrap()["tokens"]["rosemary_project"] = json!("other");
+        assert_eq!(exact_rosemary_available_conductors(&wrong_project, "garden", &[]), 0);
+
+        let mut missing_endpoint = final_snapshot.clone();
+        missing_endpoint["panes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|pane| pane["pane_id"] != "lp-a2");
+        assert_eq!(exact_rosemary_available_conductors(&missing_endpoint, "garden", &[]), 0);
+
+        let mut disconnected = final_snapshot.clone();
+        disconnected["reachability"] = json!("disconnected");
+        assert_eq!(exact_rosemary_available_conductors(&disconnected, "garden", &[]), 0);
+
+        let mut incompatible = final_snapshot.clone();
+        incompatible["compatible"] = json!(false);
+        assert_eq!(exact_rosemary_available_conductors(&incompatible, "garden", &[]), 0);
+
+        let mut ambiguous = final_snapshot.clone();
+        let mut second_pane = ambiguous["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pane| pane["pane_id"] == "lp-a2")
+            .unwrap()
+            .clone();
+        second_pane["pane_id"] = json!("lp-a3");
+        ambiguous["panes"].as_array_mut().unwrap().push(second_pane);
+        let mut second_endpoint = ambiguous["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["pane_id"] == "lp-a2")
+            .unwrap()
+            .clone();
+        second_endpoint["pane_id"] = json!("lp-a3");
+        ambiguous["agents"].as_array_mut().unwrap().push(second_endpoint);
+        assert_eq!(exact_rosemary_available_conductors(&ambiguous, "garden", &[]), 0);
+        assert_eq!(
+            exact_rosemary_available_conductors(
+                &final_snapshot,
+                "garden",
+                &[conductor_name.as_str()],
+            ),
+            0
+        );
         assert_eq!(final_snapshot["agents"][2], native_before);
-        task_a3.abort();
+        task_a2.abort();
         task_b2.abort();
         let _ = tx_a2;
         let _ = tx_b2;

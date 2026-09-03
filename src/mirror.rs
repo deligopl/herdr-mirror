@@ -451,6 +451,44 @@ pub struct ConvergeDeps {
     /// One planner for the whole local Herdr session. It sees every configured
     /// source before allowing any mirrored dispatch identity.
     pub names: SessionNamePlanner,
+    /// Local `pane.updated` events enter this gate before they are queued to a
+    /// host task. A converge which was already running must consult it before
+    /// writing Rosemary's authority, otherwise it can restore a tuple while
+    /// the clear signal is waiting behind that converge.
+    pub rosemary_gate: RosemaryProjectionGate,
+}
+
+#[derive(Clone, Default)]
+pub struct RosemaryProjectionGate {
+    pending_local_panes: Arc<Mutex<HashSet<String>>>,
+}
+
+impl RosemaryProjectionGate {
+    pub fn note_local_update(&self, pane_id: &str) {
+        if let Ok(mut pending) = self.pending_local_panes.lock() {
+            pending.insert(pane_id.to_string());
+        }
+    }
+
+    pub fn finish_local_update(&self, pane_id: &str) {
+        if let Ok(mut pending) = self.pending_local_panes.lock() {
+            pending.remove(pane_id);
+        }
+    }
+
+    pub(crate) fn has_local_update(&self, pane_id: &str) -> bool {
+        self.pending_local_panes
+            .lock()
+            .is_ok_and(|pending| pending.contains(pane_id))
+    }
+}
+
+pub struct PaneStatusDeps<'a> {
+    pub local: &'a ApiClient,
+    pub state_dir: &'a std::path::Path,
+    pub host_name: &'a str,
+    pub log: &'a Logger,
+    pub rosemary_gate: &'a RosemaryProjectionGate,
 }
 
 #[derive(Clone)]
@@ -1747,15 +1785,7 @@ fn projected_tokens(
     remote_name: Option<&str>,
     tokens: &HashMap<String, String>,
 ) -> (BTreeMap<String, Value>, BTreeMap<String, Value>, Option<RosemaryRun>) {
-    let mut ordinary: BTreeMap<String, Value> = tokens
-        .iter()
-        .map(|(key, value)| (key.clone(), json!(value)))
-        .collect();
-    for key in ROSEMARY_RUN_KEYS {
-        // Revision 6 projected everything under mirror:<host>. Nulling these
-        // keys retires that legacy ownership before rosemary-run takes over.
-        ordinary.insert(key.to_string(), Value::Null);
-    }
+    let ordinary = ordinary_projected_tokens(tokens);
     let cleared = || {
         ROSEMARY_RUN_KEYS
             .into_iter()
@@ -1785,6 +1815,19 @@ fn projected_tokens(
         })
         .collect();
     (ordinary, rosemary, run)
+}
+
+fn ordinary_projected_tokens(tokens: &HashMap<String, String>) -> BTreeMap<String, Value> {
+    let mut ordinary: BTreeMap<String, Value> = tokens
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+    for key in ROSEMARY_RUN_KEYS {
+        // Revision 6 projected everything under mirror:<host>. Nulling these
+        // keys retires that legacy ownership before rosemary-run takes over.
+        ordinary.insert(key.to_string(), Value::Null);
+    }
+    ordinary
 }
 
 /// A local `pane.updated` is only a doorbell. Read the authoritative pane and,
@@ -1827,15 +1870,13 @@ pub async fn capture_local_rosemary_clear(
 }
 
 async fn keep_agent_ineligible(
-    local: &ApiClient,
-    state_dir: &std::path::Path,
-    host_name: &str,
+    deps: &PaneStatusDeps<'_>,
     remote_id: &str,
     exact_remote_name: &str,
     state: &mut HostState,
     reason: &str,
-    log: &Logger,
 ) {
+    let PaneStatusDeps { local, state_dir, host_name, log, .. } = deps;
     let source = mirror_source(host_name);
     let local_id = {
         let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
@@ -1890,21 +1931,19 @@ async fn keep_agent_ineligible(
 }
 
 pub async fn push_pane_status(
-    local: &ApiClient,
-    state_dir: &std::path::Path,
-    host_name: &str,
+    deps: &PaneStatusDeps<'_>,
     remote_id: &str,
     state: &mut HostState,
     agent: Option<&AgentInfo>,
     desired_name: Option<String>,
-    log: &Logger,
 ) {
+    let PaneStatusDeps { local, state_dir, host_name, log, rosemary_gate } = deps;
     if state.panes.get(remote_id).is_none_or(PaneEntry::is_tombstoned) {
         return;
     }
     let remote_name = agent.and_then(|agent| agent.name.as_deref()).filter(|name| !name.is_empty());
-    let (projected_agent_tokens, projected_rosemary_tokens, projected_run) = agent
-        .map(|agent| projected_tokens(state, remote_name, &agent.tokens))
+    let projected_agent_tokens = agent
+        .map(|agent| ordinary_projected_tokens(&agent.tokens))
         .unwrap_or_default();
     let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
     let source = mirror_source(host_name);
@@ -1913,14 +1952,11 @@ pub async fn push_pane_status(
             let exact_remote_name = agent.name.as_deref().unwrap_or("");
             if desired_name.is_none() {
                 keep_agent_ineligible(
-                    local,
-                    state_dir,
-                    host_name,
+                    deps,
                     remote_id,
                     exact_remote_name,
                     state,
                     "the session-global name plan refused the candidate",
-                    log,
                 )
                 .await;
                 return;
@@ -1942,14 +1978,11 @@ pub async fn push_pane_status(
                     }
                     Err(error) => {
                         keep_agent_ineligible(
-                            local,
-                            state_dir,
-                            host_name,
+                            deps,
                             remote_id,
                             exact_remote_name,
                             state,
                             &format!("agent.rename refused {desired_name:?}: {error}"),
-                            log,
                         )
                         .await;
                         return;
@@ -2034,6 +2067,37 @@ pub async fn push_pane_status(
             if let Err(error) = local.request("pane.report_metadata", meta).await {
                 log.log(&format!("report_metadata {}: {error}", entry.local_id));
             }
+            // A local clear event may have arrived while this converge was
+            // waiting on earlier RPCs. Capture it here, before deriving or
+            // writing the Rosemary authority. Reload the one suppression into
+            // this pass's state so its final save cannot overwrite the record
+            // written by the event path.
+            if rosemary_gate.has_local_update(&entry.local_id) {
+                match capture_local_rosemary_clear(local, state_dir, host_name, &entry.local_id, log).await {
+                    Ok(_) => {
+                        if let Some(remote_name) = remote_name {
+                            let durable = load_state(state_dir, host_name);
+                            match durable.rosemary_suppressions.get(remote_name) {
+                                Some(run) => {
+                                    state.rosemary_suppressions.insert(remote_name.to_string(), run.clone());
+                                }
+                                None => {
+                                    state.rosemary_suppressions.remove(remote_name);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log.log(&format!(
+                            "[{host_name}] local Rosemary update is pending; projection remains blocked: {error}"
+                        ));
+                        return;
+                    }
+                }
+            }
+            let (.., projected_rosemary_tokens, projected_run) =
+                projected_tokens(state, remote_name, &agent.tokens);
+            let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
             let rosemary_meta = json!({
                 "pane_id": entry.local_id,
                 "source": "rosemary-run",
@@ -2211,7 +2275,11 @@ fn mirrored_agent_name_hashed(host_name: &str, exact_remote: &str) -> Option<Str
     let digest = format!("{:x}", hasher.finalize());
     let digest = &digest[..8];
     const ROSIE_SUFFIX: &str = "-conductor-rosie";
-    let suffix = remote.ends_with(ROSIE_SUFFIX).then_some(ROSIE_SUFFIX).unwrap_or("");
+    let suffix = if remote.ends_with(ROSIE_SUFFIX) {
+        ROSIE_SUFFIX
+    } else {
+        ""
+    };
     let prefix_budget = AGENT_NAME_MAX - 1 - digest.len() - suffix.len();
     let readable = full
         .trim_start_matches(|c: char| !c.is_ascii_lowercase())
@@ -2285,14 +2353,17 @@ pub async fn push_statuses(
     for remote_id in remote_ids {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
         push_pane_status(
-            &deps.local,
-            &deps.state_dir,
-            &deps.host.name,
+            &PaneStatusDeps {
+                local: &deps.local,
+                state_dir: &deps.state_dir,
+                host_name: &deps.host.name,
+                log: &deps.log,
+                rosemary_gate: &deps.rosemary_gate,
+            },
             &remote_id,
             state,
             agent,
             names.get(&remote_id).cloned().flatten(),
-            &deps.log,
         )
         .await;
     }
@@ -2833,15 +2904,19 @@ mod tests {
             ..AgentInfo::default()
         };
         let log = Logger::new(&state_dir, false);
+        let rosemary_gate = RosemaryProjectionGate::default();
         push_pane_status(
-            &local_api,
-            &state_dir,
-            "configured-host",
+            &PaneStatusDeps {
+                local: &local_api,
+                state_dir: &state_dir,
+                host_name: "configured-host",
+                log: &log,
+                rosemary_gate: &rosemary_gate,
+            },
             "remote-pane",
             &mut state,
             Some(&agent),
             Some("new-dispatch-name".into()),
-            &log,
         )
         .await;
 
