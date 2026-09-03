@@ -6,7 +6,7 @@
 // this small parser is a complete decoder; no VT emulator needed.
 
 use std::fmt::Write as _;
-use std::rc::Rc;
+use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 /// Terminal display width of a char (CJK/Hangul are 2 columns).
@@ -27,12 +27,12 @@ pub fn window_offset(grid: &Grid, out_rows: usize) -> usize {
 
 #[derive(Clone, PartialEq)]
 pub struct Cell {
-    /// Rc: runs of cells share one SGR allocation
-    pub sgr: Rc<str>,
+    /// Arc: runs of cells share one SGR allocation
+    pub sgr: Arc<str>,
     /// OSC 8 target URI, when this cell sits inside a hyperlink. Carried
     /// per-cell for the same reason as `sgr`: the renderer repaints arbitrary
     /// rows in isolation, so it cannot rely on stream order to know the state.
-    pub link: Option<Rc<str>>,
+    pub link: Option<Arc<str>>,
     pub ch: char,
 }
 
@@ -75,8 +75,8 @@ impl Grid {
         chars.extend(ansi.chars());
         let mut row = 0usize;
         let mut col = 0usize;
-        let mut sgr: Rc<str> = Rc::from("");
-        let mut link: Option<Rc<str>> = None;
+        let mut sgr: Arc<str> = Arc::from("");
+        let mut link: Option<Arc<str>> = None;
         let mut i = 0usize;
         while i < chars.len() {
             if chars[i] == '\x1b' {
@@ -88,7 +88,7 @@ impl Grid {
                             col = it.next().unwrap_or(1) - 1;
                         }
                         'm' => {
-                            sgr = Rc::from(chars[i..i + len].iter().collect::<String>());
+                            sgr = Arc::from(chars[i..i + len].iter().collect::<String>());
                         }
                         'J' => self.clear(),
                         'h' | 'l' if params == "?25" => self.cursor_visible = final_ch == 'h',
@@ -280,14 +280,14 @@ fn parse_osc(chars: &[char]) -> Option<usize> {
 /// OSC ends the string early and the tail executes. Deliberately no length cap:
 /// herdr has none, and truncating a URL yields a *different* valid one, which
 /// is the wrong-target failure this whole path exists to avoid.
-fn parse_osc8(seq: &[char]) -> Option<Option<Rc<str>>> {
+fn parse_osc8(seq: &[char]) -> Option<Option<Arc<str>>> {
     let body: String = seq.iter().collect();
     let body = body.strip_prefix("\x1b]")?;
     let body = body.strip_suffix('\x07').or_else(|| body.strip_suffix("\x1b\\"))?;
     let rest = body.strip_prefix("8;")?;
     let uri = rest.split_once(';').map_or("", |(_params, uri)| uri);
     let uri: String = uri.chars().filter(|ch| !ch.is_control()).collect();
-    Some((!uri.is_empty()).then(|| Rc::from(uri.as_str())))
+    Some((!uri.is_empty()).then(|| Arc::from(uri.as_str())))
 }
 
 // ---------------------------------------------------------------------------

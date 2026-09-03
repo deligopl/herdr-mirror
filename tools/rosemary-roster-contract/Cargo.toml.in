@@ -1,0 +1,11 @@
+[package]
+name = "rosemary-roster-contract"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+rosemary-core = { path = "rosemary/crates/core" }
+rosemary2-server = { path = "rosemary/crates/server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

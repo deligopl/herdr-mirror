@@ -1,0 +1,165 @@
+{
+  "cases": [
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": true,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "active_binding"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 2,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "ambiguous_endpoints"
+    },
+    {
+      "available_conductors": 1,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "done",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "available_done"
+    },
+    {
+      "available_conductors": 1,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "available_idle"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": false,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "disconnected"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": false,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "endpoint_not_present"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 0,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "missing_endpoint"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": false,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "not_ready"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": true,
+        "protocol_compatible": false
+      },
+      "name": "protocol_incompatible"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "working",
+        "project_member": true,
+        "protocol_compatible": true
+      },
+      "name": "working_not_idle_or_done"
+    },
+    {
+      "available_conductors": 0,
+      "inputs": {
+        "active_binding": false,
+        "connected": true,
+        "endpoint_count": 1,
+        "endpoint_present": true,
+        "interactive_ready": true,
+        "presence": "idle",
+        "project_member": false,
+        "protocol_compatible": true
+      },
+      "name": "wrong_project"
+    }
+  ],
+  "source": {
+    "commit": "7d589949ab50d3f5ec2c0d542f411ef31c6a75f3",
+    "derivation": "crates/server/src/roster.rs::derive_observed",
+    "derivation_file_sha256": "87bd9d62d4c7abfa6e76ad6adfcd45f067e2c3c845c49195a5eb96829acf0d28",
+    "generator": "tools/rosemary-roster-contract/main.rs",
+    "repository": "https://github.com/deligopl/rosemary2.git"
+  }
+}

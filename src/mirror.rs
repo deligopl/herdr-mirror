@@ -461,6 +461,10 @@ pub struct ConvergeDeps {
 #[derive(Clone, Default)]
 pub struct RosemaryProjectionGate {
     pending_local_panes: Arc<Mutex<HashSet<String>>>,
+    captured_local_panes: Arc<Mutex<HashSet<String>>>,
+    captured_clear_panes: Arc<Mutex<HashSet<String>>>,
+    capture_changed: Arc<tokio::sync::Notify>,
+    projection: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RosemaryProjectionGate {
@@ -468,18 +472,70 @@ impl RosemaryProjectionGate {
         if let Ok(mut pending) = self.pending_local_panes.lock() {
             pending.insert(pane_id.to_string());
         }
+        if let Ok(mut captured) = self.captured_local_panes.lock() {
+            captured.remove(pane_id);
+        }
+        if let Ok(mut cleared) = self.captured_clear_panes.lock() {
+            cleared.remove(pane_id);
+        }
+    }
+
+    pub fn finish_local_capture(&self, pane_id: &str, cleared: bool) {
+        if let Ok(mut captured) = self.captured_local_panes.lock() {
+            captured.insert(pane_id.to_string());
+        }
+        if cleared {
+            if let Ok(mut clears) = self.captured_clear_panes.lock() {
+                clears.insert(pane_id.to_string());
+            }
+        }
+        self.capture_changed.notify_one();
     }
 
     pub fn finish_local_update(&self, pane_id: &str) {
         if let Ok(mut pending) = self.pending_local_panes.lock() {
             pending.remove(pane_id);
         }
+        if let Ok(mut captured) = self.captured_local_panes.lock() {
+            captured.remove(pane_id);
+        }
+        if let Ok(mut cleared) = self.captured_clear_panes.lock() {
+            cleared.remove(pane_id);
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_local_update(&self, pane_id: &str) -> bool {
         self.pending_local_panes
             .lock()
             .is_ok_and(|pending| pending.contains(pane_id))
+    }
+
+    async fn wait_for_local_capture(&self, pane_id: &str) {
+        loop {
+            let waiting = self
+                .pending_local_panes
+                .lock()
+                .is_ok_and(|pending| pending.contains(pane_id))
+                && self
+                    .captured_local_panes
+                    .lock()
+                    .is_ok_and(|captured| !captured.contains(pane_id));
+            if !waiting {
+                return;
+            }
+            self.capture_changed.notified().await;
+        }
+    }
+
+    async fn projection_permit(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.projection.clone().lock_owned().await
+    }
+
+    fn captured_clear(&self, pane_id: &str) -> bool {
+        self.captured_clear_panes
+            .lock()
+            .is_ok_and(|cleared| cleared.contains(pane_id))
     }
 }
 
@@ -2067,54 +2123,105 @@ pub async fn push_pane_status(
             if let Err(error) = local.request("pane.report_metadata", meta).await {
                 log.log(&format!("report_metadata {}: {error}", entry.local_id));
             }
-            // A local clear event may have arrived while this converge was
-            // waiting on earlier RPCs. Capture it here, before deriving or
-            // writing the Rosemary authority. Reload the one suppression into
-            // this pass's state so its final save cannot overwrite the record
-            // written by the event path.
-            if rosemary_gate.has_local_update(&entry.local_id) {
-                match capture_local_rosemary_clear(local, state_dir, host_name, &entry.local_id, log).await {
-                    Ok(_) => {
-                        if let Some(remote_name) = remote_name {
-                            let durable = load_state(state_dir, host_name);
-                            match durable.rosemary_suppressions.get(remote_name) {
-                                Some(run) => {
-                                    state.rosemary_suppressions.insert(remote_name.to_string(), run.clone());
-                                }
-                                None => {
-                                    state.rosemary_suppressions.remove(remote_name);
-                                }
-                            }
-                        }
+            // Serialize the final decision and the complete rosemary-run RPC.
+            // The event reader may durably capture a clear while that RPC is
+            // in flight, but it cannot retire the pending marker before this
+            // transaction has reloaded the record and corrected a stale write.
+            let local_pane_id = entry.local_id.clone();
+            let _projection = rosemary_gate.projection_permit().await;
+            rosemary_gate.wait_for_local_capture(&local_pane_id).await;
+            if rosemary_gate.captured_clear(&local_pane_id) {
+                let Some(remote_name) = remote_name else {
+                    log.log(&format!(
+                        "[{host_name}] captured Rosemary clear has no current remote agent; projection remains blocked"
+                    ));
+                    return;
+                };
+                let durable = load_state(state_dir, host_name);
+                match durable.rosemary_suppressions.get(remote_name) {
+                    Some(run) => {
+                        state.rosemary_suppressions.insert(remote_name.to_string(), run.clone());
                     }
-                    Err(error) => {
-                        log.log(&format!(
-                            "[{host_name}] local Rosemary update is pending; projection remains blocked: {error}"
-                        ));
-                        return;
+                    None => {
+                        state.rosemary_suppressions.remove(remote_name);
                     }
                 }
             }
             let (.., projected_rosemary_tokens, projected_run) =
                 projected_tokens(state, remote_name, &agent.tokens);
-            let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
+            let (pane_id, pane_seq) = state
+                .panes
+                .get(remote_id)
+                .map(|entry| (entry.local_id.clone(), entry.seq))
+                .expect("pane entry checked above");
             let rosemary_meta = json!({
-                "pane_id": entry.local_id,
+                "pane_id": pane_id,
                 "source": "rosemary-run",
                 "tokens": projected_rosemary_tokens,
-                "seq": entry.seq,
+                "seq": pane_seq,
             });
             match local.request("pane.report_metadata", rosemary_meta).await {
                 Ok(_) => {
+                    let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
                     entry.remote_agent_name = remote_name.map(str::to_string);
-                    entry.projected_rosemary_run = projected_run;
+                    entry.projected_rosemary_run = projected_run.clone();
                 }
                 Err(error) => log.log(&format!(
                     "report Rosemary metadata {}: {error}",
-                    entry.local_id
+                    pane_id
                 )),
             }
-            entry.reported = Some(label);
+            // A pane.updated can be observed after the final decision but
+            // before the request takes effect. Wait for that observation's
+            // durable capture while still holding the projection permit, then
+            // retract this transaction's stale tuple before it can finish.
+            rosemary_gate.wait_for_local_capture(&local_pane_id).await;
+            if rosemary_gate.captured_clear(&local_pane_id) {
+                let (Some(remote_name), Some(projected_run)) = (remote_name, projected_run) else {
+                    state
+                        .panes
+                        .get_mut(remote_id)
+                        .expect("pane entry checked above")
+                        .reported = Some(label);
+                    return;
+                };
+                let durable = load_state(state_dir, host_name);
+                if let Some(suppressed) = durable.rosemary_suppressions.get(remote_name) {
+                    state
+                        .rosemary_suppressions
+                        .insert(remote_name.to_string(), suppressed.clone());
+                    if suppressed == &projected_run {
+                        let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
+                        let clear = ROSEMARY_RUN_KEYS
+                            .into_iter()
+                            .map(|key| (key, Value::Null))
+                            .collect::<BTreeMap<_, _>>();
+                        match local
+                            .request(
+                                "pane.report_metadata",
+                                json!({
+                                    "pane_id": entry.local_id,
+                                    "source": "rosemary-run",
+                                    "tokens": clear,
+                                    "seq": entry.seq,
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(_) => entry.projected_rosemary_run = None,
+                            Err(error) => log.log(&format!(
+                                "retract stale Rosemary metadata {}: {error}",
+                                entry.local_id
+                            )),
+                        }
+                    }
+                }
+            }
+            state
+                .panes
+                .get_mut(remote_id)
+                .expect("pane entry checked above")
+                .reported = Some(label);
         }
         None => {
             if entry.reported_name.is_some() {
