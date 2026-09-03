@@ -1071,6 +1071,24 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MissingLocalAction {
+    Tombstone,
+    Rebuild,
+}
+
+/// Snapshot absence is not user intent. Herdr emits an authoritative close
+/// event for a user action, while a server restart makes every persisted local
+/// id disappear without one. Preserve only the former as a tombstone; discard
+/// stale mappings from the latter so this converge can rebuild them.
+pub(crate) fn missing_local_action(observed_close: bool) -> MissingLocalAction {
+    if observed_close {
+        MissingLocalAction::Tombstone
+    } else {
+        MissingLocalAction::Rebuild
+    }
+}
+
 /// Returns the post-converge state so callers don't re-read the state file.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
     let mut state = load_state(&deps.state_dir, &deps.host.name);
@@ -1138,14 +1156,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes);
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
-    // 1. detect mirrors that are gone locally. Always tombstone (never remove)
-    //    so this pass can't recreate them (the snapshot still lists the object);
-    //    section 2 reaps the tombstoned entry once the remote is gone.
+    // 1. detect mirrors that are gone locally. Only an event-confirmed user
+    //    close becomes a tombstone. Absence without that event means the local
+    //    id map is stale (most importantly after a local server restart), so
+    //    remove it and let this same converge rebuild the mirror.
     //
-    //    Closing the REMOTE is destructive, so it is driven only by an
-    //    event-confirmed user close (see closes.rs) — never by absence alone,
-    //    which also happens mid-rebuild, after a failed converge, or while the
-    //    local server is restarting.
+    //    Closing the REMOTE is destructive and uses the same authoritative
+    //    close event. A snapshot alone never closes or suppresses a live remote.
     let close_remote = deps.close_remote_on_local_close;
     let mine: HashSet<String> = state
         .workspaces
@@ -1159,15 +1176,31 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         Err(_) => HashSet::new(),
     };
     let mut ws_close_remote: Vec<String> = Vec::new();
+    let mut drop_workspaces: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
         if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
-            entry.tombstone = Some(true);
-            if close_remote && user_closed.contains(&entry.local_id) {
-                ws_close_remote.push(rid.clone());
-            } else {
-                log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
+            match missing_local_action(user_closed.contains(&entry.local_id)) {
+                MissingLocalAction::Tombstone => {
+                    entry.tombstone = Some(true);
+                    if close_remote {
+                        ws_close_remote.push(rid.clone());
+                    } else {
+                        log.log(&format!(
+                            "workspace mirror for {rid} was closed locally — tombstoning"
+                        ));
+                    }
+                }
+                MissingLocalAction::Rebuild => {
+                    log.log(&format!(
+                        "workspace mirror for {rid} vanished without a close event — rebuilding"
+                    ));
+                    drop_workspaces.push(rid.clone());
+                }
             }
         }
+    }
+    for rid in drop_workspaces {
+        state.workspaces.remove(&rid);
     }
     for rid in &ws_close_remote {
         log.log(&format!("workspace mirror for {rid} closed locally — closing remote workspace"));
@@ -1189,7 +1222,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // blocks recreation)
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
-                    entry.tombstone = Some(true);
                     // user intent covers the pane itself AND its whole tab:
                     // closing a tab emits only tab_closed, so the panes inside
                     // it are claimed through their tab's mapped local id
@@ -1197,10 +1229,24 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         .get(rid.as_str())
                         .and_then(|t| state.tabs.get(*t))
                         .is_some_and(|e| user_closed.contains(&e.local_id));
-                    if close_remote && (user_closed.contains(&entry.local_id) || tab_closed) {
-                        pane_close_remote.push(rid.clone());
-                    } else {
-                        log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
+                    let observed_close = user_closed.contains(&entry.local_id) || tab_closed;
+                    match missing_local_action(observed_close) {
+                        MissingLocalAction::Tombstone => {
+                            entry.tombstone = Some(true);
+                            if close_remote {
+                                pane_close_remote.push(rid.clone());
+                            } else {
+                                log.log(&format!(
+                                    "pane mirror for {rid} was closed locally — tombstoning"
+                                ));
+                            }
+                        }
+                        MissingLocalAction::Rebuild => {
+                            log.log(&format!(
+                                "pane mirror for {rid} vanished without a close event — rebuilding"
+                            ));
+                            drop_panes.push(rid.clone());
+                        }
                     }
                 }
                 _ => drop_panes.push(rid.clone()),
@@ -1878,6 +1924,13 @@ async fn keep_agent_ineligible(
 ) {
     let PaneStatusDeps { local, state_dir, host_name, log, .. } = deps;
     let source = mirror_source(host_name);
+    if state
+        .panes
+        .get(remote_id)
+        .is_some_and(|entry| entry.identity_ineligible && !entry.identity_cleanup_pending)
+    {
+        return;
+    }
     let local_id = {
         let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
         entry.identity_ineligible = true;
@@ -1912,7 +1965,14 @@ async fn keep_agent_ineligible(
                 "[{host_name}] cleanup failed for mirrored agent {exact_remote_name:?}: clear authority: {error}"
             ));
         }
-        if rename.is_ok() && authority.is_ok() {
+        let local_pane_gone = if rename.is_err() || authority.is_err() {
+            fetch_snapshot(local).await.ok().is_some_and(|snapshot| {
+                !snapshot.panes.iter().any(|pane| pane.pane_id == local_id)
+            })
+        } else {
+            false
+        };
+        if (rename.is_ok() && authority.is_ok()) || local_pane_gone {
             let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
             entry.reported_name = None;
             entry.reported = None;
@@ -1922,6 +1982,11 @@ async fn keep_agent_ineligible(
             if let Err(error) = save_state(state_dir, host_name, state) {
                 log.log(&format!(
                     "[{host_name}] could not persist completed cleanup for mirrored agent {exact_remote_name:?}: {error}"
+                ));
+            }
+            if local_pane_gone {
+                log.log(&format!(
+                    "[{host_name}] local pane {local_id} vanished during identity cleanup; stale identity and authority are already absent"
                 ));
             }
             break;
@@ -2520,7 +2585,7 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 
 #[cfg(test)]
 mod tests {
-    use super::hidden_close_plan;
+    use super::{hidden_close_plan, missing_local_action, MissingLocalAction};
 
     fn ws_entry(local: &str, tomb: bool) -> WsEntry {
         WsEntry {
@@ -2559,6 +2624,12 @@ mod tests {
         assert!(state.workspaces.contains_key("R2"));
         assert!(!state.workspaces.contains_key("R1"));
         assert!(!state.workspaces.contains_key("R3"));
+    }
+
+    #[test]
+    fn only_an_observed_close_becomes_a_tombstone() {
+        assert_eq!(missing_local_action(true), MissingLocalAction::Tombstone);
+        assert_eq!(missing_local_action(false), MissingLocalAction::Rebuild);
     }
     use super::*;
 
@@ -2882,7 +2953,17 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
-        let local = FakePeer::start("cleanup", json!({})).await;
+        let local = FakePeer::start(
+            "cleanup",
+            json!({
+                "panes": [{
+                    "pane_id": "local-pane",
+                    "tab_id": "local-tab",
+                    "workspace_id": "local-workspace"
+                }]
+            }),
+        )
+        .await;
         local.fail("agent.rename", 2);
         let local_api = ApiClient::connect(&local.path).await.unwrap();
         let mut state = HostState::default();
@@ -2932,6 +3013,121 @@ mod tests {
         assert!(log_text.contains("cleanup failed"));
         assert!(local.requests().iter().filter(|request| request["method"] == "agent.rename").count() >= 3);
         assert!(!local.requests().iter().any(|request| request["method"] == "pane.report_agent"));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn already_clean_ineligible_agent_does_not_repeat_cleanup() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-rosemary-already-clean-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let local = FakePeer::start("already-clean", json!({})).await;
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let mut state = HostState::default();
+        state.panes.insert(
+            "remote-pane".into(),
+            PaneEntry {
+                local_id: "local-pane".into(),
+                identity_ineligible: true,
+                identity_cleanup_pending: false,
+                ..PaneEntry::default()
+            },
+        );
+        let agent = AgentInfo {
+            pane_id: "remote-pane".into(),
+            agent: Some("codex".into()),
+            name: Some("colliding name".into()),
+            agent_status: Some("idle".into()),
+            ..AgentInfo::default()
+        };
+        push_pane_status(
+            &PaneStatusDeps {
+                local: &local_api,
+                state_dir: &state_dir,
+                host_name: "configured-host",
+                log: &Logger::new(&state_dir, false),
+                rosemary_gate: &RosemaryProjectionGate::default(),
+            },
+            "remote-pane",
+            &mut state,
+            Some(&agent),
+            None,
+        )
+        .await;
+
+        assert!(!local.requests().iter().any(|request| {
+            matches!(
+                request["method"].as_str(),
+                Some("agent.rename" | "pane.clear_agent_authority")
+            )
+        }));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn cleanup_of_a_vanished_local_pane_finishes_instead_of_retrying_forever() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-rosemary-vanished-pane-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let local = FakePeer::start("vanished-pane", json!({})).await;
+        local.fail("agent.rename", 10);
+        local.fail("pane.clear_agent_authority", 10);
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let mut state = HostState::default();
+        state.panes.insert(
+            "remote-pane".into(),
+            PaneEntry {
+                local_id: "local-pane".into(),
+                reported: Some("codex".into()),
+                reported_name: Some("old-name".into()),
+                remote_agent_name: Some("remote-name".into()),
+                ..PaneEntry::default()
+            },
+        );
+        let agent = AgentInfo {
+            pane_id: "remote-pane".into(),
+            agent: Some("codex".into()),
+            name: Some("remote-name".into()),
+            agent_status: Some("idle".into()),
+            ..AgentInfo::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            push_pane_status(
+                &PaneStatusDeps {
+                    local: &local_api,
+                    state_dir: &state_dir,
+                    host_name: "configured-host",
+                    log: &Logger::new(&state_dir, false),
+                    rosemary_gate: &RosemaryProjectionGate::default(),
+                },
+                "remote-pane",
+                &mut state,
+                Some(&agent),
+                None,
+            ),
+        )
+        .await
+        .expect("cleanup loop did not stop after the local pane vanished");
+
+        let entry = &state.panes["remote-pane"];
+        assert!(entry.identity_ineligible);
+        assert!(!entry.identity_cleanup_pending);
+        assert_eq!(entry.reported_name, None);
+        assert_eq!(
+            local
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == "agent.rename")
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
