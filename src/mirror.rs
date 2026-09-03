@@ -6,8 +6,9 @@
 // mirror locally" (tombstone — don't recreate) from "remote object went away"
 // (close the mirror).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -447,6 +448,135 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    /// One planner for the whole local Herdr session. It sees every configured
+    /// source before allowing any mirrored dispatch identity.
+    pub names: SessionNamePlanner,
+}
+
+#[derive(Clone)]
+pub struct SessionNamePlanner {
+    inner: Arc<Mutex<SessionNamePlan>>,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct SessionNamePlan {
+    expected_hosts: BTreeSet<String>,
+    observed: BTreeMap<String, Vec<(String, String)>>,
+    planned: BTreeMap<(String, String), Option<String>>,
+    generation: u64,
+}
+
+impl SessionNamePlanner {
+    pub fn new(hosts: impl IntoIterator<Item = String>) -> Self {
+        let expected_hosts = hosts.into_iter().collect();
+        let (changed, _) = tokio::sync::watch::channel(0);
+        Self {
+            inner: Arc::new(Mutex::new(SessionNamePlan {
+                expected_hosts,
+                ..SessionNamePlan::default()
+            })),
+            changed,
+        }
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    fn update(
+        &self,
+        host_name: &str,
+        agents: &[AgentInfo],
+        local: &Snapshot,
+        state_dir: &std::path::Path,
+        log: &Logger,
+    ) -> HashMap<String, Option<String>> {
+        let mut plan = self.inner.lock().expect("session name planner poisoned");
+        plan.observed.insert(
+            host_name.to_string(),
+            agents
+                .iter()
+                .filter_map(|agent| {
+                    agent.name.as_ref().map(|name| (agent.pane_id.clone(), name.clone()))
+                })
+                .collect(),
+        );
+
+        let ready = plan.expected_hosts.iter().all(|host| plan.observed.contains_key(host));
+        let mut next = BTreeMap::new();
+        if ready {
+            let mut records = Vec::new();
+            for (host, agents) in &plan.observed {
+                for (pane, remote_name) in agents {
+                    records.push((host.clone(), pane.clone(), remote_name.clone()));
+                }
+            }
+            let mut candidates: Vec<Option<String>> = records
+                .iter()
+                .map(|(host, _, remote)| mirrored_agent_name(host, Some(remote)))
+                .collect();
+
+            // A short un-hashed spelling can be ambiguous across source-pair
+            // boundaries. Only those duplicate spellings are regenerated with
+            // the exact source-pair digest; ordinary legal names stay stable.
+            let mut owners: HashMap<String, Vec<usize>> = HashMap::new();
+            for (index, candidate) in candidates.iter().enumerate() {
+                if let Some(candidate) = candidate {
+                    owners.entry(candidate.clone()).or_default().push(index);
+                }
+            }
+            for indexes in owners.values().filter(|indexes| indexes.len() > 1) {
+                for index in indexes {
+                    let (host, _, remote) = &records[*index];
+                    candidates[*index] = mirrored_agent_name_hashed(host, remote);
+                }
+            }
+
+            let mapped_panes: HashSet<String> = plan
+                .expected_hosts
+                .iter()
+                .flat_map(|host| load_state(state_dir, host).panes.into_values().map(|entry| entry.local_id))
+                .collect();
+            let native_names: HashSet<String> = local
+                .agents
+                .iter()
+                .filter(|agent| !mapped_panes.contains(&agent.pane_id))
+                .filter_map(|agent| agent.name.clone())
+                .collect();
+            let mut final_owners: HashMap<String, Vec<usize>> = HashMap::new();
+            for (index, candidate) in candidates.iter().enumerate() {
+                if let Some(candidate) = candidate {
+                    final_owners.entry(candidate.clone()).or_default().push(index);
+                }
+            }
+            for (index, (host, pane, remote)) in records.iter().enumerate() {
+                let candidate = candidates[index].clone();
+                let collision = candidate.as_ref().is_some_and(|name| {
+                    native_names.contains(name)
+                        || final_owners.get(name).is_some_and(|owners| owners.len() > 1)
+                });
+                let eligible = candidate.filter(|_| !collision);
+                if eligible.is_none() {
+                    log.log(&format!(
+                        "[{host}] mirrored agent {remote:?} is ineligible: invalid or session-global name collision"
+                    ));
+                }
+                next.insert((host.clone(), pane.clone()), eligible);
+            }
+        }
+
+        if next != plan.planned {
+            plan.planned = next;
+            plan.generation += 1;
+            let _ = self.changed.send(plan.generation);
+        }
+        plan.planned
+            .iter()
+            .filter(|((host, _), _)| host == host_name)
+            .map(|((_, pane), name)| (pane.clone(), name.clone()))
+            .collect()
+    }
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -927,6 +1057,18 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     // as user intent — which is the chain that closed two real remote
     // workspaces. The daemon does it in `apply_hidden` instead.
     if crate::state::is_hidden(&deps.state_dir, &deps.host.name) {
+        // Hidden contributes an empty source to the session-global identity
+        // barrier. Otherwise one intentionally hidden host would prevent every
+        // visible host from ever receiving a dispatch name.
+        if let Ok(local_snap) = fetch_snapshot(&deps.local).await {
+            deps.names.update(
+                &deps.host.name,
+                &[],
+                &local_snap,
+                &deps.state_dir,
+                &deps.log,
+            );
+        }
         return Ok(());
     }
 
@@ -1341,6 +1483,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             reported_name: None,
                             remote_agent_name: None,
                             projected_rosemary_run: None,
+                            identity_ineligible: false,
+                            identity_cleanup_pending: false,
                         },
                     );
                     fresh.push(local_id.clone());
@@ -1425,6 +1569,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             reported_name: None,
                             remote_agent_name: None,
                             projected_rosemary_run: None,
+                            identity_ineligible: false,
+                            identity_cleanup_pending: false,
                         },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
@@ -1476,6 +1622,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             reported_name: None,
                             remote_agent_name: None,
                             projected_rosemary_run: None,
+                            identity_ineligible: false,
+                            identity_cleanup_pending: false,
                         },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
@@ -1567,7 +1715,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     state.ratios.retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
 
     // 5. push authoritative agent status onto mirror panes
-    push_statuses(deps, &remote_snap, state).await;
+    push_statuses(deps, &remote_snap, &local_snap, state).await;
     Ok(())
 }
 
@@ -1582,12 +1730,12 @@ const ROSEMARY_RUN_KEYS: [&str; 4] = [
 ];
 
 fn rosemary_run(tokens: &HashMap<String, String>) -> Option<RosemaryRun> {
-    let binding = tokens.get(ROSEMARY_RUN_KEYS[0])?.trim();
-    if binding.is_empty() {
+    let binding = tokens.get(ROSEMARY_RUN_KEYS[0])?;
+    if binding.trim().is_empty() {
         return None;
     }
     Some(RosemaryRun {
-        binding: binding.to_string(),
+        binding: binding.clone(),
         outcome: tokens.get(ROSEMARY_RUN_KEYS[1]).cloned(),
         commit: tokens.get(ROSEMARY_RUN_KEYS[2]).cloned(),
         summary: tokens.get(ROSEMARY_RUN_KEYS[3]).cloned(),
@@ -1648,19 +1796,17 @@ pub async fn capture_local_rosemary_clear(
     host_name: &str,
     local_pane_id: &str,
     log: &Logger,
-) {
+) -> Result<bool> {
     let mut state = load_state(state_dir, host_name);
     let Some(entry) = state.panes.values().find(|entry| entry.local_id == local_pane_id) else {
-        return;
+        return Ok(false);
     };
     let (Some(remote_name), Some(projected)) =
         (entry.remote_agent_name.clone(), entry.projected_rosemary_run.clone())
     else {
-        return;
+        return Ok(false);
     };
-    let Ok(snapshot) = fetch_snapshot(local).await else {
-        return;
-    };
+    let snapshot = fetch_snapshot(local).await?;
     let tokens = snapshot
         .agents
         .iter()
@@ -1670,11 +1816,76 @@ pub async fn capture_local_rosemary_clear(
         ROSEMARY_RUN_KEYS.iter().all(|key| !tokens.contains_key(*key))
     });
     if !cleared {
-        return;
+        return Ok(false);
     }
     state.rosemary_suppressions.insert(remote_name.clone(), projected);
-    if let Err(error) = save_state(state_dir, host_name, &state) {
+    save_state(state_dir, host_name, &state).map_err(|error| {
         log.log(&format!("[{host_name}] could not persist Rosemary suppression for {remote_name}: {error}"));
+        error
+    })?;
+    Ok(true)
+}
+
+async fn keep_agent_ineligible(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    remote_id: &str,
+    exact_remote_name: &str,
+    state: &mut HostState,
+    reason: &str,
+    log: &Logger,
+) {
+    let source = mirror_source(host_name);
+    let local_id = {
+        let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
+        entry.identity_ineligible = true;
+        entry.identity_cleanup_pending = true;
+        entry.local_id.clone()
+    };
+    log.log(&format!(
+        "[{host_name}] mirrored agent {exact_remote_name:?} is ineligible: {reason}; clearing local identity and authority"
+    ));
+    if let Err(error) = save_state(state_dir, host_name, state) {
+        log.log(&format!(
+            "[{host_name}] could not durably mark mirrored agent {exact_remote_name:?} ineligible: {error}"
+        ));
+    }
+    loop {
+        let rename = local
+            .request("agent.rename", json!({ "target": local_id, "name": Value::Null }))
+            .await;
+        let authority = local
+            .request(
+                "pane.clear_agent_authority",
+                json!({ "pane_id": local_id, "source": source }),
+            )
+            .await;
+        if let Err(error) = &rename {
+            log.log(&format!(
+                "[{host_name}] cleanup failed for mirrored agent {exact_remote_name:?}: clear name: {error}"
+            ));
+        }
+        if let Err(error) = &authority {
+            log.log(&format!(
+                "[{host_name}] cleanup failed for mirrored agent {exact_remote_name:?}: clear authority: {error}"
+            ));
+        }
+        if rename.is_ok() && authority.is_ok() {
+            let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
+            entry.reported_name = None;
+            entry.reported = None;
+            entry.remote_agent_name = None;
+            entry.projected_rosemary_run = None;
+            entry.identity_cleanup_pending = false;
+            if let Err(error) = save_state(state_dir, host_name, state) {
+                log.log(&format!(
+                    "[{host_name}] could not persist completed cleanup for mirrored agent {exact_remote_name:?}: {error}"
+                ));
+            }
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -1699,6 +1910,53 @@ pub async fn push_pane_status(
     let source = mirror_source(host_name);
     match agent {
         Some(agent) => {
+            let exact_remote_name = agent.name.as_deref().unwrap_or("");
+            if desired_name.is_none() {
+                keep_agent_ineligible(
+                    local,
+                    state_dir,
+                    host_name,
+                    remote_id,
+                    exact_remote_name,
+                    state,
+                    "the session-global name plan refused the candidate",
+                    log,
+                )
+                .await;
+                return;
+            }
+            if desired_name != entry.reported_name {
+                let local_id = entry.local_id.clone();
+                match local
+                    .request(
+                        "agent.rename",
+                        json!({ "target": local_id, "name": desired_name }),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
+                        entry.reported_name = desired_name.clone();
+                        entry.identity_ineligible = false;
+                        entry.identity_cleanup_pending = false;
+                    }
+                    Err(error) => {
+                        keep_agent_ineligible(
+                            local,
+                            state_dir,
+                            host_name,
+                            remote_id,
+                            exact_remote_name,
+                            state,
+                            &format!("agent.rename refused {desired_name:?}: {error}"),
+                            log,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
             entry.seq += 1;
             let display = agent.display_agent.clone().or_else(|| agent.agent.clone());
             // Identity is the remote's CANONICAL id ("claude"), not the pretty
@@ -1758,36 +2016,6 @@ pub async fn push_pane_status(
             // inside the local server's 32-character rule. A refused or
             // residual-collision name is cleared instead of leaving an older
             // dispatch identity behind.
-            if desired_name != entry.reported_name {
-                match local
-                    .request(
-                        "agent.rename",
-                        json!({ "target": entry.local_id, "name": desired_name }),
-                    )
-                    .await
-                {
-                    Ok(_) => entry.reported_name = desired_name.clone(),
-                    Err(e) => {
-                        log.log(&format!(
-                            "rename mirrored agent {} to {:?}: {e}",
-                            entry.local_id, desired_name
-                        ));
-                        let _ = local.request(
-                            "agent.rename",
-                            json!({ "target": entry.local_id, "name": Value::Null }),
-                        ).await;
-                        let _ = local.request(
-                            "pane.clear_agent_authority",
-                            json!({ "pane_id": entry.local_id, "source": source }),
-                        ).await;
-                        entry.reported_name = None;
-                        entry.reported = None;
-                        entry.remote_agent_name = None;
-                        entry.projected_rosemary_run = None;
-                        return;
-                    }
-                }
-            }
             // forward the remote's own tokens so a mirrored agent row carries the
             // same values a native one does, under whatever layout is configured
             // locally. Ignored by a pre-0.7.4 local server (no deny_unknown_fields).
@@ -1962,6 +2190,20 @@ pub(crate) fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) ->
         return legal_agent_name(&full);
     }
 
+    mirrored_agent_name_hashed(host_name, exact_remote)
+}
+
+fn mirrored_agent_name_hashed(host_name: &str, exact_remote: &str) -> Option<String> {
+    let remote = sanitize_agent_component(exact_remote);
+    if !remote.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let host = sanitize_agent_component(host_name);
+    if host.is_empty() {
+        return None;
+    }
+    let full = format!("{host}-{remote}");
+
     let mut hasher = Sha256::new();
     hasher.update(host_name.as_bytes());
     hasher.update([0]);
@@ -1981,29 +2223,6 @@ pub(crate) fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) ->
         return None;
     }
     legal_agent_name(&format!("{readable}-{digest}{suffix}"))
-}
-
-/// Resolve every name before any pane is advertised. A residual duplicate is
-/// deliberately represented as no name for every affected pane.
-fn mirrored_agent_names<'a>(
-    host_name: &str,
-    agents: impl Iterator<Item = &'a AgentInfo>,
-) -> HashMap<String, Option<String>> {
-    let mut planned = HashMap::new();
-    let mut owners: HashMap<String, Vec<String>> = HashMap::new();
-    for agent in agents {
-        let candidate = mirrored_agent_name(host_name, agent.name.as_deref());
-        if let Some(name) = &candidate {
-            owners.entry(name.clone()).or_default().push(agent.pane_id.clone());
-        }
-        planned.insert(agent.pane_id.clone(), candidate);
-    }
-    for panes in owners.values().filter(|panes| panes.len() > 1) {
-        for pane in panes {
-            planned.insert(pane.clone(), None);
-        }
-    }
-    planned
 }
 
 /// Authoritative close path: apply explicit remote `*.closed` events by closing
@@ -2047,10 +2266,21 @@ pub async fn apply_remote_closes(
     }
 }
 
-pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
+pub async fn push_statuses(
+    deps: &ConvergeDeps,
+    remote_snap: &Snapshot,
+    local_snap: &Snapshot,
+    state: &mut HostState,
+) {
     let agent_by_pane: HashMap<&str, &AgentInfo> =
         remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
-    let names = mirrored_agent_names(&deps.host.name, remote_snap.agents.iter());
+    let names = deps.names.update(
+        &deps.host.name,
+        &remote_snap.agents,
+        local_snap,
+        &deps.state_dir,
+        &deps.log,
+    );
     let remote_ids: Vec<String> = state.panes.keys().cloned().collect();
     for remote_id in remote_ids {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
@@ -2262,8 +2492,8 @@ mod tests {
 
     struct FakePeer {
         path: PathBuf,
-        snapshot: std::sync::Arc<std::sync::Mutex<Value>>,
         requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        failures: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -2280,38 +2510,57 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let snapshot = std::sync::Arc::new(std::sync::Mutex::new(snapshot));
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let failures = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
             let snapshots = snapshot.clone();
             let captured = requests.clone();
+            let rejected = failures.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else { break };
                     let snapshots = snapshots.clone();
                     let captured = captured.clone();
+                    let rejected = rejected.clone();
                     tokio::spawn(async move {
                         let (read, mut write) = stream.into_split();
                         let mut lines = BufReader::new(read).lines();
                         let Ok(Some(line)) = lines.next_line().await else { return };
                         let request: Value = serde_json::from_str(&line).unwrap();
                         captured.lock().unwrap().push(request.clone());
-                        let result = if request["method"] == "session.snapshot" {
-                            json!({"snapshot": snapshots.lock().unwrap().clone()})
-                        } else {
-                            json!({"type": "ok"})
+                        let method = request["method"].as_str().unwrap_or("");
+                        let refused = {
+                            let mut rejected = rejected.lock().unwrap();
+                            rejected.get_mut(method).is_some_and(|remaining| {
+                                if *remaining == 0 {
+                                    false
+                                } else {
+                                    *remaining -= 1;
+                                    true
+                                }
+                            })
                         };
-                        let response = json!({"id": request["id"], "result": result});
+                        let response = if refused {
+                            json!({"id": request["id"], "error": {"message": "injected refusal"}})
+                        } else {
+                            let result = if request["method"] == "session.snapshot" {
+                                json!({"snapshot": snapshots.lock().unwrap().clone()})
+                            } else {
+                                json!({"type": "ok"})
+                            };
+                            json!({"id": request["id"], "result": result})
+                        };
                         write.write_all(format!("{response}\n").as_bytes()).await.unwrap();
                     });
                 }
             });
-            Self { path, snapshot, requests, task }
-        }
-
-        fn set_snapshot(&self, snapshot: Value) {
-            *self.snapshot.lock().unwrap() = snapshot;
+            Self { path, requests, failures, task }
         }
 
         fn requests(&self) -> Vec<Value> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn fail(&self, method: &str, times: usize) {
+            self.failures.lock().unwrap().insert(method.to_string(), times);
         }
     }
 
@@ -2320,23 +2569,6 @@ mod tests {
             self.task.abort();
             let _ = std::fs::remove_file(&self.path);
         }
-    }
-
-    fn remote_rosemary_snapshot(binding: &str) -> Value {
-        json!({
-            "workspaces": [{"workspace_id": "rw", "label": "feature", "tab_count": 1,
-                "pane_count": 1, "active_tab_id": "rt", "tokens": {"rosemary_project": "garden"}}],
-            "tabs": [{"tab_id": "rt", "workspace_id": "rw", "label": "main"}],
-            "panes": [{"pane_id": "rp", "tab_id": "rt", "workspace_id": "rw",
-                "label": null, "cwd": "/project", "foreground_cwd": "/project"}],
-            "agents": [{"pane_id": "rp", "agent": "codex", "display_agent": "Codex",
-                "name": "conductor-rosie", "agent_status": "idle", "interactive_ready": true,
-                "agent_session": {"agent": "codex", "kind": "id", "source": "herdr:codex",
-                    "value": "remote-session"},
-                "tokens": {"rosemary_binding": binding, "rosemary_outcome": "complete",
-                    "rosemary_commit": "abc123", "rosemary_summary": "done"}}],
-            "layouts": []
-        })
     }
 
     fn local_rosemary_snapshot(local_pane: &str, include_run: bool) -> Value {
@@ -2433,16 +2665,56 @@ mod tests {
         assert!(cases[1].2.ends_with("-conductor-rosie"));
         assert_ne!(cases[2].2, cases[3].2, "the formerly colliding pairs must differ");
 
-        let duplicate = AgentInfo {
-            pane_id: "p1".into(),
-            name: Some("same".into()),
+    }
+
+    #[test]
+    fn session_name_plan_handles_cross_host_native_and_residual_collisions() {
+        let state_dir = std::env::temp_dir().join(format!("hm-name-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let empty_local: Snapshot = serde_json::from_value(json!({})).unwrap();
+        let alpha = vec![AgentInfo {
+            pane_id: "alpha-pane".into(),
+            name: Some("beta-conductor-rosie".into()),
             ..AgentInfo::default()
-        };
-        let mut other = duplicate.clone();
-        other.pane_id = "p2".into();
-        let plan = mirrored_agent_names("host", [&duplicate, &other].into_iter());
-        assert_eq!(plan["p1"], None);
-        assert_eq!(plan["p2"], None);
+        }];
+        let alpha_beta = vec![AgentInfo {
+            pane_id: "alpha-beta-pane".into(),
+            name: Some("conductor-rosie".into()),
+            ..AgentInfo::default()
+        }];
+        let planner = SessionNamePlanner::new(["alpha".to_string(), "alpha-beta".to_string()]);
+        let log = Logger::new(&state_dir, false);
+        assert!(planner.update("alpha", &alpha, &empty_local, &state_dir, &log).is_empty());
+        let second = planner.update("alpha-beta", &alpha_beta, &empty_local, &state_dir, &log);
+        let first = planner.update("alpha", &alpha, &empty_local, &state_dir, &log);
+        assert_ne!(first["alpha-pane"], second["alpha-beta-pane"]);
+        assert!(first["alpha-pane"].is_some());
+        assert!(second["alpha-beta-pane"].is_some());
+
+        let native_local: Snapshot = serde_json::from_value(json!({
+            "agents": [{"pane_id": "native", "name": "greenroom-conductor"}]
+        }))
+        .unwrap();
+        let native_collision = SessionNamePlanner::new(["greenroom".to_string()]);
+        let remote = vec![AgentInfo {
+            pane_id: "remote".into(),
+            name: Some("conductor".into()),
+            ..AgentInfo::default()
+        }];
+        assert_eq!(
+            native_collision.update("greenroom", &remote, &native_local, &state_dir, &log)["remote"],
+            None
+        );
+
+        let duplicate = vec![
+            AgentInfo { pane_id: "p1".into(), name: Some("same".into()), ..AgentInfo::default() },
+            AgentInfo { pane_id: "p2".into(), name: Some("same".into()), ..AgentInfo::default() },
+        ];
+        let residual = SessionNamePlanner::new(["host".to_string()]);
+        let names = residual.update("host", &duplicate, &empty_local, &state_dir, &log);
+        assert_eq!(names["p1"], None);
+        assert_eq!(names["p2"], None);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     /// A remote name with nothing usable in it is no name at all — better an
@@ -2470,7 +2742,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut state = HostState::default();
         let first = HashMap::from([
-            ("rosemary_binding".into(), "run-1".into()),
+            ("rosemary_binding".into(), " run-1 ".into()),
             ("rosemary_outcome".into(), "complete".into()),
             ("rosemary_commit".into(), "abc123".into()),
             ("rosemary_summary".into(), "done".into()),
@@ -2480,8 +2752,9 @@ mod tests {
             projected_tokens(&mut state, Some("conductor"), &first);
         assert_eq!(projected["model"], "gpt");
         assert!(ROSEMARY_RUN_KEYS.iter().all(|key| projected[*key].is_null()));
-        assert_eq!(rosemary["rosemary_binding"], "run-1");
+        assert_eq!(rosemary["rosemary_binding"], " run-1 ");
         let remembered = remembered.unwrap();
+        assert_eq!(remembered.binding, " run-1 ");
         state.rosemary_suppressions.insert("conductor".into(), remembered.clone());
         save_state(&dir, "host", &state).unwrap();
 
@@ -2499,13 +2772,13 @@ mod tests {
         assert_eq!(restarted.rosemary_suppressions["conductor"], remembered);
 
         let mut changed = first.clone();
-        changed.insert("rosemary_binding".into(), "run-2".into());
+        changed.insert("rosemary_binding".into(), "run-1".into());
         let (projected, rosemary, run) =
             projected_tokens(&mut restarted, Some("conductor"), &changed);
         assert_eq!(projected["model"], "gpt");
         assert!(ROSEMARY_RUN_KEYS.iter().all(|key| projected[*key].is_null()));
-        assert_eq!(rosemary["rosemary_binding"], "run-2");
-        assert_eq!(run.unwrap().binding, "run-2");
+        assert_eq!(rosemary["rosemary_binding"], "run-1");
+        assert_eq!(run.unwrap().binding, "run-1");
         assert!(!restarted.rosemary_suppressions.contains_key("conductor"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2530,125 +2803,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_converge_journey_preserves_clear_and_native_agent() {
+    async fn refused_name_and_failed_cleanup_remain_durably_ineligible_and_are_logged() {
         let state_dir = std::env::temp_dir().join(format!(
-            "hm-rosemary-journey-{}",
+            "hm-rosemary-cleanup-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
-        let remote = FakePeer::start("remote", remote_rosemary_snapshot("run-1")).await;
-        let local = FakePeer::start("local", local_rosemary_snapshot("lp", true)).await;
+        let local = FakePeer::start("cleanup", json!({})).await;
+        local.fail("agent.rename", 2);
         let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let remote_api = ApiClient::connect(&remote.path).await.unwrap();
         let mut state = HostState::default();
-        state.workspaces.insert(
-            "rw".into(),
-            WsEntry {
-                local_id: "lw".into(),
-                tombstone: None,
-                root_tab_local_id: None,
-                last_remote_label: Some("feature".into()),
+        state.panes.insert(
+            "remote-pane".into(),
+            PaneEntry {
+                local_id: "local-pane".into(),
+                reported: Some("codex".into()),
+                reported_name: Some("old-dispatch-name".into()),
+                remote_agent_name: Some("exact remote name".into()),
+                ..PaneEntry::default()
             },
         );
-        state.tabs.insert(
-            "rt".into(),
-            crate::state::TabEntry {
-                local_id: "lt".into(),
-                last_remote_label: Some("main".into()),
-            },
-        );
+        save_state(&state_dir, "configured-host", &state).unwrap();
+        let agent = AgentInfo {
+            pane_id: "remote-pane".into(),
+            agent: Some("codex".into()),
+            name: Some("exact remote name".into()),
+            agent_status: Some("idle".into()),
+            ..AgentInfo::default()
+        };
+        let log = Logger::new(&state_dir, false);
+        push_pane_status(
+            &local_api,
+            &state_dir,
+            "configured-host",
+            "remote-pane",
+            &mut state,
+            Some(&agent),
+            Some("new-dispatch-name".into()),
+            &log,
+        )
+        .await;
+
+        let durable = load_state(&state_dir, "configured-host");
+        let entry = &durable.panes["remote-pane"];
+        assert!(entry.identity_ineligible);
+        assert!(!entry.identity_cleanup_pending);
+        assert_eq!(entry.reported_name, None);
+        let log_text = std::fs::read_to_string(state_dir.join("daemon.log")).unwrap();
+        assert!(log_text.contains("[configured-host]"));
+        assert!(log_text.contains("exact remote name"));
+        assert!(log_text.contains("cleanup failed"));
+        assert!(local.requests().iter().filter(|request| request["method"] == "agent.rename").count() >= 3);
+        assert!(!local.requests().iter().any(|request| request["method"] == "pane.report_agent"));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_clear_is_not_acknowledged_when_the_suppression_cannot_be_saved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-rosemary-save-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let local = FakePeer::start("save-failure", local_rosemary_snapshot("lp", false)).await;
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let mut state = HostState::default();
         state.panes.insert(
             "rp".into(),
             PaneEntry {
                 local_id: "lp".into(),
-                tombstone: None,
-                seq: 0,
-                reported: None,
-                reported_name: None,
-                remote_agent_name: None,
-                projected_rosemary_run: None,
+                remote_agent_name: Some("conductor-rosie".into()),
+                projected_rosemary_run: Some(RosemaryRun {
+                    binding: "run-1".into(),
+                    outcome: Some("complete".into()),
+                    commit: Some("abc123".into()),
+                    summary: Some("done".into()),
+                }),
+                ..PaneEntry::default()
             },
         );
         save_state(&state_dir, "vps", &state).unwrap();
-        let deps = ConvergeDeps {
-            local: local_api.clone(),
-            remote: remote_api,
-            host: ssh_host(),
-            state_dir: state_dir.clone(),
-            log: Logger::new(&state_dir, false),
-            close_remote_on_local_close: false,
-            closes: crate::closes::new_closes(),
-        };
-
-        converge(&deps).await.unwrap();
-        let requests = local.requests();
-        let first_report = requests
-            .iter()
-            .find(|request| request["method"] == "pane.report_agent")
-            .unwrap();
-        assert_eq!(first_report["params"]["agent_session_id"], "remote-session");
-        assert_eq!(first_report["params"]["state"], "idle");
-        assert!(requests.iter().any(|request| {
-            request["method"] == "agent.rename"
-                && request["params"]["name"] == "vps-conductor-rosie"
-        }));
-
-        // The fake accepts the same public typed prompt Rosemary uses. Mirror
-        // has not replaced or invented a second routing protocol.
-        local_api
-            .request("agent.prompt", json!({"target": "lp", "text": "continue"}))
-            .await
-            .unwrap();
-        assert!(local.requests().iter().any(|request| request["method"] == "agent.prompt"));
-
-        // Rosemary clears locally; pane.updated is a doorbell in the daemon,
-        // and this is the production handler it calls after that doorbell.
-        local.set_snapshot(local_rosemary_snapshot("lp", false));
-        capture_local_rosemary_clear(&local_api, &state_dir, "vps", "lp", &deps.log).await;
-        let suppressed = load_state(&state_dir, "vps");
-        assert_eq!(suppressed.rosemary_suppressions["conductor-rosie"].binding, "run-1");
-
-        // Restart/reconnect plus local pane recreation: the source-keyed record
-        // survives while the local id changes, and the exact tuple stays out.
-        let mut recreated = load_state(&state_dir, "vps");
-        recreated.panes.get_mut("rp").unwrap().local_id = "lp2".into();
-        save_state(&state_dir, "vps", &recreated).unwrap();
-        local.set_snapshot(local_rosemary_snapshot("lp2", false));
-        converge(&deps).await.unwrap();
-        let reports: Vec<Value> = local
-            .requests()
-            .into_iter()
-            .filter(|request| request["method"] == "pane.report_metadata")
-            .collect();
-        let after_recreate = reports.last().unwrap();
-        assert_eq!(after_recreate["params"]["source"], "rosemary-run");
-        assert!(ROSEMARY_RUN_KEYS
-            .iter()
-            .all(|key| after_recreate["params"]["tokens"][*key].is_null()));
-
-        // A genuinely newer binding retires only this source pair's record.
-        remote.set_snapshot(remote_rosemary_snapshot("run-2"));
-        converge(&deps).await.unwrap();
-        let reports: Vec<Value> = local
-            .requests()
-            .into_iter()
-            .filter(|request| request["method"] == "pane.report_metadata")
-            .collect();
-        assert_eq!(reports.last().unwrap()["params"]["tokens"]["rosemary_binding"], "run-2");
+        let path = crate::state::state_path(&state_dir, "vps");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let result = capture_local_rosemary_clear(
+            &local_api,
+            &state_dir,
+            "vps",
+            "lp",
+            &Logger::new(&state_dir, false),
+        )
+        .await;
+        assert!(result.is_err(), "a failed durable write must not acknowledge the clear");
         assert!(load_state(&state_dir, "vps").rosemary_suppressions.is_empty());
-
-        // The native row was never a projection target and stays byte-for-byte
-        // the same in the fake local server throughout the journey.
-        let snapshot = local.snapshot.lock().unwrap().clone();
-        let native = snapshot["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|agent| agent["pane_id"] == "native-p")
-            .unwrap();
-        assert_eq!(native["name"], "native-agent");
-        assert_eq!(native["agent_session"]["value"], "native-session");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -2690,6 +2941,8 @@ mod tests {
             reported_name: None,
             remote_agent_name: None,
             projected_rosemary_run: None,
+            identity_ineligible: false,
+            identity_cleanup_pending: false,
         }
     }
 
@@ -2712,6 +2965,8 @@ mod tests {
                 reported_name: None,
                 remote_agent_name: None,
                 projected_rosemary_run: None,
+                identity_ineligible: false,
+                identity_cleanup_pending: false,
             },
         );
         let mut ids = Vec::new();

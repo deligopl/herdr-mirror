@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::util::Result;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneEntry {
     pub local_id: String,
@@ -34,6 +38,12 @@ pub struct PaneEntry {
     /// exact Rosemary tuple most recently written onto this local pane
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projected_rosemary_run: Option<RosemaryRun>,
+    /// The session-global planner has not granted this pane a dispatch name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub identity_ineligible: bool,
+    /// At least one local identity/authority clear has not succeeded yet.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub identity_cleanup_pending: bool,
 }
 
 impl PaneEntry {
