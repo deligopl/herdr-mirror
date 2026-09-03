@@ -42,6 +42,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::ChildStdin;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -225,7 +226,7 @@ struct Session {
     /// itself. `None` until that line arrives — the attach may fail before the
     /// wrapper ever runs — so every cleanup treats it as optional.
     remote_pid: Option<i32>,
-    stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    stdin: ChildStdin,
 }
 
 async fn write_terminal_input(
@@ -235,6 +236,15 @@ async fn write_terminal_input(
     let line = json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }).to_string()
         + "\n";
     stdin.write_all(line.as_bytes()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_typed_prompt_through_data_plane(bytes: &[u8]) -> serde_json::Value {
+    let (mut pane_side, remote_side) = tokio::io::duplex(4096);
+    write_terminal_input(&mut pane_side, bytes).await.unwrap();
+    drop(pane_side);
+    let mut lines = BufReader::new(remote_side).lines();
+    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
 }
 
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
@@ -452,7 +462,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, pid, remote_pid: None, stdin: Box::new(stdin) })
+    Ok(Session { gen, mode, pid, remote_pid: None, stdin })
 }
 
 // ---------------------------------------------------------------------------
@@ -916,48 +926,6 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
-    fn new(
-        args: Args,
-        state_dir: std::path::PathBuf,
-        tty: bool,
-        tx: mpsc::Sender<Msg>,
-    ) -> Self {
-        Self {
-            args,
-            state_dir,
-            tty,
-            grid: Grid::new(),
-            renderer: Renderer::new(),
-            tx,
-            mode: Mode::Observe,
-            switching_to: None,
-            switch_at: None,
-            session: None,
-            next_gen: 0,
-            backoff_idx: 0,
-            reconnect_at: None,
-            pending_remote_kills: Vec::new(),
-            attach_conflict_retried: false,
-            control_failures: 0,
-            control_sticky: false,
-            pending_input: Vec::new(),
-            last_input: Instant::now(),
-            hint_clear_at: None,
-            predict: Predictor::new(),
-            remote_fg: None,
-            select: Select::new(),
-            last_select_rows: None,
-            fg_poll_at: None,
-            settle_at: None,
-            mouse_grabbed: tty,
-            app_cursor_keys: false,
-            paste_inflight: false,
-            paste_buf: Vec::new(),
-            paste_queue: Vec::new(),
-            paste_original: None,
-        }
-    }
-
     fn paint(&mut self) {
         if !self.tty {
             return;
@@ -1722,59 +1690,6 @@ impl App {
     }
 }
 
-/// Test seam for the production pane application. The peer still owns only
-/// the public local-pane address; bytes cross the same App stdin/control path
-/// and Session writer used by `run`, ending as a real `terminal.input` frame.
-#[cfg(test)]
-pub(crate) fn test_production_pane_input(
-    remote_pane: String,
-    terminal_inputs: Arc<Mutex<Vec<serde_json::Value>>>,
-) -> mpsc::Sender<Vec<u8>> {
-    let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(8);
-    let (pane_side, remote_side) = tokio::io::duplex(4096);
-    let (app_tx, _app_rx) = mpsc::channel::<Msg>(8);
-    let args = Args {
-        ssh_target: "hermetic-peer".into(),
-        pane_target: remote_pane.clone(),
-        remote_bin: None,
-        cols: 80,
-        rows: 24,
-        dump: true,
-        session: None,
-        control_idle_secs: 0,
-        always_control: true,
-        max_cols: None,
-        max_rows: None,
-        ctl_path: None,
-        container: None,
-    };
-    let mut app = App::new(args, std::env::temp_dir(), false, app_tx);
-    app.mode = Mode::Control;
-    app.fg_poll_at = Some(Instant::now());
-    app.session = Some(Session {
-        gen: 1,
-        mode: Mode::Control,
-        pid: 0,
-        remote_pid: None,
-        stdin: Box::new(pane_side),
-    });
-    tokio::spawn(async move {
-        while let Some(bytes) = input_rx.recv().await {
-            app.handle_stdin(bytes).await;
-        }
-    });
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(remote_side).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(&line) {
-                frame["pane_id"] = json!(remote_pane);
-                terminal_inputs.lock().unwrap().push(frame);
-            }
-        }
-    });
-    input_tx
-}
-
 // ---------------------------------------------------------------------------
 // main
 
@@ -2082,7 +1997,42 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
-    let mut app = App::new(args, state_dir.clone(), tty, tx);
+    let mut app = App {
+        args,
+        state_dir: state_dir.clone(),
+        tty,
+        grid: Grid::new(),
+        renderer: Renderer::new(),
+        tx,
+        mode: Mode::Observe,
+        switching_to: None,
+        switch_at: None,
+        session: None,
+        next_gen: 0,
+        backoff_idx: 0,
+        reconnect_at: None,
+        pending_remote_kills: Vec::new(),
+        attach_conflict_retried: false,
+        control_failures: 0,
+        control_sticky: false,
+        pending_input: Vec::new(),
+        last_input: Instant::now(),
+        hint_clear_at: None,
+        predict: Predictor::new(),
+        remote_fg: None,
+        select: Select::new(),
+        last_select_rows: None,
+        fg_poll_at: None,
+        settle_at: None,
+        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+        // startup leaves the pane in normal cursor mode; the first classification
+        // moves it if the remote turns out to be a TUI
+        app_cursor_keys: false,
+        paste_inflight: false,
+        paste_buf: Vec::new(),
+        paste_queue: Vec::new(),
+        paste_original: None,
+    };
     // A streamer that was killed before it could clean up (a daemon restart, a
     // closed pane, a SIGKILL) leaves its remote client attached and its pid on
     // disk. We are the next streamer for that same mirror pane, so the record

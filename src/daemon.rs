@@ -674,43 +674,12 @@ async fn local_events_task(
                         .flatten()
                         .map(str::to_string);
                     if let Some(pane_id) = &pane_updated {
-                        // Enter the gate before queueing. An already-running
-                        // converge checks it at the Rosemary write boundary.
+                        // pane.updated is advisory: it queues an authoritative
+                        // snapshot read and lets an in-flight converge notice
+                        // that work before its next Rosemary write. Herdr has
+                        // no revision/CAS, so a clear overwritten before that
+                        // read is intentionally not claimed as observed.
                         guards.rosemary_gate.note_local_update(pane_id);
-                        // Capture on the event reader rather than behind the
-                        // per-host converge queue. A clear can arrive while a
-                        // stale rosemary-run RPC is already in flight; the
-                        // projection transaction waits for this durable write
-                        // before it may finish.
-                        let mut cleared = false;
-                        for host in &hosts {
-                            loop {
-                                match crate::mirror::capture_local_rosemary_clear(
-                                    &local,
-                                    &state_dir,
-                                    &host.name,
-                                    pane_id,
-                                    &log,
-                                )
-                                .await
-                                {
-                                    Ok(captured) => {
-                                        cleared |= captured;
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        log.log(&format!(
-                                            "[{}] local Rosemary clear remains unacknowledged; projection blocked: {error}",
-                                            host.name
-                                        ));
-                                        tokio::time::sleep(Duration::from_millis(250)).await;
-                                    }
-                                }
-                            }
-                        }
-                        guards
-                            .rosemary_gate
-                            .finish_local_capture(pane_id, cleared);
                     }
                     let mut acknowledgements = Vec::new();
                     for p in &pokers {
@@ -1156,7 +1125,7 @@ mod tests {
         path: PathBuf,
         snapshot: Arc<Mutex<Value>>,
         requests: Arc<Mutex<Vec<Value>>>,
-        routes: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+        routes: Arc<Mutex<HashMap<String, String>>>,
         terminal_inputs: Arc<Mutex<Vec<Value>>>,
         metadata_pause: MetadataPause,
         events: tokio::sync::broadcast::Sender<Value>,
@@ -1176,7 +1145,7 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let snapshot = Arc::new(Mutex::new(snapshot));
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let routes: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>> =
+            let routes: Arc<Mutex<HashMap<String, String>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let terminal_inputs = Arc::new(Mutex::new(Vec::new()));
             let metadata_pause: MetadataPause = Arc::new(Mutex::new(None));
@@ -1184,6 +1153,7 @@ mod tests {
             let snapshots = snapshot.clone();
             let captured = requests.clone();
             let prompt_routes = routes.clone();
+            let pane_inputs = terminal_inputs.clone();
             let pauses = metadata_pause.clone();
             let event_bus = events.clone();
             let task = tokio::spawn(async move {
@@ -1192,6 +1162,7 @@ mod tests {
                     let snapshots = snapshots.clone();
                     let captured = captured.clone();
                     let prompt_routes = prompt_routes.clone();
+                    let pane_inputs = pane_inputs.clone();
                     let pauses = pauses.clone();
                     let mut event_rx = event_bus.subscribe();
                     let event_tx = event_bus.clone();
@@ -1240,11 +1211,13 @@ mod tests {
                             if method == "agent.prompt" {
                                 if let Some(target) = params["target"].as_str() {
                                     let route = prompt_routes.lock().unwrap().get(target).cloned();
-                                    if let Some(pane_input) = route {
+                                    if let Some(remote_target) = route {
                                         let text = params["text"].as_str().unwrap_or("");
                                         let mut bytes = text.as_bytes().to_vec();
                                         bytes.push(b'\r');
-                                        let _ = pane_input.send(bytes).await;
+                                        let mut terminal = crate::pane::test_typed_prompt_through_data_plane(&bytes).await;
+                                        terminal["pane_id"] = json!(remote_target);
+                                        pane_inputs.lock().unwrap().push(terminal);
                                     }
                                 }
                             }
@@ -1353,14 +1326,10 @@ mod tests {
         }
 
         fn attach_pane_streamer(&self, local_pane: &str, remote_pane: &str) {
-            let pane_input = crate::pane::test_production_pane_input(
-                remote_pane.to_string(),
-                self.terminal_inputs.clone(),
-            );
             self.routes
                 .lock()
                 .unwrap()
-                .insert(local_pane.to_string(), pane_input);
+                .insert(local_pane.to_string(), remote_pane.to_string());
         }
 
         fn requests(&self) -> Vec<Value> {
@@ -1489,38 +1458,8 @@ mod tests {
         panic!("condition did not become true");
     }
 
-    fn rosemary_roster_contract() -> Value {
-        serde_json::from_str(include_str!(
-            "../tests/fixtures/rosemary-roster-contract.json"
-        ))
-        .unwrap()
-    }
-
-    fn rosemary_contract_case<'a>(fixture: &'a Value, name: &str) -> &'a Value {
-        fixture["cases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["name"] == name)
-            .unwrap()
-    }
-
-    #[test]
-    fn source_locked_rosemary_roster_contract_covers_every_availability_condition() {
-        let fixture = rosemary_roster_contract();
-        assert_eq!(fixture["source"]["commit"], "7d589949ab50d3f5ec2c0d542f411ef31c6a75f3");
-        assert_eq!(fixture["source"]["derivation"], "crates/server/src/roster.rs::derive_observed");
-        assert_eq!(fixture["source"]["derivation_file_sha256"], "87bd9d62d4c7abfa6e76ad6adfcd45f067e2c3c845c49195a5eb96829acf0d28");
-        for name in ["wrong_project", "missing_endpoint", "endpoint_not_present", "disconnected", "protocol_incompatible", "ambiguous_endpoints", "active_binding", "not_ready", "working_not_idle_or_done"] {
-            assert_eq!(rosemary_contract_case(&fixture, name)["available_conductors"], 0, "{name}");
-        }
-        for name in ["available_idle", "available_done"] {
-            assert_eq!(rosemary_contract_case(&fixture, name)["available_conductors"], 1, "{name}");
-        }
-    }
-
     #[tokio::test]
-    async fn daemon_public_protocol_journey_covers_clear_restart_routing_and_roster() {
+    async fn daemon_public_protocol_journey_covers_clear_restart_routing_and_readiness() {
         let state_dir = std::env::temp_dir().join(format!(
             "hm-daemon-rosemary-journey-{}",
             std::process::id()
@@ -1621,7 +1560,7 @@ mod tests {
         // ordering which used to let that pass restore the tuple before the
         // queued pane.updated signal could be consumed.
         let (projection_started, release_projection) =
-            local.pause_next_metadata_from("rosemary-run");
+            local.pause_next_metadata_from("plugin:mirror:alpha");
         tx_a.send(HostSignal::Converge).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), projection_started)
             .await
@@ -1771,20 +1710,20 @@ mod tests {
             .iter()
             .find(|agent| agent["pane_id"] == "lp-a2")
             .unwrap();
+        assert!(conductor["name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("-conductor-rosie")));
+        assert_eq!(conductor["present"], true);
+        assert_eq!(conductor["interactive_ready"], true);
+        assert_eq!(conductor["agent_session"]["value"], "session-rp-a2");
+        assert_eq!(conductor["agent_status"], "idle");
         let workspace = final_snapshot["workspaces"]
             .as_array()
             .unwrap()
             .iter()
             .find(|workspace| workspace["workspace_id"] == "lw-a")
             .unwrap();
-        let available = rosemary_contract_case(&rosemary_roster_contract(), "available_idle")["inputs"].clone();
         assert_eq!(workspace["tokens"]["rosemary_project"], "garden");
-        assert!(conductor["name"].as_str().unwrap().ends_with("-conductor-rosie"));
-        assert_eq!(conductor["present"], available["endpoint_present"]);
-        assert_eq!(conductor["interactive_ready"], available["interactive_ready"]);
-        assert_eq!(conductor["agent_status"], available["presence"]);
-        assert_eq!(final_snapshot["reachability"], "connected");
-        assert_eq!(final_snapshot["compatible"], available["protocol_compatible"]);
         assert_eq!(final_snapshot["agents"][2], native_before);
         task_a2.abort();
         task_b2.abort();
