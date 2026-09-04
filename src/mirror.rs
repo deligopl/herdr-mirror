@@ -1998,14 +1998,19 @@ async fn keep_agent_ineligible(
                 "[{host_name}] cleanup failed for mirrored agent {exact_remote_name:?}: clear authority: {error}"
             ));
         }
-        let local_pane_gone = if rename.is_err() || authority.is_err() {
-            fetch_snapshot(local).await.ok().is_some_and(|snapshot| {
-                !snapshot.panes.iter().any(|pane| pane.pane_id == local_id)
+        let (local_pane_gone, local_agent_gone) = if rename.is_err() || authority.is_err() {
+            fetch_snapshot(local).await.ok().map_or((false, false), |snapshot| {
+                (
+                    !snapshot.panes.iter().any(|pane| pane.pane_id == local_id),
+                    !snapshot.agents.iter().any(|agent| agent.pane_id == local_id),
+                )
             })
         } else {
-            false
+            (false, false)
         };
-        if (rename.is_ok() && authority.is_ok()) || local_pane_gone {
+        let name_is_clear = rename.is_ok() || local_agent_gone;
+        let authority_is_clear = authority.is_ok() || local_pane_gone;
+        if (name_is_clear && authority_is_clear) || local_pane_gone {
             let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
             entry.reported_name = None;
             entry.reported = None;
@@ -2020,6 +2025,10 @@ async fn keep_agent_ineligible(
             if local_pane_gone {
                 log.log(&format!(
                     "[{host_name}] local pane {local_id} vanished during identity cleanup; stale identity and authority are already absent"
+                ));
+            } else if local_agent_gone && rename.is_err() {
+                log.log(&format!(
+                    "[{host_name}] local pane {local_id} has no detected agent during identity cleanup; the stale name is already absent"
                 ));
             }
             break;
@@ -3097,6 +3106,11 @@ mod tests {
                     "pane_id": "local-pane",
                     "tab_id": "local-tab",
                     "workspace_id": "local-workspace"
+                }],
+                "agents": [{
+                    "pane_id": "local-pane",
+                    "agent": "codex",
+                    "agent_status": "idle"
                 }]
             }),
         )
@@ -3201,6 +3215,82 @@ mod tests {
                 Some("agent.rename" | "pane.clear_agent_authority")
             )
         }));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn missing_local_agent_completes_cleanup_without_retrying_forever() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-rosemary-missing-local-agent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let local = FakePeer::start(
+            "missing-local-agent",
+            json!({
+                "panes": [{
+                    "pane_id": "local-pane",
+                    "tab_id": "local-tab",
+                    "workspace_id": "local-workspace"
+                }],
+                "agents": []
+            }),
+        )
+        .await;
+        local.fail("agent.rename", 10);
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let mut state = HostState::default();
+        state.panes.insert(
+            "remote-pane".into(),
+            PaneEntry {
+                local_id: "local-pane".into(),
+                reported: Some("codex".into()),
+                reported_name: Some("stale-name".into()),
+                remote_agent_name: Some("remote-worker".into()),
+                ..PaneEntry::default()
+            },
+        );
+        save_state(&state_dir, "configured-host", &state).unwrap();
+        let agent = AgentInfo {
+            pane_id: "remote-pane".into(),
+            agent: Some("codex".into()),
+            name: Some("remote-worker".into()),
+            agent_status: Some("idle".into()),
+            ..AgentInfo::default()
+        };
+        let log = Logger::new(&state_dir, false);
+        push_pane_status(
+            &PaneStatusDeps {
+                local: &local_api,
+                state_dir: &state_dir,
+                host_name: "configured-host",
+                log: &log,
+                rosemary_gate: &RosemaryProjectionGate::default(),
+            },
+            "remote-pane",
+            &mut state,
+            Some(&agent),
+            None,
+        )
+        .await;
+
+        let durable = load_state(&state_dir, "configured-host");
+        let entry = &durable.panes["remote-pane"];
+        assert!(entry.identity_ineligible);
+        assert!(!entry.identity_cleanup_pending);
+        assert_eq!(entry.reported_name, None);
+        assert_eq!(
+            local
+                .requests()
+                .iter()
+                .filter(|request| request["method"] == "agent.rename")
+                .count(),
+            1
+        );
+        assert!(std::fs::read_to_string(state_dir.join("daemon.log"))
+            .unwrap()
+            .contains("has no detected agent during identity cleanup"));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
