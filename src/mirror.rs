@@ -544,7 +544,15 @@ impl SessionNamePlanner {
                 .collect(),
         );
 
-        let ready = plan.expected_hosts.iter().all(|host| plan.observed.contains_key(host));
+        // Do not make an available workspace wait for every configured host.
+        // A sleeping Air or stopped VM workspace can be absent indefinitely.
+        // Plan from the observations we have and recompute when another host
+        // arrives; host namespacing keeps ordinary cases stable, while the
+        // existing digest fallback resolves a newly revealed collision.
+        let ready = plan
+            .expected_hosts
+            .iter()
+            .any(|host| plan.observed.contains_key(host));
         let mut next = BTreeMap::new();
         if ready {
             let mut records = Vec::new();
@@ -2927,7 +2935,8 @@ mod tests {
         }];
         let planner = SessionNamePlanner::new(["alpha".to_string(), "alpha-beta".to_string()]);
         let log = Logger::new(&state_dir, false);
-        assert!(planner.update("alpha", &alpha, &empty_local, &state_dir, &log).is_empty());
+        let initial = planner.update("alpha", &alpha, &empty_local, &state_dir, &log);
+        assert!(initial["alpha-pane"].is_some());
         let second = planner.update("alpha-beta", &alpha_beta, &empty_local, &state_dir, &log);
         let first = planner.update("alpha", &alpha, &empty_local, &state_dir, &log);
         assert_ne!(first["alpha-pane"], second["alpha-beta-pane"]);
