@@ -500,7 +500,7 @@ pub struct SessionNamePlanner {
 #[derive(Default)]
 struct SessionNamePlan {
     expected_hosts: BTreeSet<String>,
-    observed: BTreeMap<String, Vec<(String, String)>>,
+    observed: BTreeMap<String, Vec<(String, Option<String>)>>,
     planned: BTreeMap<(String, String), Option<String>>,
     generation: u64,
 }
@@ -535,8 +535,11 @@ impl SessionNamePlanner {
             host_name.to_string(),
             agents
                 .iter()
-                .filter_map(|agent| {
-                    agent.name.as_ref().map(|name| (agent.pane_id.clone(), name.clone()))
+                .map(|agent| {
+                    (
+                        agent.pane_id.clone(),
+                        agent.name.clone().filter(|name| !name.trim().is_empty()),
+                    )
                 })
                 .collect(),
         );
@@ -550,9 +553,22 @@ impl SessionNamePlanner {
                     records.push((host.clone(), pane.clone(), remote_name.clone()));
                 }
             }
+            let mut unnamed_per_host: HashMap<&str, usize> = HashMap::new();
+            for (host, _, remote) in &records {
+                if remote.is_none() {
+                    *unnamed_per_host.entry(host.as_str()).or_default() += 1;
+                }
+            }
             let mut candidates: Vec<Option<String>> = records
                 .iter()
-                .map(|(host, _, remote)| mirrored_agent_name(host, Some(remote)))
+                .map(|(host, pane, remote)| match remote {
+                    Some(remote) => mirrored_agent_name(host, Some(remote)),
+                    None => mirrored_unnamed_agent_name(
+                        host,
+                        pane,
+                        unnamed_per_host.get(host.as_str()).copied().unwrap_or_default() > 1,
+                    ),
+                })
                 .collect();
 
             // A short un-hashed spelling can be ambiguous across source-pair
@@ -567,7 +583,10 @@ impl SessionNamePlanner {
             for indexes in owners.values().filter(|indexes| indexes.len() > 1) {
                 for index in indexes {
                     let (host, _, remote) = &records[*index];
-                    candidates[*index] = mirrored_agent_name_hashed(host, remote);
+                    candidates[*index] = match remote {
+                        Some(remote) => mirrored_agent_name_hashed(host, remote),
+                        None => mirrored_unnamed_agent_name(host, &records[*index].1, true),
+                    };
                 }
             }
 
@@ -589,7 +608,12 @@ impl SessionNamePlanner {
                 }
             }
             for (index, (host, pane, remote)) in records.iter().enumerate() {
-                let candidate = candidates[index].clone();
+                let mut candidate = candidates[index].clone();
+                if remote.is_none()
+                    && candidate.as_ref().is_some_and(|name| native_names.contains(name))
+                {
+                    candidate = mirrored_unnamed_agent_name(host, pane, true);
+                }
                 let collision = candidate.as_ref().is_some_and(|name| {
                     native_names.contains(name)
                         || final_owners.get(name).is_some_and(|owners| owners.len() > 1)
@@ -597,7 +621,8 @@ impl SessionNamePlanner {
                 let eligible = candidate.filter(|_| !collision);
                 if eligible.is_none() {
                     log.log(&format!(
-                        "[{host}] mirrored agent {remote:?} is ineligible: invalid or session-global name collision"
+                        "[{host}] mirrored agent {} is ineligible: invalid or session-global name collision",
+                        remote.as_deref().unwrap_or("<unnamed>")
                     ));
                 }
                 next.insert((host.clone(), pane.clone()), eligible);
@@ -2015,12 +2040,9 @@ pub async fn push_pane_status(
     match agent {
         Some(agent) => {
             let exact_remote_name = agent.name.as_deref().unwrap_or("");
-            // An unnamed remote agent needs no local rename. On a fresh
-            // mirror the local pane is not recognized as an agent until the
-            // report below lands, so trying `agent.rename` first enters the
-            // ineligibility cleanup loop with "agent target ... not found".
             // A non-empty remote name whose planned local name was refused is
-            // different: keep that identity fail-closed.
+            // kept fail-closed. An unnamed agent may still proceed without a
+            // name only if even the workspace-derived fallback was impossible.
             if !exact_remote_name.is_empty() && desired_name.is_none() {
                 keep_agent_ineligible(
                     deps,
@@ -2032,7 +2054,13 @@ pub async fn push_pane_status(
                 .await;
                 return;
             }
-            if desired_name != entry.reported_name {
+            // A fresh mirror pane is not a local agent until report_agent
+            // lands. Defer its first rename until after that report; otherwise
+            // Herdr correctly rejects the unknown target and the agent enters
+            // a permanent cleanup loop.
+            let rename_after_report = entry.reported.is_none()
+                && desired_name != entry.reported_name;
+            if desired_name != entry.reported_name && !rename_after_report {
                 let local_id = entry.local_id.clone();
                 match local
                     .request(
@@ -2095,7 +2123,37 @@ pub async fn push_pane_status(
             }
             if let Err(e) = local.request("pane.report_agent", report).await {
                 log.log(&format!("report_agent {}: {e}", entry.local_id));
+                return;
             }
+            if rename_after_report {
+                let local_id = entry.local_id.clone();
+                match local
+                    .request(
+                        "agent.rename",
+                        json!({ "target": local_id, "name": desired_name }),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
+                        entry.reported_name = desired_name.clone();
+                        entry.identity_ineligible = false;
+                        entry.identity_cleanup_pending = false;
+                    }
+                    Err(error) => {
+                        keep_agent_ineligible(
+                            deps,
+                            remote_id,
+                            exact_remote_name,
+                            state,
+                            &format!("agent.rename refused {desired_name:?}: {error}"),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
             // Herdr's typed agent operations validate the pane's real
             // foreground process, not only lifecycle reports. Tell the local
             // streamer which supported wrapper it represents; a changed hint
@@ -2327,6 +2385,42 @@ pub(crate) fn mirrored_agent_name(host_name: &str, remote_name: Option<&str>) ->
     }
 
     mirrored_agent_name_hashed(host_name, exact_remote)
+}
+
+/// Give an unnamed remote agent the workspace/host name the owner already
+/// recognizes. A single unnamed agent gets the bare host name. Multiple
+/// unnamed agents (or a collision with a native name) get a stable pane-based
+/// digest so the plan remains deterministic across converge passes.
+fn mirrored_unnamed_agent_name(
+    host_name: &str,
+    pane_id: &str,
+    require_suffix: bool,
+) -> Option<String> {
+    let host = sanitize_agent_component(host_name);
+    if !host.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !require_suffix && host.len() <= AGENT_NAME_MAX {
+        return legal_agent_name(&host);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(host_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(pane_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let digest = &digest[..8];
+    let prefix_budget = AGENT_NAME_MAX - 1 - digest.len();
+    let readable = host
+        .trim_start_matches(|c: char| !c.is_ascii_lowercase())
+        .chars()
+        .take(prefix_budget)
+        .collect::<String>();
+    let readable = readable.trim_end_matches(['-', '_']);
+    if readable.is_empty() {
+        return None;
+    }
+    legal_agent_name(&format!("{readable}-{digest}"))
 }
 
 fn mirrored_agent_name_hashed(host_name: &str, exact_remote: &str) -> Option<String> {
@@ -2863,6 +2957,34 @@ mod tests {
         let names = residual.update("host", &duplicate, &empty_local, &state_dir, &log);
         assert_eq!(names["p1"], None);
         assert_eq!(names["p2"], None);
+
+        let unnamed = SessionNamePlanner::new(["cargocaddy-studio".to_string()]);
+        let one = vec![AgentInfo {
+            pane_id: "only-pane".into(),
+            agent: Some("claude".into()),
+            ..AgentInfo::default()
+        }];
+        assert_eq!(
+            unnamed.update("cargocaddy-studio", &one, &empty_local, &state_dir, &log)
+                ["only-pane"],
+            Some("cargocaddy-studio".into())
+        );
+
+        let several = vec![
+            AgentInfo { pane_id: "p1".into(), agent: Some("claude".into()), ..AgentInfo::default() },
+            AgentInfo { pane_id: "p2".into(), agent: Some("codex".into()), ..AgentInfo::default() },
+        ];
+        let several_names = unnamed.update(
+            "cargocaddy-studio",
+            &several,
+            &empty_local,
+            &state_dir,
+            &log,
+        );
+        assert_ne!(several_names["p1"], several_names["p2"]);
+        assert!(several_names.values().all(|name| name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("cargocaddy-studio-"))));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -3074,7 +3196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unnamed_remote_agent_is_reported_without_identity_cleanup() {
+    async fn unnamed_remote_agent_is_reported_before_workspace_default_name() {
         let state_dir = std::env::temp_dir().join(format!(
             "hm-unnamed-agent-{}",
             std::process::id()
@@ -3092,10 +3214,6 @@ mod tests {
             }),
         )
         .await;
-        // A fresh mirror pane is not a local agent until Mirror reports the
-        // remote identity. Trying to rename it first reproduces the live
-        // `agent target ... not found` loop.
-        local.fail("agent.rename", 10);
         let local_api = ApiClient::connect(&local.path).await.unwrap();
         let mut state = HostState::default();
         state.panes.insert(
@@ -3127,7 +3245,7 @@ mod tests {
                 "remote-pane",
                 &mut state,
                 Some(&agent),
-                None,
+                Some("configured-host".into()),
             ),
         )
         .await
@@ -3137,13 +3255,22 @@ mod tests {
             .requests()
             .iter()
             .any(|request| request["method"] == "pane.report_agent"));
-        assert!(!local.requests().iter().any(|request| {
-            matches!(
-                request["method"].as_str(),
-                Some("agent.rename" | "pane.clear_agent_authority")
-            )
+        let requests = local.requests();
+        let report_index = requests
+            .iter()
+            .position(|request| request["method"] == "pane.report_agent")
+            .expect("fresh mirror never reported its agent identity");
+        let rename_index = requests
+            .iter()
+            .position(|request| request["method"] == "agent.rename")
+            .expect("unnamed mirror never received its workspace-derived name");
+        assert!(report_index < rename_index);
+        assert_eq!(requests[rename_index]["params"]["name"], "configured-host");
+        assert!(!requests.iter().any(|request| {
+            request["method"] == "pane.clear_agent_authority"
         }));
         assert!(!state.panes["remote-pane"].identity_ineligible);
+        assert_eq!(state.panes["remote-pane"].reported_name.as_deref(), Some("configured-host"));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
