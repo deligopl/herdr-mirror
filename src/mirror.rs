@@ -2015,7 +2015,13 @@ pub async fn push_pane_status(
     match agent {
         Some(agent) => {
             let exact_remote_name = agent.name.as_deref().unwrap_or("");
-            if desired_name.is_none() {
+            // An unnamed remote agent needs no local rename. On a fresh
+            // mirror the local pane is not recognized as an agent until the
+            // report below lands, so trying `agent.rename` first enters the
+            // ineligibility cleanup loop with "agent target ... not found".
+            // A non-empty remote name whose planned local name was refused is
+            // different: keep that identity fail-closed.
+            if !exact_remote_name.is_empty() && desired_name.is_none() {
                 keep_agent_ineligible(
                     deps,
                     remote_id,
@@ -3064,6 +3070,80 @@ mod tests {
                 Some("agent.rename" | "pane.clear_agent_authority")
             )
         }));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn unnamed_remote_agent_is_reported_without_identity_cleanup() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-unnamed-agent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let local = FakePeer::start(
+            "unnamed-agent",
+            json!({
+                "panes": [{
+                    "pane_id": "local-pane",
+                    "tab_id": "local-tab",
+                    "workspace_id": "local-workspace"
+                }]
+            }),
+        )
+        .await;
+        // A fresh mirror pane is not a local agent until Mirror reports the
+        // remote identity. Trying to rename it first reproduces the live
+        // `agent target ... not found` loop.
+        local.fail("agent.rename", 10);
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let mut state = HostState::default();
+        state.panes.insert(
+            "remote-pane".into(),
+            PaneEntry {
+                local_id: "local-pane".into(),
+                ..PaneEntry::default()
+            },
+        );
+        let agent = AgentInfo {
+            pane_id: "remote-pane".into(),
+            agent: Some("claude".into()),
+            name: None,
+            agent_status: Some("idle".into()),
+            interactive_ready: true,
+            ..AgentInfo::default()
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            push_pane_status(
+                &PaneStatusDeps {
+                    local: &local_api,
+                    state_dir: &state_dir,
+                    host_name: "configured-host",
+                    log: &Logger::new(&state_dir, false),
+                    rosemary_gate: &RosemaryProjectionGate::default(),
+                },
+                "remote-pane",
+                &mut state,
+                Some(&agent),
+                None,
+            ),
+        )
+        .await
+        .expect("an unnamed remote agent entered identity cleanup");
+
+        assert!(local
+            .requests()
+            .iter()
+            .any(|request| request["method"] == "pane.report_agent"));
+        assert!(!local.requests().iter().any(|request| {
+            matches!(
+                request["method"].as_str(),
+                Some("agent.rename" | "pane.clear_agent_authority")
+            )
+        }));
+        assert!(!state.panes["remote-pane"].identity_ineligible);
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
