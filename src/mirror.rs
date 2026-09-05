@@ -2043,6 +2043,7 @@ pub async fn push_pane_status(
     state: &mut HostState,
     agent: Option<&AgentInfo>,
     desired_name: Option<String>,
+    local_agent_present: bool,
 ) {
     let PaneStatusDeps { local, state_dir, host_name, log, rosemary_gate } = deps;
     if state.panes.get(remote_id).is_none_or(PaneEntry::is_tombstoned) {
@@ -2071,13 +2072,13 @@ pub async fn push_pane_status(
                 .await;
                 return;
             }
-            // A fresh mirror pane is not a local agent until report_agent
-            // lands. Defer its first rename until after that report; otherwise
-            // Herdr correctly rejects the unknown target and the agent enters
-            // a permanent cleanup loop.
-            let rename_after_report = entry.reported.is_none()
-                && desired_name != entry.reported_name;
-            if desired_name != entry.reported_name && !rename_after_report {
+            // A streamer must first expose a real supported foreground agent
+            // before Herdr accepts typed identity operations for its pane.
+            // Reporting metadata in this same pass is not sufficient: the
+            // streamer adopts its agent wrapper asynchronously. Keep reporting
+            // and defer the rename until a later local snapshot proves that
+            // the pane is an agent.
+            if desired_name != entry.reported_name && local_agent_present {
                 let local_id = entry.local_id.clone();
                 match local
                     .request(
@@ -2141,34 +2142,6 @@ pub async fn push_pane_status(
             if let Err(e) = local.request("pane.report_agent", report).await {
                 log.log(&format!("report_agent {}: {e}", entry.local_id));
                 return;
-            }
-            if rename_after_report {
-                let local_id = entry.local_id.clone();
-                match local
-                    .request(
-                        "agent.rename",
-                        json!({ "target": local_id, "name": desired_name }),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
-                        entry.reported_name = desired_name.clone();
-                        entry.identity_ineligible = false;
-                        entry.identity_cleanup_pending = false;
-                    }
-                    Err(error) => {
-                        keep_agent_ineligible(
-                            deps,
-                            remote_id,
-                            exact_remote_name,
-                            state,
-                            &format!("agent.rename refused {desired_name:?}: {error}"),
-                        )
-                        .await;
-                        return;
-                    }
-                }
             }
             let entry = state.panes.get_mut(remote_id).expect("pane entry checked above");
             // Herdr's typed agent operations validate the pane's real
@@ -2535,6 +2508,12 @@ pub async fn push_statuses(
     let remote_ids: Vec<String> = state.panes.keys().cloned().collect();
     for remote_id in remote_ids {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
+        let local_agent_present = state.panes.get(&remote_id).is_some_and(|entry| {
+            local_snap
+                .agents
+                .iter()
+                .any(|agent| agent.pane_id == entry.local_id)
+        });
         push_pane_status(
             &PaneStatusDeps {
                 local: &deps.local,
@@ -2547,6 +2526,7 @@ pub async fn push_statuses(
             state,
             agent,
             names.get(&remote_id).cloned().flatten(),
+            local_agent_present,
         )
         .await;
     }
@@ -3150,6 +3130,7 @@ mod tests {
             &mut state,
             Some(&agent),
             Some("new-dispatch-name".into()),
+            true,
         )
         .await;
 
@@ -3206,6 +3187,7 @@ mod tests {
             &mut state,
             Some(&agent),
             None,
+            false,
         )
         .await;
 
@@ -3272,6 +3254,7 @@ mod tests {
             &mut state,
             Some(&agent),
             None,
+            false,
         )
         .await;
 
@@ -3345,15 +3328,38 @@ mod tests {
                 &mut state,
                 Some(&agent),
                 Some("configured-host".into()),
+                false,
             ),
         )
         .await
         .expect("an unnamed remote agent entered identity cleanup");
 
-        assert!(local
-            .requests()
+        let first_requests = local.requests();
+        assert!(first_requests
             .iter()
             .any(|request| request["method"] == "pane.report_agent"));
+        assert!(!first_requests
+            .iter()
+            .any(|request| request["method"] == "agent.rename"));
+        assert!(!state.panes["remote-pane"].identity_ineligible);
+        assert_eq!(state.panes["remote-pane"].reported_name, None);
+
+        push_pane_status(
+            &PaneStatusDeps {
+                local: &local_api,
+                state_dir: &state_dir,
+                host_name: "configured-host",
+                log: &Logger::new(&state_dir, false),
+                rosemary_gate: &RosemaryProjectionGate::default(),
+            },
+            "remote-pane",
+            &mut state,
+            Some(&agent),
+            Some("configured-host".into()),
+            true,
+        )
+        .await;
+
         let requests = local.requests();
         let report_index = requests
             .iter()
@@ -3417,6 +3423,7 @@ mod tests {
                 &mut state,
                 Some(&agent),
                 None,
+                false,
             ),
         )
         .await

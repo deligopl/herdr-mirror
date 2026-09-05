@@ -222,6 +222,7 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
             &mut state,
             agent,
             desired_name,
+            false,
         )
         .await;
     }
