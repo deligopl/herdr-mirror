@@ -776,13 +776,40 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// The fake-SSH regressions run one at a time.
+    ///
+    /// They are process tests, not unit tests: each one forks a busy-looping
+    /// descendant, blocks TERM, and asserts on exact pids and sub-second
+    /// deadlines. Run beside the other 220 tests on `cargo test`'s thread pool
+    /// they contend for the same cores and miss those deadlines — measured on
+    /// 2026-09-07, where a serial run was green and parallel runs failed
+    /// intermittently on `recorded_pid`. One at a time they are deterministic,
+    /// and they cost about 12 seconds together either way, because their own
+    /// timeouts dominate.
+    static FAKE_SSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fake_ssh_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking regression must not make every later one fail to acquire.
+        FAKE_SSH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A path no other test in this process can produce.
+    ///
+    /// The clock alone was not enough: `cargo test` runs this module's tests on
+    /// several threads at once, `SystemTime::now()` is not guaranteed to
+    /// advance between two of them, and every test asks for a program called
+    /// `fake-ssh`. Two colliding calls shared one file, and the first test to
+    /// finish deleted it out from under the other's `spawn`. The counter makes
+    /// the name unique by construction.
     fn test_path(name: &str) -> PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "herdr-mirror-{name}-{}-{nonce}",
+            "herdr-mirror-{name}-{}-{nonce}-{sequence}",
             std::process::id()
         ))
     }
@@ -885,6 +912,7 @@ esac
 
     #[tokio::test]
     async fn ssh_timeout_reaps_its_process_tree_across_retries() {
+        let _serial = fake_ssh_guard();
         let program = fake_ssh();
         let mut survivors = Vec::new();
 
@@ -921,6 +949,7 @@ esac
 
     #[tokio::test]
     async fn ssh_preserves_ordinary_output_and_status() {
+        let _serial = fake_ssh_guard();
         let program = fake_ssh();
         let output = ssh_with_program(program.as_os_str(), &["output".into()], 1000).await;
         let _ = fs::remove_file(program);
@@ -932,6 +961,7 @@ esac
 
     #[tokio::test]
     async fn ssh_timeout_includes_pipes_held_by_a_descendant() {
+        let _serial = fake_ssh_guard();
         let program = fake_ssh();
         let leader_file = test_path("pipe-leader");
         let child_file = test_path("pipe-child");
@@ -966,6 +996,7 @@ esac
 
     #[tokio::test]
     async fn ssh_timeout_gives_the_whole_group_term_grace() {
+        let _serial = fake_ssh_guard();
         let program = fake_ssh();
         let leader_file = test_path("term-leader");
         let child_file = test_path("term-child");
@@ -993,6 +1024,7 @@ esac
 
     #[tokio::test]
     async fn successful_master_start_is_not_treated_as_a_timeout() {
+        let _serial = fake_ssh_guard();
         let program = fake_ssh();
         let master_file = test_path("successful-master");
         let args = vec![
