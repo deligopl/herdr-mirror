@@ -903,10 +903,14 @@ esac
             let child = recorded_pid(&child_file).await;
             if !wait_for_pid_exit(leader).await || !wait_for_pid_exit(child).await {
                 survivors.push((leader, child));
+                // A failing regression must not leave its disposable processes
+                // behind. Only a survivor is signalled: the kernel recycles the
+                // pid of a process that already exited, and the rest of this
+                // suite runs in parallel, so killing a reaped pid can land on
+                // another test's child instead.
+                kill_pid(child);
+                kill_pid(leader);
             }
-            // A failing regression must not leave its disposable processes behind.
-            kill_pid(child);
-            kill_pid(leader);
             let _ = fs::remove_file(leader_file);
             let _ = fs::remove_file(child_file);
         }
@@ -950,11 +954,11 @@ esac
         }
         let output = bounded.expect("ssh helper hung after its direct child exited");
         assert_eq!(output.err, "ssh timeout");
+        // Both assertions above already proved these exited, and their pids are
+        // free for the kernel to reuse, so there is nothing left to signal.
         assert!(wait_for_pid_exit(leader).await, "direct ssh child survived timeout");
         assert!(wait_for_pid_exit(child).await, "pipe-holding descendant survived timeout");
 
-        kill_pid(child);
-        kill_pid(leader);
         let _ = fs::remove_file(leader_file);
         let _ = fs::remove_file(child_file);
         let _ = fs::remove_file(program);
@@ -981,8 +985,6 @@ esac
         assert!(wait_for_pid_exit(leader).await, "direct ssh child survived timeout");
         assert!(wait_for_pid_exit(child).await, "graceful descendant survived timeout");
 
-        kill_pid(child);
-        kill_pid(leader);
         let _ = fs::remove_file(leader_file);
         let _ = fs::remove_file(child_file);
         let _ = fs::remove_file(cleanup_file);
