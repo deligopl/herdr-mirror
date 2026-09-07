@@ -2,15 +2,19 @@
 // forward) over one ControlMaster per host. Pane streams deliberately use
 // their own direct connections instead (see pane.rs).
 
+use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 
 use crate::api::ApiClient;
 use crate::config::{ApiTransport, HostConfig};
@@ -47,22 +51,203 @@ struct SshOutput {
     err: String,
 }
 
+const SSH_TIMEOUT_TERM_GRACE: Duration = Duration::from_secs(2);
+const SSH_TIMEOUT_KILL_GRACE: Duration = Duration::from_millis(500);
+const SSH_TIMEOUT_REAP_POLL: Duration = Duration::from_millis(10);
+
 async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
-    let fut = Command::new("ssh")
+    ssh_with_program(OsStr::new("ssh"), args, timeout_ms).await
+}
+
+async fn ssh_with_program(program: &OsStr, args: &[String], timeout_ms: u64) -> SshOutput {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
-    match timeout(Duration::from_millis(timeout_ms), fut).await {
-        Ok(Ok(o)) => SshOutput {
-            code: o.status.code().unwrap_or(1),
-            out: String::from_utf8_lossy(&o.stdout).into_owned(),
-            err: String::from_utf8_lossy(&o.stderr).into_owned(),
+        // Every short-lived daemon SSH invocation owns its complete native
+        // ProxyCommand tree. A timeout may therefore stop exactly this group
+        // without finding processes by name or touching a successful master.
+        .process_group(0)
+        // Last-resort protection if this helper future itself is cancelled.
+        // The explicit timeout path below owns group cleanup and reaping.
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return SshOutput { code: 1, out: String::new(), err: error.to_string() };
+        }
+    };
+    let Some(pgid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
+        let _ = child.kill().await;
+        return SshOutput {
+            code: 1,
+            out: String::new(),
+            err: "ssh process has no usable pid".into(),
+        };
+    };
+    let stdout = read_pipe(child.stdout.take());
+    let stderr = read_pipe(child.stderr.take());
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut stdout = stdout;
+    let mut stderr = stderr;
+
+    let status = match timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let cleanup = terminate_owned_process_group(&mut child, pgid).await;
+            abort_pipe_tasks(&stdout, &stderr);
+            let detail = match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup_error) => {
+                    format!("{error}; process cleanup failed: {cleanup_error}")
+                }
+            };
+            return SshOutput { code: 1, out: String::new(), err: detail };
+        }
+        Err(_) => {
+            let cleanup = terminate_owned_process_group(&mut child, pgid).await;
+            abort_pipe_tasks(&stdout, &stderr);
+            return match cleanup {
+                Ok(()) => SshOutput { code: 1, out: String::new(), err: "ssh timeout".into() },
+                Err(error) => SshOutput {
+                    code: 1,
+                    out: String::new(),
+                    err: format!("ssh timeout; process cleanup failed: {error}"),
+                },
+            };
+        }
+    };
+
+    match timeout_at(deadline, finish_pipes(&mut stdout, &mut stderr)).await {
+        Ok(Ok((stdout, stderr))) => SshOutput {
+            code: status.code().unwrap_or(1),
+            out: String::from_utf8_lossy(&stdout).into_owned(),
+            err: String::from_utf8_lossy(&stderr).into_owned(),
         },
-        Ok(Err(e)) => SshOutput { code: 1, out: String::new(), err: e.to_string() },
-        Err(_) => SshOutput { code: 1, out: String::new(), err: "ssh timeout".into() },
+        Ok(Err(error)) => {
+            let cleanup = terminate_owned_process_group(&mut child, pgid).await;
+            abort_pipe_tasks(&stdout, &stderr);
+            let detail = match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup_error) => {
+                    format!("{error}; process cleanup failed: {cleanup_error}")
+                }
+            };
+            SshOutput { code: 1, out: String::new(), err: detail }
+        }
+        Err(_) => {
+            let cleanup = terminate_owned_process_group(&mut child, pgid).await;
+            abort_pipe_tasks(&stdout, &stderr);
+            match cleanup {
+                Ok(()) => SshOutput { code: 1, out: String::new(), err: "ssh timeout".into() },
+                Err(error) => SshOutput {
+                    code: 1,
+                    out: String::new(),
+                    err: format!("ssh timeout; process cleanup failed: {error}"),
+                },
+            }
+        }
     }
+}
+
+fn read_pipe<R>(pipe: Option<R>) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut bytes).await?;
+        }
+        Ok(bytes)
+    })
+}
+
+async fn finish_pipe(pipe: &mut JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    pipe.await.map_err(io::Error::other)?
+}
+
+async fn finish_pipes(
+    stdout: &mut JoinHandle<io::Result<Vec<u8>>>,
+    stderr: &mut JoinHandle<io::Result<Vec<u8>>>,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let (stdout, stderr) = tokio::join!(finish_pipe(stdout), finish_pipe(stderr));
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => Ok((stdout, stderr)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+fn abort_pipe_tasks(
+    stdout: &JoinHandle<io::Result<Vec<u8>>>,
+    stderr: &JoinHandle<io::Result<Vec<u8>>>,
+) {
+    stdout.abort();
+    stderr.abort();
+}
+
+fn process_group_exists(pgid: i32) -> io::Result<bool> {
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
+    }
+}
+
+fn signal_process_group(pgid: i32, signal: i32) -> io::Result<()> {
+    if unsafe { libc::kill(-pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+async fn wait_for_process_group_exit(pgid: i32, grace: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + grace;
+    while process_group_exists(pgid)? && Instant::now() < deadline {
+        sleep(SSH_TIMEOUT_REAP_POLL).await;
+    }
+    Ok(!process_group_exists(pgid)?)
+}
+
+async fn terminate_owned_process_group(child: &mut Child, pgid: i32) -> io::Result<()> {
+    signal_process_group(pgid, libc::SIGTERM)?;
+    let term_deadline = Instant::now() + SSH_TIMEOUT_TERM_GRACE;
+    while process_group_exists(pgid)? && Instant::now() < term_deadline {
+        // Reap the SSH leader as soon as it exits, but keep giving its
+        // ProxyCommand descendants the same bounded opportunity to handle TERM.
+        child.try_wait()?;
+        sleep(SSH_TIMEOUT_REAP_POLL).await;
+    }
+    if process_group_exists(pgid)? {
+        // The leader's former PGID still identifies only this invocation.
+        signal_process_group(pgid, libc::SIGKILL)?;
+    }
+    timeout(SSH_TIMEOUT_KILL_GRACE, child.wait())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ssh leader was not reaped after process-group cleanup",
+            )
+        })??;
+    if !wait_for_process_group_exit(pgid, SSH_TIMEOUT_KILL_GRACE).await? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "owned ssh process group survived SIGKILL",
+        ));
+    }
+    Ok(())
 }
 
 fn remove_stale_control_socket(path: &Path) -> Result<()> {
@@ -589,6 +774,7 @@ fn version_supported(version: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_path(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -615,6 +801,214 @@ mod tests {
             api_transport: ApiTransport::Auto,
             always_control: true,
         }
+    }
+
+    fn fake_ssh() -> PathBuf {
+        let path = test_path("fake-ssh");
+        fs::write(
+            &path,
+            r#"#!/bin/sh
+case "$1" in
+  timeout)
+    printf '%s\n' "$$" >"$2"
+    sh -c 'trap "" TERM; printf "%s\n" "$$" >"$1"; while :; do :; done' sh "$3" &
+    wait
+    ;;
+  pipe-hold)
+    printf '%s\n' "$$" >"$2"
+    sh -c 'trap "" TERM; printf "%s\n" "$$" >"$1"; while :; do :; done' sh "$3" &
+    exit 0
+    ;;
+  term-cleanup)
+    printf '%s\n' "$$" >"$2"
+    sh -c 'trap "/bin/sleep 0.2; printf cleaned >\"$2\"; exit 0" TERM; printf "%s\n" "$$" >"$1"; while :; do :; done' sh "$3" "$4" &
+    exit 0
+    ;;
+  output)
+    printf 'ordinary stdout'
+    printf 'ordinary stderr' >&2
+    exit 7
+    ;;
+  master)
+    [ "$3" = -M ] && [ "$4" = -f ] && [ "$5" = -N ] || exit 9
+    /bin/sleep 30 </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" >"$2"
+    exit 0
+    ;;
+  *) exit 8 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    async fn recorded_pid(path: &Path) -> i32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(value) = fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fake ssh did not record its pid in {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn kill_pid(pid: i32) {
+        if pid_alive(pid) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    async fn wait_for_pid_exit(pid: i32) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while pid_alive(pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        !pid_alive(pid)
+    }
+
+    #[tokio::test]
+    async fn ssh_timeout_reaps_its_process_tree_across_retries() {
+        let program = fake_ssh();
+        let mut survivors = Vec::new();
+
+        for attempt in 0..3 {
+            let leader_file = test_path(&format!("timeout-leader-{attempt}"));
+            let child_file = test_path(&format!("timeout-child-{attempt}"));
+            let args = vec![
+                "timeout".into(),
+                leader_file.display().to_string(),
+                child_file.display().to_string(),
+            ];
+
+            let output = ssh_with_program(program.as_os_str(), &args, 2000).await;
+            assert_eq!(output.err, "ssh timeout");
+            let leader = recorded_pid(&leader_file).await;
+            let child = recorded_pid(&child_file).await;
+            if !wait_for_pid_exit(leader).await || !wait_for_pid_exit(child).await {
+                survivors.push((leader, child));
+            }
+            // A failing regression must not leave its disposable processes behind.
+            kill_pid(child);
+            kill_pid(leader);
+            let _ = fs::remove_file(leader_file);
+            let _ = fs::remove_file(child_file);
+        }
+
+        let _ = fs::remove_file(program);
+        assert!(survivors.is_empty(), "timed-out ssh process trees survived: {survivors:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_preserves_ordinary_output_and_status() {
+        let program = fake_ssh();
+        let output = ssh_with_program(program.as_os_str(), &["output".into()], 1000).await;
+        let _ = fs::remove_file(program);
+
+        assert_eq!(output.code, 7);
+        assert_eq!(output.out, "ordinary stdout");
+        assert_eq!(output.err, "ordinary stderr");
+    }
+
+    #[tokio::test]
+    async fn ssh_timeout_includes_pipes_held_by_a_descendant() {
+        let program = fake_ssh();
+        let leader_file = test_path("pipe-leader");
+        let child_file = test_path("pipe-child");
+        let args = vec![
+            "pipe-hold".into(),
+            leader_file.display().to_string(),
+            child_file.display().to_string(),
+        ];
+
+        let bounded = tokio::time::timeout(
+            Duration::from_secs(4),
+            ssh_with_program(program.as_os_str(), &args, 500),
+        )
+        .await;
+        let leader = recorded_pid(&leader_file).await;
+        let child = recorded_pid(&child_file).await;
+        if bounded.is_err() {
+            kill_pid(child);
+            kill_pid(leader);
+        }
+        let output = bounded.expect("ssh helper hung after its direct child exited");
+        assert_eq!(output.err, "ssh timeout");
+        assert!(wait_for_pid_exit(leader).await, "direct ssh child survived timeout");
+        assert!(wait_for_pid_exit(child).await, "pipe-holding descendant survived timeout");
+
+        kill_pid(child);
+        kill_pid(leader);
+        let _ = fs::remove_file(leader_file);
+        let _ = fs::remove_file(child_file);
+        let _ = fs::remove_file(program);
+    }
+
+    #[tokio::test]
+    async fn ssh_timeout_gives_the_whole_group_term_grace() {
+        let program = fake_ssh();
+        let leader_file = test_path("term-leader");
+        let child_file = test_path("term-child");
+        let cleanup_file = test_path("term-cleanup");
+        let args = vec![
+            "term-cleanup".into(),
+            leader_file.display().to_string(),
+            child_file.display().to_string(),
+            cleanup_file.display().to_string(),
+        ];
+
+        let output = ssh_with_program(program.as_os_str(), &args, 2000).await;
+        let leader = recorded_pid(&leader_file).await;
+        let child = recorded_pid(&child_file).await;
+        assert_eq!(output.err, "ssh timeout");
+        assert_eq!(fs::read_to_string(&cleanup_file).unwrap(), "cleaned");
+        assert!(wait_for_pid_exit(leader).await, "direct ssh child survived timeout");
+        assert!(wait_for_pid_exit(child).await, "graceful descendant survived timeout");
+
+        kill_pid(child);
+        kill_pid(leader);
+        let _ = fs::remove_file(leader_file);
+        let _ = fs::remove_file(child_file);
+        let _ = fs::remove_file(cleanup_file);
+        let _ = fs::remove_file(program);
+    }
+
+    #[tokio::test]
+    async fn successful_master_start_is_not_treated_as_a_timeout() {
+        let program = fake_ssh();
+        let master_file = test_path("successful-master");
+        let args = vec![
+            "master".into(),
+            master_file.display().to_string(),
+            "-M".into(),
+            "-f".into(),
+            "-N".into(),
+        ];
+
+        let output = ssh_with_program(program.as_os_str(), &args, 1000).await;
+        let master = recorded_pid(&master_file).await;
+        assert_eq!(output.code, 0);
+        assert!(pid_alive(master), "successful background master was terminated");
+
+        kill_pid(master);
+        let _ = fs::remove_file(master_file);
+        let _ = fs::remove_file(program);
     }
 
     #[test]
