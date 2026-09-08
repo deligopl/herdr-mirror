@@ -213,6 +213,8 @@ enum Msg {
     /// result of a background foreground poll; None=poll failed (keep the last
     /// value)
     Foreground(Option<Fg>),
+    /// the remote pane's own content revision from that same poll; None=unknown
+    RemoteRevision(Option<u64>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
 }
@@ -896,6 +898,16 @@ struct App {
     last_select_rows: Option<(usize, usize)>,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
+    /// when a frame last reached us
+    last_frame_at: Instant,
+    /// the remote pane's content revision as of the last successful poll, and
+    /// when it was last seen to INCREASE. The increase is the fact that
+    /// matters: it is the only cheap proof that the remote produced output
+    /// this stream was supposed to carry.
+    remote_revision: Option<u64>,
+    remote_advanced_at: Option<Instant>,
+    /// next output-health tick (see `OUTPUT_HEALTH_INTERVAL`)
+    health_at: Option<Instant>,
     /// scheduled delayed re-poll to catch a foreground change the last input just
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
@@ -924,6 +936,17 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// after input settles, re-poll once this much later to catch a foreground
 /// change the input caused (e.g. a TUI just exited); bypasses FG_POLL_INTERVAL
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
+
+/// How often a streamer asks the remote whether it produced output, and
+/// publishes what it knows about its own output direction.
+///
+/// The existing foreground poll cannot answer this: it fires around input and
+/// mode changes, and the pane this exists for is precisely the one nobody is
+/// typing into any more. One extra multiplexed ssh exec every 20 seconds per
+/// mirrored pane is the whole cost, on the ControlMaster the daemon already
+/// holds, and it is bounded by the sweep it feeds: reporting faster than the
+/// daemon can act would buy nothing.
+const OUTPUT_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 
 impl App {
     fn paint(&mut self) {
@@ -1010,7 +1033,7 @@ impl App {
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
         tokio::spawn(async move {
-            let v = crate::foreground::poll(
+            let (fg, revision) = crate::foreground::poll(
                 &ssh,
                 bin.as_deref(),
                 session.as_deref(),
@@ -1019,8 +1042,43 @@ impl App {
                 container.as_ref(),
             )
             .await;
-            let _ = tx.send(Msg::Foreground(v)).await;
+            let _ = tx.send(Msg::Foreground(fg)).await;
+            let _ = tx.send(Msg::RemoteRevision(revision)).await;
         });
+    }
+
+    /// Record what a poll said about the remote pane's content revision.
+    ///
+    /// Only an INCREASE is stamped. A poll that failed, or one that saw the
+    /// same revision, says nothing new about whether the remote produced
+    /// anything, and stamping it would let an idle pane look like a stall the
+    /// moment its first frame is older than the grace.
+    fn note_remote_revision(&mut self, revision: Option<u64>) {
+        let Some(revision) = revision else { return };
+        if self.remote_revision.is_some_and(|seen| revision > seen) {
+            self.remote_advanced_at = Some(Instant::now());
+        }
+        self.remote_revision = Some(revision);
+    }
+
+    /// Publish this streamer's view of its own output direction for the
+    /// daemon's sweep. Wall-clock, because the reader is another process.
+    fn publish_stream_health(&self, local_pane_id: Option<&str>) {
+        let Some(id) = local_pane_id else { return };
+        if self.args.dump {
+            return;
+        }
+        let now_instant = Instant::now();
+        let now = crate::state::unix_now();
+        let to_unix = |t: Instant| now - now_instant.saturating_duration_since(t).as_secs_f64();
+        crate::state::publish_stream_health(
+            &self.state_dir,
+            id,
+            &crate::state::StreamHealth {
+                last_frame_unix: to_unix(self.last_frame_at),
+                remote_advanced_unix: self.remote_advanced_at.map(to_unix),
+            },
+        );
     }
 
     /// Hold the local mouse grab for the streamer's whole lifetime. The pane
@@ -1257,6 +1315,8 @@ impl App {
             return;
         }
         let Some(bytes) = &frame.bytes else { return };
+        // The output direction is alive exactly when this line runs.
+        self.last_frame_at = Instant::now();
         self.backoff_idx = 0;
         // frames are flowing, so whatever was holding the terminal is gone
         self.attach_conflict_retried = false;
@@ -1878,6 +1938,36 @@ pub async fn supervise(args: Args) -> Result<()> {
                 child = spawn_supervised_streamer(desired.as_deref())?;
             }
             _ = sigusr1.recv() => {
+                // An explicit restart request outranks everything else this
+                // signal can mean. The child is streaming, and by every local
+                // check healthy — that is exactly the state the daemon's sweep
+                // saw before deciding one direction of it was dead — so nothing
+                // the supervisor can ask the child would replace it.
+                //
+                // Replacing the CHILD is what keeps the pane: the supervisor is
+                // the pane's root process, so the owner sees a repaint where
+                // the frozen screen was, not a closed pane and a tombstone.
+                if crate::state::take_stream_restart(&state_dir, &local_pane_id) {
+                    crate::state::set_pane_hint(
+                        &state_dir,
+                        &local_pane_id,
+                        "output stalled — restarting the stream",
+                    );
+                    crate::util::Logger::new(&state_dir, false).log(&format!(
+                        "pane {local_pane_id}: restarting the streamer (output direction stalled)"
+                    ));
+                    stop_supervised_streamer(&mut child).await;
+                    // the replacement attaches to the same remote pane, so an
+                    // orphan of the child we just stopped would refuse it
+                    reap_recorded_remote_client(&args, &state_dir).await;
+                    desired = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
+                    child = spawn_supervised_streamer(desired.as_deref())?;
+                    // a deliberate replacement is not a crash: fresh clock,
+                    // fresh budget
+                    started = Instant::now();
+                    attempts = 0;
+                    continue;
+                }
                 let next = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
                 if next != desired {
                     stop_supervised_streamer(&mut child).await;
@@ -2023,6 +2113,10 @@ pub async fn run(args: Args) -> Result<()> {
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,
+        last_frame_at: Instant::now(),
+        remote_revision: None,
+        remote_advanced_at: None,
+        health_at: None,
         settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
         // startup leaves the pane in normal cursor mode; the first classification
@@ -2067,6 +2161,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     app.connect(initial_mode(app.args.always_control, term_size())).await;
+    app.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
     // the pane may have been laid out while the session was spawning; the signal
     // for that is buffered above, but check directly too
     if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
@@ -2092,6 +2187,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.health_at,
         ]);
 
         tokio::select! {
@@ -2114,6 +2210,7 @@ pub async fn run(args: Args) -> Result<()> {
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
+                    Some(Msg::RemoteRevision(v)) => app.note_remote_revision(v),
                     Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
@@ -2174,6 +2271,13 @@ pub async fn run(args: Args) -> Result<()> {
                     app.settle_at = None;
                     app.spawn_foreground_poll(true); // forced: bypass the throttle
                 }
+                if app.health_at.is_some_and(|t| t <= now) {
+                    app.health_at = Some(now + OUTPUT_HEALTH_INTERVAL);
+                    // forced: the pane this exists for is the one nobody is
+                    // typing into, so the input-driven throttle never releases
+                    app.spawn_foreground_poll(true);
+                    app.publish_stream_health(local_pane_id.as_deref());
+                }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
@@ -2196,6 +2300,12 @@ pub async fn run(args: Args) -> Result<()> {
     // replace this child, or a pane closing, must not be held up. Whatever is
     // left unconfirmed stays recorded for the next streamer of this pane.
     app.reap_remote_clients().await;
+    // A record outliving its streamer would let the sweep judge a pane that no
+    // longer has one; that pane's recovery is `heal_zombie_mirrors`, not a
+    // restart request addressed to nobody.
+    if let Some(id) = local_pane_id.as_deref() {
+        crate::state::clear_stream_health(&state_dir, id);
+    }
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next

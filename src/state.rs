@@ -264,6 +264,112 @@ pub fn take_pane_hint(state_dir: &Path, local_pane_id: &str) -> Option<String> {
     (fresh && !msg.is_empty()).then_some(msg)
 }
 
+/// What a live streamer knows about its own output direction, published for
+/// the daemon's frozen-mirror sweep to judge.
+///
+/// The streamer cannot decide this for itself the way it decides a crash: on
+/// 2026-09-08 the wedged mirror's own event loop was demonstrably alive — text
+/// typed locally reached the remote pane — so a self-check running inside it
+/// would have concluded it was healthy. What was dead was one direction, and
+/// only something outside the pane can act on that. So the streamer reports and
+/// the sweep decides, which also means a streamer whose loop later stops
+/// entirely is caught by the same record going stale.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamHealth {
+    /// when a frame last reached this streamer
+    pub last_frame_unix: f64,
+    /// when the REMOTE pane's own content revision was last seen to increase —
+    /// the last moment the remote definitely produced output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_advanced_unix: Option<f64>,
+}
+
+pub fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default()
+}
+
+fn stream_health_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir
+        .join("stream-health")
+        .join(format!("{}.json", crate::util::sane_component(local_pane_id)))
+}
+
+pub fn publish_stream_health(state_dir: &Path, local_pane_id: &str, health: &StreamHealth) {
+    let path = stream_health_path(state_dir, local_pane_id);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string(health) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+pub fn read_stream_health(state_dir: &Path, local_pane_id: &str) -> Option<StreamHealth> {
+    let text = std::fs::read_to_string(stream_health_path(state_dir, local_pane_id)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn clear_stream_health(state_dir: &Path, local_pane_id: &str) {
+    let _ = std::fs::remove_file(stream_health_path(state_dir, local_pane_id));
+}
+
+/// How long the remote may have produced output that never arrived before the
+/// stream is called stalled.
+///
+/// Well above any latency this transport shows — the measured worst single
+/// keystroke round trip through Mirror on this fleet is 304 ms — and above the
+/// streamer's own reconnect ladder, so a stream that is merely re-attaching is
+/// never mistaken for a dead one.
+pub const OUTPUT_STALL_GRACE_SECS: f64 = 45.0;
+
+/// Whether a live streamer's OUTPUT direction has stalled.
+///
+/// Neither half means anything alone. A mirror pane showing nothing may simply
+/// have nothing to show, which is why silence is not the signal; and a remote
+/// pane that produced output proves nothing on its own, because the frame may
+/// still be in flight. Stalled is the conjunction: the remote definitely
+/// produced output at a moment, no frame has arrived since that moment, and
+/// enough time has passed that ordinary latency cannot explain it.
+///
+/// Pure, because the two clocks and the three-way comparison are the whole
+/// decision and the live shape it was written from cannot be reproduced on
+/// demand.
+pub fn output_direction_stalled(health: &StreamHealth, now: f64, grace_secs: f64) -> bool {
+    let Some(advanced) = health.remote_advanced_unix else {
+        return false; // the remote has produced nothing we know of
+    };
+    health.last_frame_unix < advanced && now - advanced >= grace_secs
+}
+
+/// An explicit "replace the streamer in this pane", written by the daemon's
+/// sweep and consumed by the pane supervisor on SIGUSR1.
+///
+/// Its own file, and consumed by exactly one taker, for the same reasons `wake`
+/// is: SIGUSR1 already means "collect an addressed notice", so the marker is
+/// what tells a restart request apart from that ordinary traffic, and taking it
+/// spends it so a stale signal cannot restart a healthy stream twice.
+fn stream_restart_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir
+        .join("stream-restarts")
+        .join(format!("{}.request", crate::util::sane_component(local_pane_id)))
+}
+
+pub fn request_stream_restart(state_dir: &Path, local_pane_id: &str) -> std::io::Result<()> {
+    let path = stream_restart_path(state_dir, local_pane_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, "")
+}
+
+pub fn take_stream_restart(state_dir: &Path, local_pane_id: &str) -> bool {
+    std::fs::remove_file(stream_restart_path(state_dir, local_pane_id)).is_ok()
+}
+
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}-map.json"))
 }
@@ -366,6 +472,87 @@ mod tests {
         request_wake(&dir, "a").unwrap();
         assert!(!take_wake(&dir, "b"));
         assert!(take_wake(&dir, "a"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The three-way comparison that separates an idle mirror from a dead one.
+    #[test]
+    fn only_output_the_remote_produced_and_never_delivered_counts_as_a_stall() {
+        let grace = OUTPUT_STALL_GRACE_SECS;
+        let now = 1_000.0;
+
+        // idle: nothing produced remotely, nothing drawn locally. Not a stall,
+        // and this is the common case — most mirror panes sit at a prompt.
+        assert!(!output_direction_stalled(
+            &StreamHealth { last_frame_unix: 100.0, remote_advanced_unix: None },
+            now,
+            grace
+        ));
+
+        // healthy: the remote produced output and a frame arrived after it
+        assert!(!output_direction_stalled(
+            &StreamHealth { last_frame_unix: 901.0, remote_advanced_unix: Some(900.0) },
+            now,
+            grace
+        ));
+
+        // in flight: produced, not yet delivered, but only a moment ago
+        assert!(!output_direction_stalled(
+            &StreamHealth { last_frame_unix: 900.0, remote_advanced_unix: Some(999.0) },
+            now,
+            grace
+        ));
+
+        // the live shape: the remote kept producing, the last frame predates it
+        // by minutes, and input was still flowing — which this policy never
+        // consults, because a working input direction is exactly what made the
+        // freeze invisible to every existing check.
+        assert!(output_direction_stalled(
+            &StreamHealth { last_frame_unix: 500.0, remote_advanced_unix: Some(900.0) },
+            now,
+            grace
+        ));
+
+        // and the boundary is inclusive, so a sweep landing exactly on it acts
+        assert!(output_direction_stalled(
+            &StreamHealth { last_frame_unix: 500.0, remote_advanced_unix: Some(now - grace) },
+            now,
+            grace
+        ));
+    }
+
+    #[test]
+    fn a_stream_restart_request_is_consumed_by_exactly_one_taker() {
+        let dir = std::env::temp_dir().join(format!("hm-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!take_stream_restart(&dir, "w7R:p2"));
+        request_stream_restart(&dir, "w7R:p2").unwrap();
+        // never the neighbour's pane: a restart closes and replaces a stream
+        assert!(!take_stream_restart(&dir, "w7R:p3"));
+        assert!(take_stream_restart(&dir, "w7R:p2"));
+        assert!(!take_stream_restart(&dir, "w7R:p2"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stream_health_round_trips_and_is_absent_before_the_first_report() {
+        let dir = std::env::temp_dir().join(format!("hm-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(read_stream_health(&dir, "w7R:p2").is_none());
+        publish_stream_health(
+            &dir,
+            "w7R:p2",
+            &StreamHealth { last_frame_unix: 12.5, remote_advanced_unix: Some(30.25) },
+        );
+        let back = read_stream_health(&dir, "w7R:p2").unwrap();
+        assert_eq!(back.last_frame_unix, 12.5);
+        assert_eq!(back.remote_advanced_unix, Some(30.25));
+        clear_stream_health(&dir, "w7R:p2");
+        assert!(read_stream_health(&dir, "w7R:p2").is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

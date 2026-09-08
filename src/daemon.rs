@@ -559,6 +559,22 @@ fn heal_interval_seconds(poll_seconds: u64) -> u64 {
     HEAL_SECONDS.max(poll_seconds)
 }
 
+/// Whether the streamer drawing `local_pane_id` has stopped rendering.
+///
+/// Reads the record that streamer publishes and applies the stall policy to it.
+/// Split out so the whole path — the streamer's own file format, the two
+/// clocks, and the verdict — is testable without a live pane, which is the only
+/// way to cover a shape that took a real transport fault to produce.
+fn streamer_output_stalled(state_dir: &std::path::Path, local_pane_id: &str, now: f64) -> bool {
+    crate::state::read_stream_health(state_dir, local_pane_id).is_some_and(|health| {
+        crate::state::output_direction_stalled(
+            &health,
+            now,
+            crate::state::OUTPUT_STALL_GRACE_SECS,
+        )
+    })
+}
+
 /// After a local herdr server restart, session-restore resurrects mirror panes
 /// as plain shells: their ids match the map, but no streamer processes exist —
 /// and converge can't tell (the snapshot has no process info), so the mirrors
@@ -600,6 +616,35 @@ async fn heal_zombie_mirrors(
                 || crate::util::pane_streamer_alive(state_dir, &local_pane_id);
             if crate::mirror::streamer_exec_needed(process_info_live, pidfile_live) {
                 dead.push((remote_pane_id, local_pane_id, agent_hint));
+                continue;
+            }
+            // A live streamer is not the same thing as a working mirror. On
+            // 2026-09-08 one pane kept forwarding input to the remote while its
+            // output direction was dead: every process alive, the pidfile
+            // fresh, herdr reporting a streamer — so every check above passed
+            // and only recreating the pane cleared it. The streamer publishes
+            // what it knows; the verdict is here, because a stall is invisible
+            // from inside a loop that is still running.
+            if !streamer_output_stalled(state_dir, &local_pane_id, crate::state::unix_now()) {
+                continue;
+            }
+            // Drop the record with the request: the replacement republishes on
+            // its own first tick, and until then a re-read of this one would
+            // ask for the same restart again.
+            crate::state::clear_stream_health(state_dir, &local_pane_id);
+            if crate::state::request_stream_restart(state_dir, &local_pane_id).is_err() {
+                continue;
+            }
+            if crate::util::poke_pane_streamer(state_dir, &local_pane_id) {
+                log.log(&format!(
+                    "[{}] mirror pane {local_pane_id} ({remote_pane_id}) stopped rendering while \
+                     its input still flowed — restarting its streamer in place",
+                    h.name
+                ));
+            } else {
+                // No supervisor to take it. Spend the request rather than
+                // leaving it to fire at whoever occupies this pane next.
+                crate::state::take_stream_restart(state_dir, &local_pane_id);
             }
         }
         if dead.is_empty() {
@@ -1141,6 +1186,69 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
     use std::sync::{Arc, Mutex};
+
+    /// The one-directional stall, driven through the real files.
+    ///
+    /// Reproduces 2026-09-08's shape: a streamer that is running, that is still
+    /// carrying input, and whose remote pane keeps producing output no frame
+    /// ever delivers. Everything the sweep already checked — process alive,
+    /// pidfile fresh, herdr reporting a streamer — is true throughout, which is
+    /// why the record and this verdict are the only thing that can catch it.
+    #[test]
+    fn a_streamer_that_stopped_rendering_is_caught_while_it_still_looks_alive() {
+        let dir = std::env::temp_dir().join(format!("hm-stall-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pane = "w7R:p6";
+        let now = 10_000.0;
+
+        // no report yet: a pane whose streamer has not ticked once is not
+        // evidence of anything, and must never be restarted on that basis
+        assert!(!streamer_output_stalled(&dir, pane, now));
+
+        // healthy: the remote produced output and the frame arrived
+        crate::state::publish_stream_health(
+            &dir,
+            pane,
+            &crate::state::StreamHealth {
+                last_frame_unix: now - 5.0,
+                remote_advanced_unix: Some(now - 6.0),
+            },
+        );
+        assert!(!streamer_output_stalled(&dir, pane, now));
+
+        // idle: nothing produced remotely for hours. The mirror shows nothing
+        // because there is nothing to show — the case that makes plain output
+        // silence useless as a signal.
+        crate::state::publish_stream_health(
+            &dir,
+            pane,
+            &crate::state::StreamHealth {
+                last_frame_unix: now - 7_200.0,
+                remote_advanced_unix: None,
+            },
+        );
+        assert!(!streamer_output_stalled(&dir, pane, now));
+
+        // frozen: the remote kept producing, the last frame predates it
+        crate::state::publish_stream_health(
+            &dir,
+            pane,
+            &crate::state::StreamHealth {
+                last_frame_unix: now - 600.0,
+                remote_advanced_unix: Some(now - 300.0),
+            },
+        );
+        assert!(streamer_output_stalled(&dir, pane, now));
+
+        // and the request the sweep then makes reaches this pane and no other,
+        // exactly once
+        crate::state::request_stream_restart(&dir, pane).unwrap();
+        assert!(!crate::state::take_stream_restart(&dir, "w7R:p7"));
+        assert!(crate::state::take_stream_restart(&dir, pane));
+        assert!(!crate::state::take_stream_restart(&dir, pane));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     type MetadataPause =
         Arc<Mutex<Option<(String, oneshot::Sender<()>, Arc<tokio::sync::Notify>)>>>;

@@ -75,8 +75,21 @@ pub fn classify(pane_json: &str, proc_json: &str) -> Option<Fg> {
     Some(if is_shell(name) { Fg::Shell } else { Fg::Mouse })
 }
 
-/// Query the remote pane's foreground process over ssh and classify it. `None`
-/// on any failure (ssh/network/parse) so the caller keeps its last known value.
+/// The remote pane's own content revision, from the same `pane get` answer the
+/// foreground classification is read out of.
+///
+/// herdr bumps it whenever the pane's screen changes, so it is the cheapest
+/// available answer to "did the remote produce output?" — the question that
+/// separates a mirror with nothing to show from a mirror that is no longer
+/// being shown anything. Free here: the poll already makes this call.
+pub fn revision(pane_json: &str) -> Option<u64> {
+    let pane: serde_json::Value = serde_json::from_str(pane_json).ok()?;
+    pane.get("result")?.get("pane")?.get("revision")?.as_u64()
+}
+
+/// Query the remote pane over ssh: its foreground classification, and its
+/// content revision. `None` on any failure (ssh/network/parse) so the caller
+/// keeps its last known value.
 pub async fn poll(
     ssh_target: &str,
     remote_bin: Option<&str>,
@@ -84,7 +97,7 @@ pub async fn poll(
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
-) -> Option<Fg> {
+) -> (Option<Fg>, Option<u64>) {
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
     // both answers in ONE hop: same ssh round trip cost as the old single query
@@ -102,8 +115,13 @@ pub async fn poll(
             //
             // No ControlMaster equivalent is needed — docker exec is local, so
             // there is no handshake to amortize.
-            let ids = crate::docker::resolve(&ct.docker_bin, &ct.kind).await.ok()?;
-            let id = ids.into_iter().next()?;
+            let Some(id) = crate::docker::resolve(&ct.docker_bin, &ct.kind)
+                .await
+                .ok()
+                .and_then(|ids| ids.into_iter().next())
+            else {
+                return (None, None);
+            };
             let mut c = Command::new(&ct.docker_bin);
             // `sh -c` not `-lc`: match ssh's non-login remote shell
             c.args(["exec", &id, "sh", "-c", &cmd]);
@@ -121,19 +139,22 @@ pub async fn poll(
             c
         }
     };
-    let out = sc
+    let Some(out) = sc
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+        .ok()
+        .filter(|out| out.status.success())
+    else {
+        return (None, None);
+    };
     let text = String::from_utf8_lossy(&out.stdout);
-    let (pane_json, proc_json) = text.split_once("<<>>")?;
-    classify(pane_json, proc_json)
+    let Some((pane_json, proc_json)) = text.split_once("<<>>") else {
+        return (None, None);
+    };
+    (classify(pane_json, proc_json), revision(pane_json))
 }
 
 #[cfg(test)]
@@ -162,6 +183,19 @@ mod tests {
         assert!(!is_shell("htop"));
         assert!(!is_shell("nvim"));
         assert!(!is_shell("lazygit"));
+    }
+
+    /// The revision is what tells an idle mirror apart from a stalled one, so
+    /// its absence must read as "unknown", never as "nothing happened".
+    #[test]
+    fn revision_is_read_when_present_and_absent_otherwise() {
+        assert_eq!(
+            revision(r#"{"result":{"pane":{"pane_id":"w1:p6","revision":4218}}}"#),
+            Some(4218)
+        );
+        assert_eq!(revision(&pane_with_agent(None)), None);
+        assert_eq!(revision("not json"), None);
+        assert_eq!(revision(r#"{"result":{}}"#), None);
     }
 
     #[test]
