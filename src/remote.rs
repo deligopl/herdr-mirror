@@ -250,6 +250,123 @@ async fn terminate_owned_process_group(child: &mut Child, pgid: i32) -> io::Resu
     Ok(())
 }
 
+/// How long a retired ControlMaster may take to handle SIGTERM.
+const MASTER_TERM_GRACE: Duration = Duration::from_secs(2);
+/// How long it may then take to disappear after SIGKILL.
+const MASTER_KILL_GRACE: Duration = Duration::from_millis(500);
+/// Bound on the `-O check` that decides whether a master is still usable. Much
+/// tighter than the 15s the connect path allows, because this runs on a
+/// disconnect: a master that cannot answer promptly is exactly the one being
+/// retired, and waiting on it would delay the reconnect it is blocking.
+const MASTER_CHECK_TIMEOUT_MS: u64 = 5_000;
+
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Pick the backgrounded ControlMaster holding `ctl_path` out of a `ps` listing.
+///
+/// Identity-guarded on three things at once, because this pid is about to be
+/// signalled. The program must be `ssh`; `-S` must be followed by exactly this
+/// control path (a prefix test would match a neighbouring `<name>.ctl.backup`,
+/// and `socket_stem` already gives two hosts a shared prefix by design); and
+/// the argv must carry a bare `-M`, which only a master does. The daemon's own
+/// exec relays, forwards and `-O` commands all pass the same `-S <ctl_path>`
+/// *without* `-M`, and killing one of those would abort a live relay carrying
+/// the API connection.
+pub(crate) fn master_pid_from_ps(listing: &str, ctl_path: &str) -> Option<i32> {
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|p| p.parse::<i32>().ok()) else {
+            continue;
+        };
+        let argv: Vec<&str> = fields.collect();
+        let Some(program) = argv.first() else { continue };
+        let base = program.rsplit('/').next().unwrap_or(program);
+        if base != "ssh" {
+            continue;
+        }
+        if !argv.contains(&"-M") {
+            continue;
+        }
+        let holds_path = argv
+            .windows(2)
+            .any(|w| w[0] == "-S" && w[1] == ctl_path);
+        if holds_path {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+async fn ps_listing() -> String {
+    // `pid=,command=` with empty headers: one line per process, pid first,
+    // full argv after. `command` is the portable spelling — macOS's own
+    // keyword, and an alias of `args` on procps.
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+}
+
+/// End a ControlMaster that this daemon started and that can no longer serve.
+///
+/// `ssh -M -f -N` daemonizes: the surviving master is reparented to init, so it
+/// is not one of this process's children and can only be found by its
+/// ControlPath and ended by a signal. Its `ProxyCommand` — on this fleet
+/// `coder ssh --disable-autostart --stdio <workspace>.project` — is reparented
+/// the same way and holds the master's stdio pipes, so it reads EOF and exits
+/// as soon as the master does. Ending the master is therefore what ends the
+/// whole transport, and leaving an unusable one running is what leaves that
+/// child behind: `ensure_master` only unlinked the stale socket and started a
+/// replacement beside it.
+///
+/// Deliberately conditional. A dropped event stream does not imply a dead
+/// transport, and killing a healthy master would spend a full ssh (and, here, a
+/// Coder) handshake on every transient reconnect. So the master is retired only
+/// when it fails its own `-O check` — precisely the case `ensure_master`
+/// already treats as stale.
+///
+/// Returns the pid it retired, so the disconnect can name it.
+pub async fn retire_unusable_master(ctl_path: &Path, target: &str) -> Option<i32> {
+    let ctl = ctl_path.display().to_string();
+    let pid = master_pid_from_ps(&ps_listing().await, &ctl)?;
+    let check = vec![
+        "-S".to_string(),
+        ctl,
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-O".to_string(),
+        "check".to_string(),
+        target.to_string(),
+    ];
+    if ssh(&check, MASTER_CHECK_TIMEOUT_MS).await.code == 0 {
+        return None; // still serving: not ours to end
+    }
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0
+        && io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+    {
+        return None; // already gone
+    }
+    let deadline = Instant::now() + MASTER_TERM_GRACE;
+    while process_exists(pid) && Instant::now() < deadline {
+        sleep(SSH_TIMEOUT_REAP_POLL).await;
+    }
+    if process_exists(pid) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = Instant::now() + MASTER_KILL_GRACE;
+        while process_exists(pid) && Instant::now() < deadline {
+            sleep(SSH_TIMEOUT_REAP_POLL).await;
+        }
+    }
+    Some(pid)
+}
+
 fn remove_stale_control_socket(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -908,6 +1025,134 @@ esac
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         !pid_alive(pid)
+    }
+
+    /// The three identity guards that stand between this scan and a SIGTERM.
+    ///
+    /// Every one of them was a real way to kill the wrong process: the daemon's
+    /// exec relay carries the same `-S <ctl_path>` without `-M`, `socket_stem`
+    /// deliberately gives two long-named hosts a shared path prefix, and the
+    /// same host runs plenty of processes that are not ssh at all.
+    #[test]
+    fn only_a_master_holding_exactly_this_control_path_is_signallable() {
+        let ctl = "/state/greenroom-studio.ctl";
+        let master = "111 ssh -M -S /state/greenroom-studio.ctl -o BatchMode=yes -f -N omnidev-greenroom-studio";
+        assert_eq!(master_pid_from_ps(master, ctl), Some(111));
+        let absolute = "222 /usr/bin/ssh -M -S /state/greenroom-studio.ctl -f -N host";
+        assert_eq!(master_pid_from_ps(absolute, ctl), Some(222), "an absolute ssh is still ssh");
+
+        // the exec relay: same control path, no -M. Killing it aborts the live
+        // API connection this reconnect is trying to replace.
+        let relay = "333 ssh -S /state/greenroom-studio.ctl -o BatchMode=yes omnidev-greenroom-studio python3 -c ...";
+        assert_eq!(master_pid_from_ps(relay, ctl), None);
+
+        // a neighbouring path that merely starts the same way
+        let neighbour = "444 ssh -M -S /state/greenroom-studio.ctl.backup -o BatchMode=yes -f -N x";
+        assert_eq!(master_pid_from_ps(neighbour, ctl), None);
+
+        // not ssh, however convincing its argv
+        let impostor = "555 herdr-mirror pane -M -S /state/greenroom-studio.ctl";
+        assert_eq!(master_pid_from_ps(impostor, ctl), None);
+
+        // and the real listing is many lines of other people's processes
+        let listing = format!("{impostor}\n{relay}\n{neighbour}\n{master}\n666 sleep 30");
+        assert_eq!(master_pid_from_ps(&listing, ctl), Some(111));
+    }
+
+    /// A reconnect must not leave the previous transport running beside its
+    /// replacement.
+    ///
+    /// The fake is shaped like the real thing: a master that survives on its
+    /// own, plus a `ProxyCommand` child in a different process group that is
+    /// never signalled and exits only when the master's stdio pipe closes —
+    /// which is exactly how `coder ssh --disable-autostart --stdio
+    /// <workspace>.project` behaves on this fleet. So asserting the child is
+    /// gone asserts the whole transport is gone, not just the pid we signalled.
+    // Holding `FAKE_SSH` across awaits is the point of the serial guard; the
+    // five fake-ssh regressions beside this one trip the same lint at the pin.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn retiring_an_unusable_master_leaves_no_transport_child_behind() {
+        let _serial = fake_ssh_guard();
+        let dir = test_path("retire-master");
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("master.sh");
+        let leader_file = dir.join("leader");
+        let child_file = dir.join("child");
+        let fifo = dir.join("stdio");
+        // A control path that exists nowhere, so the real `ssh -O check` this
+        // function runs fails immediately and locally: no socket, no DNS, no
+        // network. "Unusable" is precisely the state under test.
+        let ctl = dir.join("host.ctl");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+mkfifo "$HM_TEST_FIFO"
+sh -c 'printf "%s\n" "$$" >"$1"; exec cat >/dev/null' sh "$HM_TEST_CHILD" <"$HM_TEST_FIFO" &
+exec 9>"$HM_TEST_FIFO"
+printf '%s\n' "$$" >"$HM_TEST_LEADER"
+while :; do /bin/sleep 1; done
+"#,
+        )
+        .unwrap();
+
+        // argv[0] must be `ssh`, because that is what the scan matches on and
+        // what a real `-f` master shows; a `#!` script would show its
+        // interpreter instead.
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg0("ssh")
+            .arg(&script)
+            .args(["-M", "-S", &ctl.display().to_string(), "-f", "-N", "fake.example.com"])
+            .env("HM_TEST_LEADER", &leader_file)
+            .env("HM_TEST_CHILD", &child_file)
+            .env("HM_TEST_FIFO", &fifo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut spawned = command.spawn().unwrap();
+
+        let leader = recorded_pid(&leader_file).await;
+        let child = recorded_pid(&child_file).await;
+        assert!(pid_alive(leader) && pid_alive(child));
+
+        let retired = retire_unusable_master(&ctl, "fake.example.com").await;
+        assert_eq!(retired, Some(leader), "the disconnect must be able to name it");
+
+        // Reap it here: this test is the master's direct parent, which the
+        // daemon never is (`-f` reparents the real one to init), and an
+        // unreaped zombie still answers `kill(pid, 0)`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut leader_gone = false;
+        while tokio::time::Instant::now() < deadline {
+            if matches!(spawned.try_wait(), Ok(Some(_))) {
+                leader_gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_gone = wait_for_pid_exit(child).await;
+        if !leader_gone {
+            kill_pid(leader);
+        }
+        if !child_gone {
+            kill_pid(child);
+        }
+        // Reaped on every path: a failing regression must leave nothing behind.
+        let _ = spawned.wait();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(leader_gone, "the master this daemon started survived its retirement");
+        assert!(child_gone, "the transport child outlived its parent — the orphan this fixes");
+    }
+
+    /// Nothing to retire is the ordinary case: a host whose master never came
+    /// up, or one whose reconnect follows a clean exit. It must cost no signal
+    /// and no claim.
+    #[tokio::test]
+    async fn retiring_reports_nothing_when_no_master_holds_the_path() {
+        let ctl = test_path("absent-master").join("host.ctl");
+        assert_eq!(retire_unusable_master(&ctl, "fake.example.com").await, None);
     }
 
     #[tokio::test]

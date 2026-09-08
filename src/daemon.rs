@@ -471,9 +471,32 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         if !dormant {
             backoff_idx += 1;
         }
+        // End the transport this connection was using before anything starts a
+        // replacement beside it. Only when it can no longer serve — see
+        // `retire_unusable_master`. A dormant cycle never had an ssh master.
+        let retired = if dormant || ctx.host.kind.is_docker() {
+            None
+        } else {
+            crate::remote::retire_unusable_master(
+                &crate::remote::control_path(&ctx.env_state_dir, &ctx.host.name),
+                &ctx.host.target,
+            )
+            .await
+        };
         // log dormancy once on entry, not on every poll of a stopped container
         if !dormant || !was_dormant {
-            ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+            // The cause and the pid belong on ONE line: this is the record an
+            // investigation reads to tell "the remote went away" from "we threw
+            // the transport away", and two lines can be minutes apart in a log
+            // nine hosts share.
+            let retired = match retired {
+                Some(pid) => format!(" — retired unusable ssh master pid {pid}"),
+                None => String::new(),
+            };
+            ctx.log.log(&format!(
+                "[{}] disconnected ({e}){retired} — retrying in {delay}s",
+                ctx.host.name
+            ));
         }
         was_dormant = dormant;
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
