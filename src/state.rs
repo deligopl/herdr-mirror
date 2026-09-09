@@ -370,6 +370,53 @@ pub fn take_stream_restart(state_dir: &Path, local_pane_id: &str) -> bool {
     std::fs::remove_file(stream_restart_path(state_dir, local_pane_id)).is_ok()
 }
 
+/// What the daemon last observed about one host's connection, published for
+/// `herdr-mirror status` to read.
+///
+/// `status` runs in a different process from the daemon, so until now the only
+/// record of why a host is not mirroring was the daemon log — which is exactly
+/// the file the backoff exists to stop filling. One small file per host, written
+/// on every connect and every failed dial, gives the owner the same answer as a
+/// field instead of a grep.
+///
+/// Deliberately its own file rather than a field on `HostState`, for the reason
+/// `hidden` is: the map file is load-modify-written by the daemon and by every
+/// CLI subcommand with no lock anywhere, so a field living inside it is silently
+/// reset by whoever saves last.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostHealth {
+    /// exactly what the log line says: `connected and synced`, or
+    /// `disconnected (<reason>)`
+    pub summary: String,
+    /// when that was observed, as printed
+    pub at_iso: String,
+    /// when the next dial is due; absent while the host is connected
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_unix: Option<f64>,
+}
+
+fn host_health_path(state_dir: &Path, host: &str) -> PathBuf {
+    state_dir
+        .join("host-health")
+        .join(format!("{}.json", crate::util::sane_component(host)))
+}
+
+pub fn publish_host_health(state_dir: &Path, host: &str, health: &HostHealth) {
+    let path = host_health_path(state_dir, host);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string(health) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+pub fn read_host_health(state_dir: &Path, host: &str) -> Option<HostHealth> {
+    let text = std::fs::read_to_string(host_health_path(state_dir, host)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}-map.json"))
 }
@@ -553,6 +600,49 @@ mod tests {
         assert_eq!(back.remote_advanced_unix, Some(30.25));
         clear_stream_health(&dir, "w7R:p2");
         assert!(read_stream_health(&dir, "w7R:p2").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One host's published health is that host's, and it survives the write.
+    ///
+    /// `status` is a different process from the daemon, so this file is the
+    /// whole channel between them.
+    #[test]
+    fn host_health_round_trips_and_is_absent_before_the_first_dial() {
+        let dir = std::env::temp_dir().join(format!("hm-host-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(read_host_health(&dir, "greenroom-air").is_none());
+        publish_host_health(
+            &dir,
+            "greenroom-air",
+            &HostHealth {
+                summary: "disconnected (ssh master to omnidev-greenroom-air failed: exit 255)"
+                    .into(),
+                at_iso: "2026-09-09T11:42:42.000Z".into(),
+                next_retry_unix: Some(1_000.5),
+            },
+        );
+        let back = read_host_health(&dir, "greenroom-air").unwrap();
+        assert!(back.summary.starts_with("disconnected (ssh master"));
+        assert_eq!(back.at_iso, "2026-09-09T11:42:42.000Z");
+        assert_eq!(back.next_retry_unix, Some(1_000.5));
+        // one host's record is never another's
+        assert!(read_host_health(&dir, "greenroom-studio").is_none());
+
+        publish_host_health(
+            &dir,
+            "greenroom-air",
+            &HostHealth {
+                summary: "connected and synced".into(),
+                at_iso: "2026-09-09T11:43:12.000Z".into(),
+                next_retry_unix: None,
+            },
+        );
+        let back = read_host_health(&dir, "greenroom-air").unwrap();
+        assert_eq!(back.summary, "connected and synced");
+        assert_eq!(back.next_retry_unix, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

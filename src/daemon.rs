@@ -82,6 +82,12 @@ struct HostCtx {
 #[derive(Debug)]
 enum HostSignal {
     Converge,
+    /// An explicit ask from the CLI (`wake`, `show`, `restore`, `hide`), which
+    /// reaches every host task through the daemon's SIGUSR1 handler. Ordinary
+    /// local traffic is `Converge`, and telling the two apart is what lets a
+    /// deliberate act reset a host's reconnect ladder while a split drag does
+    /// not.
+    Resync,
     LocalPaneUpdated {
         pane_id: String,
         acknowledged: oneshot::Sender<()>,
@@ -268,13 +274,13 @@ fn remember_transport(
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<HostSignal>,
-    backoff_idx: &mut usize,
+    ladder: &mut ReconnectLadder,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
 ) -> Result<()> {
     #[cfg(test)]
     if let Some(remote) = &ctx.remote_override {
-        *backoff_idx = 0;
+        ladder.reset();
         return connected_session(ctx, poke, remote.clone()).await;
     }
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
@@ -285,7 +291,7 @@ async fn run_connected(
     remote_host.hint_transport(*remembered_transport);
     let (remote, _status) = remote_host.connect_api().await?;
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
-    *backoff_idx = 0;
+    ladder.reset();
     connected_session(ctx, poke, remote).await
 }
 
@@ -318,6 +324,15 @@ async fn connected_session(
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
+    crate::state::publish_host_health(
+        &ctx.env_state_dir,
+        &ctx.host.name,
+        &crate::state::HostHealth {
+            summary: "connected and synced".into(),
+            at_iso: now_iso(),
+            next_retry_unix: None,
+        },
+    );
     // A wake asked for exactly this. Retire it here, or a request made while the
     // host was already up would also shorten the NEXT disconnect's backoff,
     // which nobody asked for.
@@ -413,16 +428,112 @@ async fn connected_session(
 
 /// Retry pacing after a lost connection.
 ///
-/// ssh keeps its original ladder: an unreachable machine is a fault, and you
-/// want it back fast. A stopped container is not a fault, it is the resting
-/// state, so retrying every 30s forever would burn a `docker ps` per host per
-/// half-minute and fill the log with non-events.
-const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
+/// A host whose workspace is simply stopped fails its ssh master with exit 255
+/// and used to be redialled every 30 seconds for as long as the daemon ran. On
+/// the owner's workstation on 2026-09-09 that was 33 079 of the 33 246 lines in
+/// `daemon.log` and another 23 683 in the rotated `.1`, eleven hosts
+/// contributing 1 391-4 717 lines each, every one of them a stopped workspace:
+/// the one line that mattered was invisible, and each host still cost an ssh
+/// attempt every half minute. So consecutive failures with the SAME reason
+/// double the delay to a five-minute ceiling.
+///
+/// It starts at 30 seconds rather than the old five, because the entry never
+/// waits this ladder out: `omnidev <workspace> herdr` calls `herdr-mirror wake`
+/// before it waits, and a wake resets the ladder and breaks the sleep. Nothing
+/// else needs a five-second redial — a host that drops and comes straight back
+/// is one converge behind either way.
+///
+/// A stopped container is not a fault, it is the resting state, so it keeps its
+/// own separate 300-second sleep (`DORMANT_DELAY`) and never advances this
+/// ladder.
+const RECONNECT_DELAYS: [u64; 5] = [30, 60, 120, 240, 300];
 const DORMANT_DELAY: u64 = 300;
 
+/// One host's place on that ladder, and whether this failure is worth a line.
+///
+/// The whole policy is here and nowhere else, because the two halves are one
+/// decision: the delay only changes when the ladder advances, and a delay that
+/// did not change is exactly the retry nobody needs told about again.
+#[derive(Debug, Default)]
+struct ReconnectLadder {
+    /// index into `RECONNECT_DELAYS` of the delay currently being served
+    step: usize,
+    last_reason: Option<String>,
+    last_delay: Option<u64>,
+}
+
+/// What to do after one failed dial.
+#[derive(Debug, PartialEq, Eq)]
+struct RetryDecision {
+    delay: u64,
+    /// log the first failure, a changed delay, and a changed reason — never an
+    /// identical repeat of the line already in the log
+    log: bool,
+}
+
+impl ReconnectLadder {
+    /// A failed dial with this reason.
+    fn fail(&mut self, reason: &str) -> RetryDecision {
+        // A different reason is a different fault, so it starts its own ladder
+        // rather than inheriting the pace of the one before it — and it is
+        // always logged, ceiling or not, because it is news.
+        let same_reason = self.last_reason.as_deref() == Some(reason);
+        self.step = if same_reason {
+            (self.step + 1).min(RECONNECT_DELAYS.len() - 1)
+        } else {
+            0
+        };
+        self.decide(reason, RECONNECT_DELAYS[self.step])
+    }
+
+    /// A cycle that found the container stopped.
+    ///
+    /// Dormancy is a separate state with its own fixed sleep, and it does not
+    /// advance the ladder it does not use: a container stopped overnight would
+    /// otherwise leave the ladder pinned at its ceiling, so the first real
+    /// failure while it boots would wait five minutes instead of the first rung.
+    /// It shares only the "log a change, not a repeat" rule, which is what kept
+    /// a dormant host to one line per dormancy before this ladder existed.
+    fn dormant(&mut self, reason: &str) -> RetryDecision {
+        self.step = 0;
+        self.decide(reason, DORMANT_DELAY)
+    }
+
+    fn decide(&mut self, reason: &str, delay: u64) -> RetryDecision {
+        let log = self.last_reason.as_deref() != Some(reason) || self.last_delay != Some(delay);
+        self.last_reason = Some(reason.to_string());
+        self.last_delay = Some(delay);
+        RetryDecision { delay, log }
+    }
+
+    /// Back to the first rung, and the next failure is news again.
+    ///
+    /// A successful connect, an explicit `wake`, and the `show`/`restore` resync
+    /// all mean somebody or something has changed the situation, so the pace
+    /// this host earned before that is no longer evidence about it. A
+    /// configuration reload resets it too, by construction: the reload is
+    /// `herdr-mirror pause` followed by `start`, and this state lives in the
+    /// host task, never on disk.
+    fn reset(&mut self) {
+        *self = ReconnectLadder::default();
+    }
+}
+
+/// Whether one signal arriving during a backoff sleep restarts the ladder.
+///
+/// `wake`, `show`, `restore` and `hide` all reach a host task through the
+/// daemon's SIGUSR1 handler as a `Resync`, while the poll tick, the heal sweep
+/// and every local Herdr event arrive as ordinary traffic — `local_events_task`
+/// fans one poke out to every host on every event, `layout.updated` included, so
+/// treating those as deliberate would collapse the ladder on every split drag.
+/// `hide` is the one deliberate act that is not a reset: a host taken out of
+/// view on purpose keeps the pace it is on.
+fn signal_restarts_ladder(signal: &HostSignal, hidden: bool) -> bool {
+    matches!(signal, HostSignal::Resync) && !hidden
+}
+
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
-    let mut backoff_idx = 0usize;
-    let mut was_dormant = false;
+    let mut ladder = ReconnectLadder::default();
     // persists across reconnects for the daemon's whole lifetime — the
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
@@ -443,7 +554,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         let e = match run_connected(
             &ctx,
             &mut poke,
-            &mut backoff_idx,
+            &mut ladder,
             &mut remembered_transport,
             &mut exec_streak,
         )
@@ -458,19 +569,10 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         // while the error text can embed user strings (target, remote_bin). A
         // substring test would make an ssh host named `dormant-box` back off
         // for 5 minutes and stop logging on every genuine failure.
-        let dormant = e.to_string().starts_with(crate::remote::DORMANT);
-        let delay = if dormant {
-            DORMANT_DELAY
-        } else {
-            RECONNECT_DELAYS[backoff_idx.min(RECONNECT_DELAYS.len() - 1)]
-        };
-        // dormant cycles must not advance the ladder they do not use: a
-        // container stopped overnight would otherwise leave backoff_idx pinned
-        // at the 30s rung, so the first real failure while it boots waits 30s
-        // instead of the 5s the ladder exists to give.
-        if !dormant {
-            backoff_idx += 1;
-        }
+        let reason = e.to_string();
+        let dormant = reason.starts_with(crate::remote::DORMANT);
+        let RetryDecision { delay, log: worth_logging } =
+            if dormant { ladder.dormant(&reason) } else { ladder.fail(&reason) };
         // End the transport this connection was using before anything starts a
         // replacement beside it. Only when it can no longer serve — see
         // `retire_unusable_master`. A dormant cycle never had an ssh master.
@@ -483,8 +585,23 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
             )
             .await
         };
-        // log dormancy once on entry, not on every poll of a stopped container
-        if !dormant || !was_dormant {
+        // The record `status` reads. Published on every failed dial, including
+        // the ones this loop deliberately no longer logs, so the owner's answer
+        // to "why is this host not mirroring" never depends on how long it has
+        // been failing.
+        crate::state::publish_host_health(
+            &ctx.env_state_dir,
+            &ctx.host.name,
+            &crate::state::HostHealth {
+                summary: format!("disconnected ({reason})"),
+                at_iso: now_iso(),
+                next_retry_unix: Some(crate::state::unix_now() + delay as f64),
+            },
+        );
+        // A change of state, not every attempt: the first failure, a changed
+        // delay, and a changed reason are news; the identical retry underneath
+        // them is the line that buried everything else.
+        if worth_logging {
             // The cause and the pid belong on ONE line: this is the record an
             // investigation reads to tell "the remote went away" from "we threw
             // the transport away", and two lines can be minutes apart in a log
@@ -498,7 +615,6 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
                 ctx.host.name
             ));
         }
-        was_dormant = dormant;
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
         // about now, and honouring them would skip the sleep entirely
         while let Ok(signal) = poke.try_recv() {
@@ -520,12 +636,21 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 signal = poke.recv() => {
+                    let hidden = crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name);
                     if let Some(signal) = signal {
+                        if signal_restarts_ladder(&signal, hidden) {
+                            ladder.reset();
+                        }
                         capture_local_update(&ctx, signal).await;
                     }
-                    if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name)
-                        || crate::state::take_wake(&ctx.env_state_dir, &ctx.host.name)
-                    {
+                    if hidden {
+                        break;
+                    }
+                    if crate::state::take_wake(&ctx.env_state_dir, &ctx.host.name) {
+                        // an explicit wake is one early retry from the first
+                        // rung: somebody has just started this workspace and is
+                        // waiting on its mirror
+                        ladder.reset();
                         break;
                     }
                 }
@@ -891,7 +1016,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
                 // restore pokes us instead of converging itself — single writer
                 log.log("sync poke received");
                 for p in &pokers {
-                    let _ = p.try_send(HostSignal::Converge);
+                    let _ = p.try_send(HostSignal::Resync);
                 }
             }
             _ = sigterm.recv() => break,
@@ -983,6 +1108,38 @@ pub fn cmd_ensure(env: &Env) {
     }
 }
 
+/// A host's last observed connection state, as `status` prints it.
+///
+/// The daemon publishes the record; this turns it into the line, so the whole
+/// field — including a countdown that has already run out — is testable without
+/// a daemon and a live host.
+fn host_health_line(state_dir: &std::path::Path, host: &str, now: f64) -> Option<String> {
+    let health = crate::state::read_host_health(state_dir, host)?;
+    let next = match health.next_retry_unix {
+        // The daemon publishes the deadline, not the delay, so a record written
+        // before a long sleep still reads as the time actually left. A deadline
+        // already in the past is a dial that is due — while a dial is in flight,
+        // or after a daemon that never got to run it.
+        Some(at) => format!(", next retry {}", human_countdown(at - now)),
+        None => String::new(),
+    };
+    Some(format!("last: {} at {}{next}", health.summary, health.at_iso))
+}
+
+/// `in 4m10s`, `in 30s`, or `now` for a deadline that has passed.
+fn human_countdown(seconds: f64) -> String {
+    let remaining = seconds.ceil();
+    if remaining <= 0.0 {
+        return "now".into();
+    }
+    let remaining = remaining as u64;
+    match (remaining / 60, remaining % 60) {
+        (0, s) => format!("in {s}s"),
+        (m, 0) => format!("in {m}m"),
+        (m, s) => format!("in {m}m{s}s"),
+    }
+}
+
 pub fn cmd_status(env: &Env) -> Result<()> {
     match running_pid(env) {
         Some(pid) => println!("daemon: running (pid {pid})"),
@@ -1043,6 +1200,12 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             .collect();
         if !tombs.is_empty() {
             println!("  closed mirrors (restorable): {}", tombs.join(", "));
+        }
+        // AFTER the tombstone line on purpose: OmniDev's console reads the one
+        // line following `host <name>` to decide whether that host has closed
+        // mirrors, so this field has to go behind it.
+        if let Some(line) = host_health_line(&env.state_dir, &h.name, crate::state::unix_now()) {
+            println!("  {line}");
         }
     }
     let log_file = env.state_dir.join("daemon.log");
@@ -1186,6 +1349,171 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
     use std::sync::{Arc, Mutex};
+
+    /// The defect, as a sequence.
+    ///
+    /// Six identical failures — one stopped workspace failing its ssh master
+    /// with exit 255, which on 2026-09-09 was eleven hosts at once — climb from
+    /// 30 s to the 300 s ceiling and stay there.
+    ///
+    /// The log count follows from the rule "the first failure, every change of
+    /// delay, every change of reason, and nothing else": the first failure (30),
+    /// then the four delay changes 30→60, 60→120, 120→240 and 240→300, is five.
+    /// The sixth failure repeats both the reason and the 300 s delay and is the
+    /// line the owner does not need again. Under the old ladder those same six
+    /// failures wrote six lines, and the next thousand wrote a thousand more.
+    #[test]
+    fn identical_failures_climb_to_the_ceiling_and_stop_repeating_themselves() {
+        let mut ladder = ReconnectLadder::default();
+        let reason = "ssh master to omnidev-greenroom-air failed: exit 255";
+        let decisions: Vec<RetryDecision> =
+            (0..6).map(|_| ladder.fail(reason)).collect();
+
+        assert_eq!(
+            decisions.iter().map(|d| d.delay).collect::<Vec<_>>(),
+            vec![30, 60, 120, 240, 300, 300]
+        );
+        assert_eq!(
+            decisions.iter().map(|d| d.log).collect::<Vec<_>>(),
+            vec![true, true, true, true, true, false]
+        );
+        assert_eq!(decisions.iter().filter(|d| d.log).count(), 5);
+
+        // and it stays quiet for as long as the workspace stays stopped: a full
+        // day of retries at the ceiling adds nothing to the log
+        for _ in 0..288 {
+            let decision = ladder.fail(reason);
+            assert_eq!(decision.delay, 300);
+            assert!(!decision.log);
+        }
+    }
+
+    /// News is always logged, however long the host has been failing.
+    ///
+    /// A host at the ceiling whose reason changes has told us something new —
+    /// most usefully the ssh failure that replaces "dormant" when a container
+    /// comes back — so it is logged, and it starts its own ladder rather than
+    /// inheriting the pace of the fault before it.
+    #[test]
+    fn a_changed_reason_is_logged_and_restarts_the_ladder_even_at_the_ceiling() {
+        let mut ladder = ReconnectLadder::default();
+        for _ in 0..5 {
+            ladder.fail("ssh master to omnidev-greenroom-air failed: exit 255");
+        }
+        assert_eq!(
+            ladder.fail("ssh master to omnidev-greenroom-air failed: exit 255"),
+            RetryDecision { delay: 300, log: false }
+        );
+
+        let changed = ladder.fail("herdr api handshake timed out");
+        assert_eq!(changed, RetryDecision { delay: 30, log: true });
+
+        // dormancy is its own state: fixed 300 s sleep, logged once on entry,
+        // and it never advances the ladder — so the first ssh failure after the
+        // container comes back waits 30 s, not five minutes
+        let dormant = "dormant: no running container for greenroom-air";
+        assert_eq!(ladder.dormant(dormant), RetryDecision { delay: 300, log: true });
+        assert_eq!(ladder.dormant(dormant), RetryDecision { delay: 300, log: false });
+        assert_eq!(
+            ladder.fail("ssh master to omnidev-greenroom-air failed: exit 255"),
+            RetryDecision { delay: 30, log: true }
+        );
+    }
+
+    /// Every reset the specification names, and the one act that is not one.
+    ///
+    /// `wake`, `show`, `restore` and a successful connect all call
+    /// `ReconnectLadder::reset`; a configuration reload is `herdr-mirror pause`
+    /// followed by `start`, so it resets by construction — the ladder lives in
+    /// the host task and is never written to disk, which the default below is
+    /// the whole of. What reaches a sleeping host task from `show` and
+    /// `restore` is the daemon's explicit `Resync`, and telling that apart from
+    /// the poke every local Herdr event fans out is what keeps a split drag from
+    /// collapsing the ladder.
+    #[test]
+    fn a_wake_a_show_a_restore_a_reload_and_a_connect_each_restart_the_ladder() {
+        let mut ladder = ReconnectLadder::default();
+        let reason = "ssh master to omnidev-greenroom-air failed: exit 255";
+        for _ in 0..5 {
+            ladder.fail(reason);
+        }
+        assert_eq!(ladder.fail(reason), RetryDecision { delay: 300, log: false });
+
+        // wake / show / restore / a successful connect
+        ladder.reset();
+        assert_eq!(ladder.fail(reason), RetryDecision { delay: 30, log: true });
+
+        // a configuration reload restarts the daemon, and this is all the state
+        // a fresh host task has
+        let mut reloaded = ReconnectLadder::default();
+        assert_eq!(reloaded.fail(reason), RetryDecision { delay: 30, log: true });
+
+        // the wiring: only the explicit resync of a visible host
+        assert!(signal_restarts_ladder(&HostSignal::Resync, false));
+        assert!(!signal_restarts_ladder(&HostSignal::Resync, true)); // `hide`
+        assert!(!signal_restarts_ladder(&HostSignal::Converge, false)); // poll, layout, heal
+    }
+
+    /// The fields `status` prints, from the record the daemon publishes.
+    ///
+    /// `status` runs in its own process, so before this the only answer to "why
+    /// is this host not mirroring" was a grep of the log the backoff exists to
+    /// stop filling.
+    #[test]
+    fn status_shows_each_host_its_last_reason_and_its_next_retry() {
+        let dir = std::env::temp_dir().join(format!("hm-host-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = 10_000.0;
+
+        // a host the daemon has never dialled says nothing rather than guessing
+        assert_eq!(host_health_line(&dir, "greenroom-air", now), None);
+
+        crate::state::publish_host_health(
+            &dir,
+            "greenroom-air",
+            &crate::state::HostHealth {
+                summary: "disconnected (ssh master to omnidev-greenroom-air failed: exit 255)"
+                    .into(),
+                at_iso: "2026-09-09T11:42:42.000Z".into(),
+                next_retry_unix: Some(now + 250.0),
+            },
+        );
+        assert_eq!(
+            host_health_line(&dir, "greenroom-air", now).unwrap(),
+            "last: disconnected (ssh master to omnidev-greenroom-air failed: exit 255) \
+at 2026-09-09T11:42:42.000Z, next retry in 4m10s"
+        );
+
+        // the deadline is published, not the delay, so the countdown is the time
+        // actually left — and a dial that is already due says so
+        assert_eq!(
+            host_health_line(&dir, "greenroom-air", now + 249.5).unwrap(),
+            "last: disconnected (ssh master to omnidev-greenroom-air failed: exit 255) \
+at 2026-09-09T11:42:42.000Z, next retry in 1s"
+        );
+        assert!(host_health_line(&dir, "greenroom-air", now + 400.0)
+            .unwrap()
+            .ends_with("next retry now"));
+
+        crate::state::publish_host_health(
+            &dir,
+            "greenroom-studio",
+            &crate::state::HostHealth {
+                summary: "connected and synced".into(),
+                at_iso: "2026-09-09T11:43:12.000Z".into(),
+                next_retry_unix: None,
+            },
+        );
+        assert_eq!(
+            host_health_line(&dir, "greenroom-studio", now).unwrap(),
+            "last: connected and synced at 2026-09-09T11:43:12.000Z"
+        );
+
+        assert_eq!(human_countdown(300.0), "in 5m");
+        assert_eq!(human_countdown(30.0), "in 30s");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The one-directional stall, driven through the real files.
     ///
@@ -1814,11 +2142,24 @@ mod tests {
         // preserve suppression without a direct connected_session call.
         let subscriptions_before = remote_a.requests().iter().filter(|r| r["method"] == "events.subscribe").count();
         remote_a.disconnect_subscribers();
-        wait_until(|| {
+        // The first rung of the reconnect ladder is 30 s, so this waits the host
+        // up rather than waiting it out — through the same
+        // disconnect/backoff/reconnect loop, which is what is under test here.
+        // Repeatedly, because a poke that arrives before the task has reached
+        // its sleep is consumed by the connected phase and the marker with it.
+        let resubscribed = || {
             remote_a.requests().iter().filter(|r| r["method"] == "events.subscribe").count()
                 > subscriptions_before
-        })
-        .await;
+        };
+        for _ in 0..400 {
+            if resubscribed() {
+                break;
+            }
+            crate::state::request_wake(&state_dir, "alpha").unwrap();
+            let _ = tx_a2.try_send(HostSignal::Converge);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(resubscribed(), "the host never reconnected after its stream dropped");
         assert!(load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie"));
 
         remote_a.set_snapshot(remote_snapshot("rp-a2", "beta-conductor-rosie", "run-2"));
