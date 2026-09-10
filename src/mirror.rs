@@ -3006,6 +3006,17 @@ mod tests {
     }
 
     #[test]
+    fn a_max_length_workspace_and_main_stay_distinct_and_legal() {
+        let host = "this-workspace-name-uses-all-thirty-two";
+        let main = mirrored_agent_name(host, Some("main")).expect("legal name");
+        let other = mirrored_agent_name(host, Some("other-pane")).expect("legal name");
+        assert!(main.len() <= AGENT_NAME_MAX);
+        assert!(other.len() <= AGENT_NAME_MAX);
+        assert_ne!(main, other);
+        assert!(main.starts_with("this-workspace"));
+    }
+
+    #[test]
     fn rosemary_suppression_is_exact_durable_and_retires_only_for_a_new_binding() {
         let dir = std::env::temp_dir().join(format!("hm-rosemary-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

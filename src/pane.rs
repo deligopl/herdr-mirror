@@ -331,7 +331,7 @@ const REMOTE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Kill a remote client through the same transport that started it. Best
 /// effort: `true` only when the command ran and reported success, so a caller
 /// can keep an unresolved pid for the next attempt instead of leaking it.
-async fn kill_remote_client(args: &Args, pid: i32) -> bool {
+pub(crate) async fn kill_remote_client(args: &Args, pid: i32) -> bool {
     if pid <= 1 {
         return true;
     }
@@ -381,7 +381,72 @@ async fn reap_recorded_remote_client(args: &Args, state_dir: &std::path::Path) {
     else {
         return;
     };
-    let _ = kill_remote_client(args, pid).await;
+    preserve_unresolved_remote_client(args, state_dir, pid, kill_remote_client(args, pid).await);
+}
+
+fn preserve_unresolved_remote_client(
+    args: &Args,
+    state_dir: &std::path::Path,
+    pid: i32,
+    reaped: bool,
+) {
+    if !reaped {
+        // A hidden/stopped host has no replacement streamer to adopt this
+        // record later. Keep the only safe handle on the remote client so an
+        // explicit suspension can retry it before the transport is closed.
+        crate::util::record_remote_client(
+            state_dir,
+            &args.ssh_target,
+            &args.pane_target,
+            pid,
+        );
+    }
+}
+
+/// Finish the remote-client half of suspending one host.
+///
+/// Local pane closure terminates the streamer supervisor first. Each
+/// supervisor normally clears its own remote attach client; this bounded pass
+/// handles a client whose earlier cleanup could not complete. A surviving
+/// record is a refusal, because ending the host transport at that point would
+/// discard the only identity-guarded cleanup path.
+pub(crate) async fn reap_host_remote_clients(
+    host: &crate::config::HostConfig,
+    state_dir: &std::path::Path,
+    pane_targets: &[String],
+) -> Result<()> {
+    let sizes = std::collections::HashMap::new();
+    let command_for = crate::mirror::cmd_for_pane(host, state_dir, &sizes);
+    let mut unresolved = Vec::new();
+    for pane_target in pane_targets {
+        let argv = command_for(pane_target);
+        let args = parse_args(&argv[2..])?;
+        let Some(pid) = crate::util::take_remote_client(
+            state_dir,
+            &args.ssh_target,
+            &args.pane_target,
+        ) else {
+            continue;
+        };
+        if !kill_remote_client(&args, pid).await {
+            crate::util::record_remote_client(
+                state_dir,
+                &args.ssh_target,
+                &args.pane_target,
+                pid,
+            );
+            unresolved.push(pane_target.clone());
+        }
+    }
+    if unresolved.is_empty() {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "remote stream clients still owned by {}: {}",
+            host.name,
+            unresolved.join(", ")
+        )))
+    }
 }
 
 fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
@@ -2852,6 +2917,34 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         assert_eq!(pending.first().copied(), Some(102));
         assert_eq!(pending.iter().filter(|p| **p == 105).count(), 1);
         assert!(!pending.contains(&1));
+    }
+
+    #[test]
+    fn failed_remote_cleanup_keeps_the_only_owned_client_handle() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-unresolved-client-{}",
+            std::process::id()
+        ));
+        let args = test_args(None);
+        preserve_unresolved_remote_client(&args, &state_dir, 4703, false);
+        assert_eq!(
+            crate::util::take_remote_client(
+                &state_dir,
+                &args.ssh_target,
+                &args.pane_target,
+            ),
+            Some(4703)
+        );
+        preserve_unresolved_remote_client(&args, &state_dir, 4703, true);
+        assert_eq!(
+            crate::util::take_remote_client(
+                &state_dir,
+                &args.ssh_target,
+                &args.pane_target,
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]

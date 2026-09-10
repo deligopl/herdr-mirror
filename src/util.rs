@@ -462,6 +462,27 @@ pub fn poke_pane_streamer(state_dir: &Path, local_pane_id: &str) -> bool {
     unsafe { libc::kill(pid, libc::SIGUSR1) == 0 }
 }
 
+/// Terminate the streamer supervisor occupying one known mirror pane.
+///
+/// Suspension owns this exact pane and needs the supervisor's shutdown path
+/// to release its remote attach client before the host transport disappears.
+/// The same executable check as `poke_pane_streamer` protects against a stale
+/// pidfile whose pid has been recycled.
+pub fn terminate_pane_streamer(state_dir: &Path, local_pane_id: &str) -> bool {
+    let Some(pid) = fs::read_to_string(pane_pid_path(state_dir, local_pane_id))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1 && pid_alive(*p))
+    else {
+        return true;
+    };
+    let ours = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("herdr-mirror"));
+    ours && unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+}
+
 /// Sleep until the earliest deadline; pend forever when none.
 pub async fn sleep_until_earliest<I>(deadlines: I)
 where
@@ -528,6 +549,26 @@ mod tests {
             remote_client_pid_path(&state_dir, "host", "w1:p1"),
             streamer_pid_path(&state_dir, "host", "w1:p1")
         );
+    }
+
+    #[test]
+    fn exact_streamer_termination_refuses_a_recycled_foreign_pid() {
+        let state_dir = test_state_dir("foreign-pane-pid");
+        let local_pane = "local-pane";
+        let path = pane_pid_path(&state_dir, local_pane);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        fs::write(&path, foreign.id().to_string()).unwrap();
+
+        assert!(!terminate_pane_streamer(&state_dir, local_pane));
+        assert!(foreign.try_wait().unwrap().is_none());
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

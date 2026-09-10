@@ -424,6 +424,76 @@ pub async fn wake_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
     report_failure(&env, "wake", wake(&env, host_arg).await).await
 }
 
+pub async fn suspend_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "suspend", suspend(&env, host_arg).await).await
+}
+
+/// Suspend exactly one host and finish every stream client it owns while the
+/// remote transport is still available.
+async fn suspend(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = resolve_host(env, host_arg).await?;
+    let Some(pid) = crate::daemon::running_pid(env) else {
+        return Err(err(format!(
+            "cannot suspend {} while the Mirror daemon is not running",
+            host.name
+        )));
+    };
+    let state = crate::state::load_state(&env.state_dir, &host.name);
+    let pane_targets: Vec<String> = state
+        .panes
+        .iter()
+        .filter(|(_, entry)| !entry.is_tombstoned())
+        .map(|(remote_id, _)| remote_id.clone())
+        .collect();
+    let local_panes: Vec<String> = state
+        .panes
+        .values()
+        .filter(|entry| !entry.is_tombstoned())
+        .map(|entry| entry.local_id.clone())
+        .collect();
+
+    crate::state::set_hidden(&env.state_dir, &host.name, true)
+        .map_err(|e| err(format!("could not mark {} hidden: {e}", host.name)))?;
+    unsafe { libc::kill(pid, libc::SIGUSR1) };
+
+    for local_pane in &local_panes {
+        crate::util::terminate_pane_streamer(&env.state_dir, local_pane);
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if local_panes
+            .iter()
+            .all(|pane| !crate::util::pane_streamer_alive(&env.state_dir, pane))
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            restore_suspended_host(env, &host.name, pid);
+            return Err(err(format!(
+                "local stream clients for {} did not stop within 3s",
+                host.name
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if let Err(failure) =
+        crate::pane::reap_host_remote_clients(&host, &env.state_dir, &pane_targets).await
+    {
+        restore_suspended_host(env, &host.name, pid);
+        return Err(failure);
+    }
+    println!(
+        "suspended {} — local mirrors and owned stream clients are stopped",
+        host.name
+    );
+    Ok(())
+}
+
+fn restore_suspended_host(env: &Env, host: &str, daemon_pid: i32) {
+    let _ = crate::state::set_hidden(&env.state_dir, host, false);
+    unsafe { libc::kill(daemon_pid, libc::SIGUSR1) };
+}
+
 async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     let host = resolve_host(env, host_arg).await?;
     let already = crate::state::is_hidden(&env.state_dir, &host.name);
