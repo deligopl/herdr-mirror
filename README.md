@@ -96,8 +96,18 @@ only stop mirroring and leave the remote — and its agent — running). When th
 remote is left running, the **restore** action (`herdr-mirror restore`) brings
 back mirrors you closed.
 
-**Pause** — the **pause** action halts syncing; mirrors stay frozen in place
-and resume with **start**. `teardown` closes all mirrors and clears state.
+**Pause** — the **pause** action halts syncing and the pane streams that carry
+terminal output, input, and health polls. Mirrors stay frozen in place because
+their local supervisor processes remain; **start** resumes those streams over a
+deterministic eight-second spread. A stream that was already attached may make
+one bounded, identity-checked SSH call while pause cleans up its own remote
+attach client. That remote cleanup never stops the remote pane, shell, agent,
+or Herdr server. `teardown` closes all mirrors and clears state.
+
+Replacing the executable does not change supervisors that are already running
+from an older build. An upgrade that introduces new supervisor behavior must
+retire and recreate those existing local mirror panes once; it must not simply
+resume a fleet of old, stopped supervisors at the same time.
 
 **Hide / show** — **hide** takes a connection's mirrors off the sidebar and
 leaves the remote untouched: its workspaces, panes and agents keep running.

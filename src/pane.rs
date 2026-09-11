@@ -1013,6 +1013,77 @@ const SETTLE_DELAY: Duration = Duration::from_millis(350);
 /// daemon can act would buy nothing.
 const OUTPUT_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 
+/// Explicit Mirror pause is a traffic boundary, not only a daemon switch.
+/// Stream children notice it quickly, leave through their normal attach-client
+/// cleanup, and let the stable supervisor keep the local pane alive.
+const STREAM_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Spread an explicit all-pane resume over eight seconds. This is deliberately
+/// a stable local calculation rather than a scheduler: every supervisor can
+/// make the same decision after the shared pause marker disappears, and no
+/// control-plane service has to admit the resulting connections.
+const STREAM_RESUME_SLOTS: u64 = 80;
+const STREAM_RESUME_SLOT: Duration = Duration::from_millis(100);
+
+fn stream_may_connect(state_dir: &std::path::Path) -> bool {
+    !crate::daemon::streams_paused(state_dir)
+}
+
+fn stream_resume_delay(local_pane_id: &str) -> Duration {
+    // FNV-1a: deterministic across processes and releases, unlike DefaultHasher.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in local_pane_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    STREAM_RESUME_SLOT * (hash % STREAM_RESUME_SLOTS) as u32
+}
+
+fn stream_pause_claim_path(state_dir: &std::path::Path, local_pane_id: &str) -> std::path::PathBuf {
+    state_dir
+        .join("stream-paused")
+        .join(format!("{}.paused", crate::util::sane_component(local_pane_id)))
+}
+
+fn mark_stream_pause(state_dir: &std::path::Path, local_pane_id: &str) {
+    let path = stream_pause_claim_path(state_dir, local_pane_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"paused\n");
+}
+
+fn take_stream_pause(state_dir: &std::path::Path, local_pane_id: &str) -> bool {
+    let path = stream_pause_claim_path(state_dir, local_pane_id);
+    let existed = path.exists();
+    let _ = std::fs::remove_file(path);
+    existed
+}
+
+async fn wait_for_stream_resume_with_delay(
+    state_dir: &std::path::Path,
+    pause_observed: bool,
+    delay: Duration,
+) -> bool {
+    if !pause_observed && stream_may_connect(state_dir) {
+        return false;
+    }
+    while !stream_may_connect(state_dir) {
+        tokio::time::sleep(STREAM_PAUSE_POLL_INTERVAL).await;
+    }
+    tokio::time::sleep(delay).await;
+    true
+}
+
+async fn wait_for_stream_resume(state_dir: &std::path::Path, local_pane_id: &str) -> bool {
+    wait_for_stream_resume_with_delay(
+        state_dir,
+        take_stream_pause(state_dir, local_pane_id),
+        stream_resume_delay(local_pane_id),
+    )
+    .await
+}
+
 impl App {
     fn paint(&mut self) {
         if !self.tty {
@@ -1940,18 +2011,35 @@ pub async fn supervise(args: Args) -> Result<()> {
     std::fs::write(&pid_path, std::process::id().to_string())?;
     let _pane_pidfile = PidfileGuard(pid_path);
     let _ = crate::state::take_pane_hint(&state_dir, &local_pane_id);
+    // A dead supervisor cannot leave a pause acknowledgement that makes its
+    // replacement stagger an ordinary, unpaused start.
+    let _ = take_stream_pause(&state_dir, &local_pane_id);
 
-    let mut desired = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
-    let mut child = spawn_supervised_streamer(desired.as_deref())?;
-    // when the child now running was started, and how much of the crash budget
-    // its predecessors have already spent (see `respawn_decision`)
-    let mut started = Instant::now();
-    let mut attempts = 0u32;
+    // Register shutdown before waiting on an explicit pause. A paused pane is
+    // still an ordinary local Herdr pane: closing it or suspending its host
+    // must be able to end the supervisor immediately, even if start never
+    // clears the global marker.
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
 
+    let mut desired = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
+    // A restored local Herdr session can start its pane roots while Mirror is
+    // explicitly paused. Publish the stable supervisor pid above, but do not
+    // create a pane-stream child (and therefore no SSH) until start clears the
+    // marker. Resumption uses the same stagger as an already-running child.
+    tokio::select! {
+        _ = wait_for_stream_resume(&state_dir, &local_pane_id) => {}
+        _ = sigterm.recv() => return Ok(()),
+        _ = sigint.recv() => return Ok(()),
+        _ = sighup.recv() => return Ok(()),
+    }
+    let mut child = spawn_supervised_streamer(desired.as_deref())?;
+    // when the child now running was started, and how much of the crash budget
+    // its predecessors have already spent (see `respawn_decision`)
+    let mut started = Instant::now();
+    let mut attempts = 0u32;
     // Every exit from here is also an exit for the child's remote attach
     // client. The child normally clears its own record on the way out, so
     // these sweeps are no-ops; they matter exactly when it could not — a
@@ -1965,6 +2053,23 @@ pub async fn supervise(args: Args) -> Result<()> {
                 // would refuse the replacement's control attach on the same
                 // remote pane. Identity-guarded, like every other kill here.
                 reap_recorded_remote_client(&args, &state_dir).await;
+                // pane-stream exits cleanly when it observes an explicit pause.
+                // Keep this supervisor — the pane's root process — alive, and
+                // resume only after the shared marker clears. A daemon crash
+                // has no marker and therefore follows the old exit policy.
+                let resume = tokio::select! {
+                    resumed = wait_for_stream_resume(&state_dir, &local_pane_id) => resumed,
+                    _ = sigterm.recv() => return Ok(()),
+                    _ = sigint.recv() => return Ok(()),
+                    _ = sighup.recv() => return Ok(()),
+                };
+                if resume {
+                    desired = crate::state::pane_agent_hint(&state_dir, &local_pane_id).flatten();
+                    child = spawn_supervised_streamer(desired.as_deref())?;
+                    started = Instant::now();
+                    attempts = 0;
+                    continue;
+                }
                 let Some(respawn) = respawn_decision(status.success(), started.elapsed(), attempts)
                 else {
                     // Budget spent, or a deliberate end of the stream. Leaving
@@ -2074,6 +2179,16 @@ pub async fn run(args: Args) -> Result<()> {
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
     let state_dir = crate::util::state_dir();
+
+    // The supervisor owns the visible local pane. A child born during an
+    // explicit pause exits before opening any transport; the supervisor holds
+    // the pane and recreates this child after the staggered resume.
+    if supervised && !stream_may_connect(&state_dir) {
+        if let Some(id) = &local_pane_id {
+            mark_stream_pause(&state_dir, id);
+        }
+        return Ok(());
+    }
 
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
@@ -2224,6 +2339,8 @@ pub async fn run(args: Args) -> Result<()> {
     // someone left a notice for this pane and wants it seen now
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
+    let mut pause_tick = tokio::time::interval(STREAM_PAUSE_POLL_INTERVAL);
+    pause_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     app.connect(initial_mode(app.args.always_control, term_size())).await;
     app.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
@@ -2308,6 +2425,20 @@ pub async fn run(args: Args) -> Result<()> {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
+            _ = pause_tick.tick() => {
+                if !stream_may_connect(&state_dir) {
+                    if let Some(id) = &local_pane_id {
+                        // The daemon reload may clear its global marker before
+                        // our bounded remote-client cleanup finishes. Leave a
+                        // pane-local acknowledgement so the supervisor still
+                        // knows this clean exit means pause, not user intent.
+                        mark_stream_pause(&state_dir, id);
+                    }
+                    app.renderer.status("Mirror paused — remote keeps running");
+                    app.paint();
+                    break;
+                }
+            }
             _ = sleep => {
                 let now = Instant::now();
                 if app.switch_at.is_some_and(|t| t <= now) {
@@ -2990,5 +3121,81 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
     fn an_exhausted_budget_gives_up_and_lets_the_pane_close() {
         assert!(respawn_decision(false, Duration::from_secs(1), STREAMER_RESPAWN_LIMIT).is_none());
         assert!(respawn_decision(false, Duration::ZERO, STREAMER_RESPAWN_LIMIT + 7).is_none());
+    }
+
+    fn pause_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-mirror-pause-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn explicit_pause_blocks_stream_transport_but_a_daemon_crash_does_not() {
+        let state_dir = pause_test_dir("transport-gate");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        assert!(stream_may_connect(&state_dir), "no marker is an ordinary daemon crash");
+        std::fs::write(crate::daemon::pause_path(&state_dir), b"paused\n").unwrap();
+        assert!(!stream_may_connect(&state_dir), "explicit pause must block SSH and polls");
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn a_paused_supervisor_holds_until_start_clears_the_marker() {
+        let state_dir = pause_test_dir("hold");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(crate::daemon::pause_path(&state_dir), b"paused\n").unwrap();
+        let waiting_dir = state_dir.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_stream_resume_with_delay(&waiting_dir, false, Duration::ZERO).await
+        });
+
+        tokio::time::sleep(STREAM_PAUSE_POLL_INTERVAL * 2).await;
+        assert!(!waiter.is_finished(), "no child may respawn while pause is held");
+        std::fs::remove_file(crate::daemon::pause_path(&state_dir)).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("resume noticed")
+            .expect("wait task"));
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn a_child_pause_ack_survives_a_fast_daemon_reload() {
+        let state_dir = pause_test_dir("ack");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        mark_stream_pause(&state_dir, "w8H:p2");
+
+        // The global marker may already be gone when the child's bounded
+        // remote-client cleanup completes. Its local acknowledgement still
+        // routes the clean exit into resume rather than pane closure.
+        let pause_observed = take_stream_pause(&state_dir, "w8H:p2");
+        assert!(pause_observed);
+        assert!(wait_for_stream_resume_with_delay(
+            &state_dir,
+            pause_observed,
+            Duration::ZERO
+        )
+        .await);
+        assert!(!take_stream_pause(&state_dir, "w8H:p2"));
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn explicit_resume_is_stable_and_spread_without_global_state() {
+        let first = stream_resume_delay("w8H:p2");
+        assert_eq!(first, stream_resume_delay("w8H:p2"));
+        let slots: std::collections::HashSet<_> =
+            (1..=40).map(|n| stream_resume_delay(&format!("w8H:p{n}"))).collect();
+        assert!(slots.len() >= 30, "pane identities should not resume in one herd");
+        assert!(slots.iter().all(|delay| *delay < Duration::from_secs(8)));
     }
 }

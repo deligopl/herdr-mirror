@@ -45,19 +45,25 @@ pub fn running_pid(env: &Env) -> Option<i32> {
 
 // Sticky pause marker: blocks the focus-hook autostart until an explicit
 // start clears it (a crash leaves no marker, so it still auto-recovers).
-fn pause_path(env: &Env) -> PathBuf {
-    env.state_dir.join("daemon.paused")
+pub(crate) fn pause_path(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("daemon.paused")
 }
 
 pub fn is_paused(env: &Env) -> bool {
-    pause_path(env).exists()
+    streams_paused(&env.state_dir)
+}
+
+/// The explicit operator pause is shared with pane streamers. A daemon crash
+/// leaves no marker, so it must not quiesce otherwise healthy mirror panes.
+pub(crate) fn streams_paused(state_dir: &std::path::Path) -> bool {
+    pause_path(state_dir).exists()
 }
 
 pub fn set_paused(env: &Env, paused: bool) {
     if paused {
-        let _ = fs::write(pause_path(env), now_iso());
+        let _ = fs::write(pause_path(&env.state_dir), now_iso());
     } else {
-        let _ = fs::remove_file(pause_path(env));
+        let _ = fs::remove_file(pause_path(&env.state_dir));
     }
 }
 
@@ -77,6 +83,10 @@ struct HostCtx {
     // unset and uses RemoteHost below.
     #[cfg(test)]
     remote_override: Option<ApiClient>,
+    /// Counts entries through the production transport-admission seam. Tests
+    /// use it to prove a hidden host never reaches `run_connected`.
+    #[cfg(test)]
+    connect_attempts: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[derive(Debug)]
@@ -278,6 +288,10 @@ async fn run_connected(
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Some(attempts) = &ctx.connect_attempts {
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     #[cfg(test)]
     if let Some(remote) = &ctx.remote_override {
         ladder.reset();
@@ -551,6 +565,23 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
             &ctx.closes,
         )
         .await;
+        // Hidden is also a transport admission boundary. `apply_hidden` above
+        // needs only the local Herdr API, but entering `run_connected` would
+        // still create one remote connection before converge noticed the same
+        // marker. Wait on the host's existing signal channel instead: `show`
+        // clears the marker and sends Resync, while ordinary local events and
+        // `wake` cannot accidentally make a hidden host dial or busy-loop.
+        let mut was_hidden = false;
+        while crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
+            was_hidden = true;
+            let Some(signal) = poke.recv().await else { return };
+            capture_local_update(&ctx, signal).await;
+        }
+        // A deliberate show starts with a clean ladder. This matches the
+        // existing visible-host Resync behavior after a failed connection.
+        if was_hidden {
+            ladder.reset();
+        }
         let e = match run_connected(
             &ctx,
             &mut poke,
@@ -968,6 +999,8 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             rosemary_gate: rosemary_gate.clone(),
             #[cfg(test)]
             remote_override: None,
+            #[cfg(test)]
+            connect_attempts: None,
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -1919,6 +1952,74 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
     }
 
     #[tokio::test]
+    async fn hidden_host_admission_makes_no_remote_request_until_show() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-hidden-admission-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        crate::state::set_hidden(&state_dir, "studio", true).unwrap();
+
+        let local = ProtocolPeer::start("hidden-local", local_facade_snapshot()).await;
+        let remote = ProtocolPeer::start(
+            "hidden-remote",
+            remote_snapshot("rp-hidden", "conductor", "run-hidden"),
+        )
+        .await;
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let remote_api = ApiClient::connect(&remote.path).await.unwrap();
+        // Constructing the test override performs its own protocol handshake;
+        // host-task admission starts after that fixed fixture setup.
+        let remote_baseline = remote.requests().len();
+        let connect_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(8);
+        let ctx = HostCtx {
+            env_state_dir: state_dir.clone(),
+            host: test_host("studio"),
+            local: local_api,
+            log: Logger::new(&state_dir, false),
+            close_remote_on_local_close: false,
+            closes: crate::closes::new_closes(),
+            names: crate::mirror::SessionNamePlanner::new(["studio".to_string()]),
+            rosemary_gate: RosemaryProjectionGate::default(),
+            remote_override: Some(remote_api),
+            connect_attempts: Some(connect_attempts.clone()),
+        };
+        let task = tokio::spawn(host_task(ctx, rx));
+
+        // Exercise both kinds of traffic which reach a host task while hidden:
+        // an ordinary local event and the explicit Resync used by wake/hide.
+        // Neither may cross the remote admission boundary while the marker is
+        // present, and recv() keeps this path asleep between those signals.
+        tx.send(HostSignal::Converge).await.unwrap();
+        tx.send(HostSignal::Resync).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            connect_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "hidden startup must admit zero remote connections"
+        );
+
+        // `show` clears the marker before its daemon poke. Drive those same two
+        // operations here and observe the real transport-admission seam plus a
+        // request reaching the fake host.
+        crate::state::set_hidden(&state_dir, "studio", false).unwrap();
+        tx.send(HostSignal::Resync).await.unwrap();
+        wait_until(|| connect_attempts.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+        assert!(remote.requests().len() > remote_baseline, "show must reach the fake host");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            connect_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "show must admit once rather than busy-loop"
+        );
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
     async fn daemon_public_protocol_journey_covers_clear_restart_routing_and_readiness() {
         let state_dir = std::env::temp_dir().join(format!(
             "hm-daemon-rosemary-journey-{}",
@@ -1963,6 +2064,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             names: names.clone(),
             rosemary_gate: rosemary_gate.clone(),
             remote_override: Some(remote_a_api.clone()),
+            connect_attempts: None,
         };
         let ctx_b = HostCtx {
             env_state_dir: state_dir.clone(),
@@ -1974,6 +2076,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             names: names.clone(),
             rosemary_gate: rosemary_gate.clone(),
             remote_override: Some(remote_b_api.clone()),
+            connect_attempts: None,
         };
         let task_a = tokio::spawn(host_task(ctx_a, rx_a));
         let task_b = tokio::spawn(host_task(ctx_b, rx_b));
@@ -2107,12 +2210,14 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
             rosemary_gate: rosemary_gate.clone(),
             remote_override: Some(remote_a_api.clone()),
+            connect_attempts: None,
         };
         let ctx_b2 = HostCtx {
             env_state_dir: state_dir.clone(), host: test_host("alpha-beta"), local: local_api.clone(),
             log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
             rosemary_gate: rosemary_gate.clone(),
             remote_override: Some(remote_b_api.clone()),
+            connect_attempts: None,
         };
         let restart_request_index = local.requests().len();
         let task_a2 = tokio::spawn(host_task(ctx_a2, rx_a2));
