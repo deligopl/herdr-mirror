@@ -963,6 +963,8 @@ struct App {
     last_select_rows: Option<(usize, usize)>,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
+    /// at most one metadata poll per pane is ever in the air; see `PollGate`
+    fg_poll_gate: crate::foreground::PollGate,
     /// when a frame last reached us
     last_frame_at: Instant,
     /// the remote pane's content revision as of the last successful poll, and
@@ -1161,6 +1163,11 @@ impl App {
             return;
         }
         self.fg_poll_at = Some(now);
+        // A forced poll bypasses the throttle above, so the throttle cannot be
+        // what bounds concurrency. This can: one in flight per pane, and a
+        // request arriving while one runs is coalesced into a single extra
+        // pass rather than starting or queueing another.
+        let Some(permit) = self.fg_poll_gate.begin() else { return };
         let tx = self.tx.clone();
         let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
@@ -1169,17 +1176,25 @@ impl App {
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
         tokio::spawn(async move {
-            let (fg, revision) = crate::foreground::poll(
-                &ssh,
-                bin.as_deref(),
-                session.as_deref(),
-                &pane,
-                ctl.as_deref(),
-                container.as_ref(),
-            )
-            .await;
-            let _ = tx.send(Msg::Foreground(fg)).await;
-            let _ = tx.send(Msg::RemoteRevision(revision)).await;
+            // dropped on completion or cancellation, so the gate never stays
+            // shut on a poll that will not finish
+            let permit = permit;
+            loop {
+                let (fg, revision) = crate::foreground::poll(
+                    &ssh,
+                    bin.as_deref(),
+                    session.as_deref(),
+                    &pane,
+                    ctl.as_deref(),
+                    container.as_ref(),
+                )
+                .await;
+                let _ = tx.send(Msg::Foreground(fg)).await;
+                let _ = tx.send(Msg::RemoteRevision(revision)).await;
+                if !permit.another_pass_wanted() {
+                    break;
+                }
+            }
         });
     }
 
@@ -2293,6 +2308,7 @@ pub async fn run(args: Args) -> Result<()> {
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,
+        fg_poll_gate: crate::foreground::PollGate::new(),
         last_frame_at: Instant::now(),
         remote_revision: None,
         remote_advanced_at: None,

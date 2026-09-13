@@ -8,12 +8,20 @@
 // as a possible mouse-aware TUI and clicks are forwarded. This is a heuristic
 // stand-in until herdr exposes the pane's mouse-reporting state through the API.
 
-use std::process::Stdio;
-
-use tokio::process::Command;
+use std::ffi::OsStr;
 
 use crate::pane::sh_quote;
-use crate::remote::SSH_COMMON_OPTS;
+use crate::remote::{ssh_with_program, SSH_COMMON_OPTS};
+
+/// How long one metadata poll may take before it is stopped and reaped.
+///
+/// A healthy poll is one ssh round trip over an existing ControlMaster, tens
+/// of milliseconds. This ceiling exists for the unhealthy case: a remote
+/// `herdr pane get` that never answers. Spawning is throttled to
+/// `FG_POLL_INTERVAL`, so bounding each poll here is what keeps the number of
+/// outstanding ones finite rather than growing for as long as the remote stays
+/// unresponsive.
+const FG_POLL_TIMEOUT_MS: u64 = 8_000;
 
 /// Interactive shells: at a prompt these don't enable mouse reporting, so mouse
 /// events over them should stay local rather than being forwarded to the pty.
@@ -87,6 +95,76 @@ pub fn revision(pane_json: &str) -> Option<u64> {
     pane.get("result")?.get("pane")?.get("revision")?.as_u64()
 }
 
+/// One in-flight metadata poll per pane, at most.
+///
+/// The deadline alone does not bound how many polls a pane can have in the air.
+/// Spawning is throttled to `FG_POLL_INTERVAL`, but a forced poll — the one an
+/// input burst asks for, so the classification is right the instant a TUI exits
+/// — bypasses that throttle entirely. Under input, polls can therefore be
+/// started far faster than a slow remote retires them.
+///
+/// So the gate, not arithmetic, is what bounds it. A caller that finds a poll
+/// already running does not start a second one and does not queue: it records
+/// that a refresh is wanted, and the running poll does one more pass when it
+/// finishes. Only the newest answer is ever worth having — each one simply
+/// overwrites the pane's last known value — so coalescing loses nothing, and a
+/// burst of a hundred forced triggers costs one extra pass, not a hundred.
+#[derive(Clone, Default)]
+pub struct PollGate {
+    state: std::sync::Arc<std::sync::Mutex<GateState>>,
+}
+
+#[derive(Default)]
+struct GateState {
+    running: bool,
+    refresh_wanted: bool,
+}
+
+/// Held for as long as a poll owns the gate. Releasing it on drop is what makes
+/// the guard safe against cancellation as well as completion: if the pane goes
+/// away mid-poll, the gate does not stay shut on a poll that will never finish.
+pub struct PollPermit {
+    gate: PollGate,
+}
+
+impl PollGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `Some` when the caller should run the poll, `None` when one is already
+    /// in flight — in which case a refresh is remembered, without a queue.
+    pub fn begin(&self) -> Option<PollPermit> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.running {
+            state.refresh_wanted = true;
+            return None;
+        }
+        state.running = true;
+        state.refresh_wanted = false;
+        drop(state);
+        Some(PollPermit { gate: self.clone() })
+    }
+}
+
+impl PollPermit {
+    /// After a pass: whether someone asked for a refresh while it ran. Taking
+    /// it and deciding to continue happen under the one lock, so a request
+    /// arriving at that moment cannot be dropped on the floor.
+    pub fn another_pass_wanted(&self) -> bool {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut state.refresh_wanted)
+    }
+}
+
+impl Drop for PollPermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.running = false;
+        state.refresh_wanted = false;
+    }
+}
+
 /// Query the remote pane over ssh: its foreground classification, and its
 /// content revision. `None` on any failure (ssh/network/parse) so the caller
 /// keeps its last known value.
@@ -106,7 +184,11 @@ pub async fn poll(
         b = bin,
         p = sh_quote(pane)
     );
-    let mut sc = match container {
+    // One guarded spawn for both transports. `remote::ssh_with_program` owns
+    // the complete process group, enforces the deadline and reaps on timeout,
+    // so a poll that never answers is stopped instead of being left behind —
+    // the behaviour a bare `output().await` here did not have.
+    let (program, args) = match container {
         Some(ct) => {
             // async resolve, not the blocking one: this runs on the pane's
             // single-threaded runtime and fires on every keystroke burst, so a
@@ -122,35 +204,32 @@ pub async fn poll(
             else {
                 return (None, None);
             };
-            let mut c = Command::new(&ct.docker_bin);
             // `sh -c` not `-lc`: match ssh's non-login remote shell
-            c.args(["exec", &id, "sh", "-c", &cmd]);
-            c
+            (
+                ct.docker_bin.clone(),
+                vec!["exec".to_string(), id, "sh".to_string(), "-c".to_string(), cmd],
+            )
         }
         None => {
-            let mut c = Command::new("ssh");
+            let mut args = Vec::new();
             // reuse the daemon's ControlMaster when given so the poll skips the
             // handshake; `-S` without `-M` uses an existing master or, if the socket
             // isn't there, connects directly — so this degrades gracefully
             if let Some(path) = ctl_path {
-                c.arg("-S").arg(path);
+                args.push("-S".to_string());
+                args.push(path.to_string());
             }
-            c.args(SSH_COMMON_OPTS).arg(ssh_target).arg(cmd);
-            c
+            args.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
+            args.push(ssh_target.to_string());
+            args.push(cmd);
+            ("ssh".to_string(), args)
         }
     };
-    let Some(out) = sc
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()
-        .filter(|out| out.status.success())
-    else {
+    let out = ssh_with_program(OsStr::new(&program), &args, FG_POLL_TIMEOUT_MS).await;
+    if out.code != 0 {
         return (None, None);
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
+    }
+    let text = out.out.as_str();
     let Some((pane_json, proc_json)) = text.split_once("<<>>") else {
         return (None, None);
     };
@@ -207,5 +286,208 @@ mod tests {
         );
         assert_eq!(classify(&none, "not json"), None);
         assert_eq!(classify("not json", &proc_with("zsh")), None);
+    }
+}
+
+#[cfg(test)]
+mod hung_poll_is_bounded {
+    //! The poll that leaked. A remote `herdr pane get` that never answers used
+    //! to leave its client running for as long as the pane lived, one more per
+    //! throttle interval, because the spawn had no deadline and no owned
+    //! process group to reap. These two properties are what stop that.
+
+    use super::*;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for `docker`: answers `ps` with one id, then hangs on `exec`
+    /// exactly as an unresponsive remote does. Writing its own pid out lets the
+    /// test ask afterwards whether the process actually went away.
+    fn hanging_docker(dir: &std::path::Path) -> String {
+        let pidfile = dir.join("child.pid");
+        let bin = dir.join("docker-stub");
+        let mut fh = std::fs::File::create(&bin).unwrap();
+        write!(
+            fh,
+            "#!/bin/sh\n\
+             if [ \"$1\" = ps ]; then echo deadbeefcafe; exit 0; fi\n\
+             echo $$ > {pid}\n\
+             exec sleep 600\n",
+            pid = pidfile.display()
+        )
+        .unwrap();
+        drop(fh);
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_poll_that_never_answers_is_stopped_and_leaves_no_client_behind() {
+        let dir = std::env::temp_dir().join(format!("fg-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let docker_bin = hanging_docker(&dir);
+        let container = crate::pane::ContainerArg {
+            kind: crate::config::HostKind::DockerContainer("whatever".into()),
+            docker_bin,
+        };
+
+        let started = Instant::now();
+        let (fg, revision) = poll("unused", None, None, "w1:p1", None, Some(&container)).await;
+        let took = started.elapsed();
+
+        // the deadline held: it returned, and near the ceiling rather than at
+        // the stub's own 600s
+        assert!(
+            took < Duration::from_millis(FG_POLL_TIMEOUT_MS + 4_000),
+            "poll ran {took:?}, so nothing bounded it"
+        );
+        assert!(took >= Duration::from_millis(FG_POLL_TIMEOUT_MS - 1_000));
+        // a failed poll says nothing, so the caller keeps its last known value
+        assert!(fg.is_none() && revision.is_none());
+
+        // and the client it owned is gone, not merely abandoned
+        let pid: i32 = std::fs::read_to_string(dir.join("child.pid"))
+            .expect("stub never recorded a pid")
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..50 {
+            if !alive(pid) {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the poll's own client {pid} outlived it");
+    }
+}
+
+#[cfg(test)]
+mod one_poll_per_pane {
+    //! Rapid forced triggers must not put a second client on the wire.
+    //!
+    //! `spawn_foreground_poll(force = true)` skips the interval throttle, so
+    //! before the gate a burst of input could start polls as fast as the events
+    //! arrived while a slow remote retired none of them.
+
+    use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Records every invocation's pid, then hangs, so the test can count how
+    /// many clients a burst actually put on the wire.
+    fn recording_docker(dir: &std::path::Path, hang: &str) -> String {
+        let bin = dir.join("docker-stub");
+        let mut fh = std::fs::File::create(&bin).unwrap();
+        write!(
+            fh,
+            "#!/bin/sh\n\
+             if [ \"$1\" = ps ]; then echo deadbeefcafe; exit 0; fi\n\
+             echo $$ >> {log}\n\
+             exec sleep {hang}\n",
+            log = dir.join("invocations").display(),
+            hang = hang
+        )
+        .unwrap();
+        drop(fh);
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    fn invocations(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("invocations"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn container(docker_bin: String) -> crate::pane::ContainerArg {
+        crate::pane::ContainerArg {
+            kind: crate::config::HostKind::DockerContainer("whatever".into()),
+            docker_bin,
+        }
+    }
+
+    /// What the pane does: run under a permit, and do one more pass if a
+    /// refresh was asked for while this one ran.
+    fn spawn_under_gate(
+        gate: &PollGate,
+        ct: Arc<crate::pane::ContainerArg>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let permit = gate.begin()?;
+        Some(tokio::spawn(async move {
+            let permit = permit;
+            loop {
+                let _ = poll("unused", None, None, "w1:p1", None, Some(ct.as_ref())).await;
+                if !permit.another_pass_wanted() {
+                    break;
+                }
+            }
+        }))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_of_forced_polls_puts_exactly_one_client_on_the_wire() {
+        let dir = std::env::temp_dir().join(format!("fg-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ct = Arc::new(container(recording_docker(&dir, "600")));
+        let gate = PollGate::new();
+
+        // one slow poll in flight, then fifty forced triggers on top of it
+        let first = spawn_under_gate(&gate, ct.clone()).expect("gate was free");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let mut extra = 0;
+        for _ in 0..50 {
+            if spawn_under_gate(&gate, ct.clone()).is_some() {
+                extra += 1;
+            }
+        }
+        assert_eq!(extra, 0, "the gate let {extra} more polls start");
+
+        // and the wire agrees: one client, not fifty-one
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let seen = invocations(&dir);
+        assert_eq!(seen.len(), 1, "clients on the wire: {seen:?}");
+
+        // the hung poll is stopped by the deadline, its coalesced pass runs
+        // (the refresh those triggers asked for), and then the gate reopens
+        first.await.unwrap();
+        assert!(gate.begin().is_some(), "the gate stayed shut after completion");
+        let after = invocations(&dir);
+        assert_eq!(after.len(), 2, "expected one coalesced extra pass: {after:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_poll_reopens_the_gate_for_the_next_one() {
+        let dir = std::env::temp_dir().join(format!("fg-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ct = Arc::new(container(recording_docker(&dir, "600")));
+        let gate = PollGate::new();
+
+        let running = spawn_under_gate(&gate, ct.clone()).expect("gate was free");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(gate.begin().is_none(), "gate should be shut while one runs");
+
+        // the pane going away mid-poll must not leave the gate shut forever
+        running.abort();
+        let _ = running.await;
+        for _ in 0..50 {
+            if gate.begin().is_some() {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the gate stayed shut after the poll was cancelled");
     }
 }

@@ -45,10 +45,10 @@ pub struct RemoteStatus {
     pub reason: Option<String>,
 }
 
-struct SshOutput {
-    code: i32,
-    out: String,
-    err: String,
+pub(crate) struct SshOutput {
+    pub(crate) code: i32,
+    pub(crate) out: String,
+    pub(crate) err: String,
 }
 
 const SSH_TIMEOUT_TERM_GRACE: Duration = Duration::from_secs(2);
@@ -59,7 +59,11 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
     ssh_with_program(OsStr::new("ssh"), args, timeout_ms).await
 }
 
-async fn ssh_with_program(program: &OsStr, args: &[String], timeout_ms: u64) -> SshOutput {
+pub(crate) async fn ssh_with_program(
+    program: &OsStr,
+    args: &[String],
+    timeout_ms: u64,
+) -> SshOutput {
     let mut command = Command::new(program);
     command
         .args(args)
