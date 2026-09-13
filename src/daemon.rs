@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -41,6 +42,62 @@ fn pid_path(env: &Env) -> PathBuf {
 pub fn running_pid(env: &Env) -> Option<i32> {
     let pid: i32 = fs::read_to_string(pid_path(env)).ok()?.trim().parse().ok()?;
     pid_alive(pid).then_some(pid)
+}
+
+// Never unlink the lock file: every writer must lock the same inode.
+fn open_daemon_lock(env: &Env) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(env.state_dir.join("daemon.lock"))?)
+}
+
+fn try_daemon_lock(env: &Env) -> Result<Option<fs::File>> {
+    let file = open_daemon_lock(env)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error.into())
+    }
+}
+
+struct DaemonOwner {
+    _lock: fs::File,
+    pid_path: PathBuf,
+    pid: String,
+}
+
+impl DaemonOwner {
+    fn acquire(env: &Env) -> Result<Self> {
+        let lock = try_daemon_lock(env)?
+            .ok_or_else(|| err("mirror daemon already running: daemon.lock is held"))?;
+        Ok(Self {
+            _lock: lock,
+            pid_path: pid_path(env),
+            pid: std::process::id().to_string(),
+        })
+    }
+
+    fn publish(&self) -> Result<()> {
+        let temporary = self.pid_path.with_extension(format!("pid.{}.tmp", self.pid));
+        fs::write(&temporary, &self.pid)?;
+        fs::rename(temporary, &self.pid_path)?;
+        Ok(())
+    }
+}
+
+impl Drop for DaemonOwner {
+    fn drop(&mut self) {
+        // Also runs on startup/API errors, while we still own the lifetime lock.
+        if fs::read_to_string(&self.pid_path).ok().as_deref() == Some(self.pid.as_str()) {
+            let _ = fs::remove_file(&self.pid_path);
+        }
+    }
 }
 
 // Sticky pause marker: blocks the focus-hook autostart until an explicit
@@ -943,10 +1000,11 @@ async fn local_events_task(
 // --- commands ---
 
 pub async fn cmd_run(env: Env) -> Result<()> {
+    let owner = DaemonOwner::acquire(&env)?;
     let detached = std::env::var("HERDR_MIRROR_DETACHED").is_ok();
     let log = Logger::new(&env.state_dir, !detached);
     let config = load_config(&env.config_search)?;
-    fs::write(pid_path(&env), std::process::id().to_string())?;
+
     log.log(&format!(
         "daemon starting (pid {}, hosts: {}, config: {})",
         std::process::id(),
@@ -1021,6 +1079,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
+    owner.publish()?;
     let mut poll = tokio::time::interval(Duration::from_secs(config.poll_seconds.max(5)));
     poll.tick().await; // consume the immediate first tick (initial sync already runs)
     // The subscribe-time sweep in local_events_task covers a local server
@@ -1076,25 +1135,26 @@ pub async fn cmd_run(env: Env) -> Result<()> {
                 .await;
         }
     }
-    let _ = fs::remove_file(pid_path(&env));
     Ok(())
 }
 
 pub fn cmd_start(env: &Env) -> Result<()> {
-    // flock + parent-written pidfile: two racing starts (focus hook) must not
-    // both see "not running" and spawn duplicate daemons
-    use std::os::fd::AsRawFd;
+    // Serialize launchers separately from the daemon lifetime lock. The child
+    // owns daemon.lock and publishes its own PID only after startup succeeds.
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(env.state_dir.join("daemon.lock"))?;
+        .open(env.state_dir.join("daemon.start.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(err("cannot lock daemon.lock"));
+        return Err(err("cannot lock daemon.start.lock"));
     }
-    if running_pid(env).is_some() {
-        println!("mirror daemon already running");
-        return Ok(());
+    match try_daemon_lock(env)? {
+        None => {
+            println!("mirror daemon already running");
+            return Ok(());
+        }
+        Some(probe) => drop(probe),
     }
     let exe = std::env::current_exe()?;
     let log = fs::OpenOptions::new()
@@ -1103,7 +1163,7 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .open(env.state_dir.join("daemon.log"))?;
     let log2 = log.try_clone()?;
     use std::os::unix::process::CommandExt;
-    let child = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(log)
@@ -1111,9 +1171,22 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .env("HERDR_MIRROR_DETACHED", "1")
         .process_group(0)
         .spawn()?;
-    fs::write(pid_path(env), child.id().to_string())?;
-    println!("mirror daemon started (pid {})", child.id());
-    Ok(())
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(err(format!("mirror daemon failed to start ({status}); see daemon.log")));
+        }
+        if running_pid(env) == Some(child.id() as i32) {
+            println!("mirror daemon started (pid {})", child.id());
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err("mirror daemon startup timed out; see daemon.log"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub fn cmd_pause(env: &Env) {
@@ -1252,6 +1325,8 @@ pub fn cmd_status(env: &Env) -> Result<()> {
 }
 
 pub async fn cmd_once(env: Env) -> Result<()> {
+    // A one-shot converge writes the same maps as the daemon.
+    let _owner = DaemonOwner::acquire(&env)?;
     let log = Logger::new(&env.state_dir, true);
     let config = load_config(&env.config_search)?;
     let local = ApiClient::connect(&env.local_socket).await?;

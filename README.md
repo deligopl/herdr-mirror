@@ -96,6 +96,13 @@ only stop mirroring and leave the remote — and its agent — running). When th
 remote is left running, the **restore** action (`herdr-mirror restore`) brings
 back mirrors you closed.
 
+**One writer per state directory** — the daemon holds `daemon.lock` for its
+entire lifetime. A second `daemon`/`run` or `once` refuses the same directory,
+even if `daemon.pid` has been lost. `start` serializes launchers separately and
+waits for the child to publish its own PID after startup. Exiting daemons only
+remove their own PID record. Never delete a live lock file: doing so creates a
+second lock inode and defeats process exclusion.
+
 **Pause** — the **pause** action halts syncing and the pane streams that carry
 terminal output, input, and health polls. Mirrors stay frozen in place because
 their local supervisor processes remain; **start** resumes those streams over a
