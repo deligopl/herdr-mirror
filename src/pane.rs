@@ -240,15 +240,6 @@ async fn write_terminal_input(
     stdin.write_all(line.as_bytes()).await
 }
 
-#[cfg(test)]
-pub(crate) async fn test_typed_prompt_through_data_plane(bytes: &[u8]) -> serde_json::Value {
-    let (mut pane_side, remote_side) = tokio::io::duplex(4096);
-    write_terminal_input(&mut pane_side, bytes).await.unwrap();
-    drop(pane_side);
-    let mut lines = BufReader::new(remote_side).lines();
-    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
-}
-
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
 pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))

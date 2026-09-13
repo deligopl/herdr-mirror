@@ -21,14 +21,14 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
     apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    teardown, AgentInfo, ConvergeDeps, PaneStatusDeps, RosemaryProjectionGate,
+    teardown, AgentInfo, ConvergeDeps, PaneStatusDeps,
 };
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
@@ -134,7 +134,6 @@ struct HostCtx {
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
     names: crate::mirror::SessionNamePlanner,
-    rosemary_gate: RosemaryProjectionGate,
     // Hermetic acceptance can drive the production host lifecycle against a
     // public-protocol peer without invoking ssh. Production always leaves it
     // unset and uses RemoteHost below.
@@ -155,44 +154,11 @@ enum HostSignal {
     /// deliberate act reset a host's reconnect ladder while a split drag does
     /// not.
     Resync,
-    LocalPaneUpdated {
-        pane_id: String,
-        acknowledged: oneshot::Sender<()>,
-    },
 }
 
 #[derive(Clone)]
 struct LocalEventGuards {
     closes: crate::closes::Closes,
-    rosemary_gate: RosemaryProjectionGate,
-}
-
-async fn capture_local_update(ctx: &HostCtx, signal: HostSignal) {
-    if let HostSignal::LocalPaneUpdated { pane_id, acknowledged } = signal {
-        loop {
-            match crate::mirror::capture_local_rosemary_clear(
-                &ctx.local,
-                &ctx.env_state_dir,
-                &ctx.host.name,
-                &pane_id,
-                &ctx.log,
-            )
-            .await
-            {
-                Ok(_) => {
-                    let _ = acknowledged.send(());
-                    break;
-                }
-                Err(error) => {
-                    ctx.log.log(&format!(
-                        "[{}] local Rosemary clear remains unacknowledged; projection blocked: {error}",
-                        ctx.host.name
-                    ));
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            }
-        }
-    }
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -289,7 +255,6 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
                 state_dir: &ctx.env_state_dir,
                 host_name: &ctx.host.name,
                 log: &ctx.log,
-                rosemary_gate: &ctx.rosemary_gate,
             },
             &remote_id,
             &mut state,
@@ -380,18 +345,15 @@ async fn connected_session(
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
         names: ctx.names.clone(),
-        rosemary_gate: ctx.rosemary_gate.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
     let mut name_plan_changes = ctx.names.subscribe();
-    // A local clear can arrive while the remote dial is completing. Persist
-    // every queued clear before the first projection of this connection.
-    while let Ok(signal) = poke.try_recv() {
-        capture_local_update(ctx, signal).await;
-    }
+    // Pokes accumulated during the dial are stale; the initial converge below
+    // already reads the current local and remote state.
+    while poke.try_recv().is_ok() {}
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
@@ -453,10 +415,7 @@ async fn connected_session(
                     }
                 }
             }
-            Some(signal) = poke.recv() => {
-                // This host task is the single writer: observe and durably
-                // suppress a local clear before any later projection.
-                capture_local_update(ctx, signal).await;
+            Some(_) = poke.recv() => {
                 converge_at.get_or_insert(Instant::now());
             }
             _ = sleep => {
@@ -631,8 +590,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         let mut was_hidden = false;
         while crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
             was_hidden = true;
-            let Some(signal) = poke.recv().await else { return };
-            capture_local_update(&ctx, signal).await;
+            let Some(_) = poke.recv().await else { return };
         }
         // A deliberate show starts with a clean ladder. This matches the
         // existing visible-host Resync behavior after a failed connection.
@@ -705,9 +663,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         }
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
         // about now, and honouring them would skip the sleep entirely
-        while let Ok(signal) = poke.try_recv() {
-            capture_local_update(&ctx, signal).await;
-        }
+        while poke.try_recv().is_ok() {}
         // Wake early only for a hidden host, whose close is genuinely waiting on
         // us and would otherwise sit behind a 300s dormant sleep, or for an
         // explicit `herdr-mirror wake <host>`: someone has just started that
@@ -729,7 +685,6 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
                         if signal_restarts_ladder(&signal, hidden) {
                             ladder.reset();
                         }
-                        capture_local_update(&ctx, signal).await;
                     }
                     if hidden {
                         break;
@@ -744,9 +699,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
                 }
             }
         }
-        while let Ok(signal) = poke.try_recv() {
-            capture_local_update(&ctx, signal).await;
-        }
+        while poke.try_recv().is_ok() {}
     }
 }
 
@@ -910,9 +863,6 @@ async fn local_events_task(
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
-            // Rosemary clears run metadata in place. The event is only a
-            // doorbell; each host task re-reads the authoritative pane.
-            json!({ "type": "pane.updated" }),
             // closing a TAB emits only tab_closed — no pane_closed for the
             // panes inside it — so without this a tab close never counts as
             // user intent and close-through silently degrades to tombstoning
@@ -951,40 +901,8 @@ async fn local_events_task(
                             }
                         }
                     }
-                    let pane_updated = (e.event == "pane_updated")
-                        .then(|| e.data.get("pane_id").and_then(|value| value.as_str()))
-                        .flatten()
-                        .map(str::to_string);
-                    if let Some(pane_id) = &pane_updated {
-                        // pane.updated is advisory: it queues an authoritative
-                        // snapshot read and lets an in-flight converge notice
-                        // that work before its next Rosemary write. Herdr has
-                        // no revision/CAS, so a clear overwritten before that
-                        // read is intentionally not claimed as observed.
-                        guards.rosemary_gate.note_local_update(pane_id);
-                    }
-                    let mut acknowledgements = Vec::new();
                     for p in &pokers {
-                        if let Some(pane_id) = &pane_updated {
-                            // A bounded suppression signal is never optional:
-                            // backpressure this one event rather than dropping
-                            // it behind cosmetic layout traffic.
-                            let (acknowledged, acknowledgement) = oneshot::channel();
-                            if p.send(HostSignal::LocalPaneUpdated {
-                                pane_id: pane_id.clone(),
-                                acknowledged,
-                            }).await.is_ok() {
-                                acknowledgements.push(acknowledgement);
-                            }
-                        } else {
-                            let _ = p.try_send(HostSignal::Converge);
-                        }
-                    }
-                    for acknowledgement in acknowledgements {
-                        let _ = acknowledgement.await;
-                    }
-                    if let Some(pane_id) = &pane_updated {
-                        guards.rosemary_gate.finish_local_update(pane_id);
+                        let _ = p.try_send(HostSignal::Converge);
                     }
                     // a workspace appeared/left — keep hosts grouped (no-op if already)
                     regroup_sidebar(&local, &prefixes, &log).await;
@@ -1040,7 +958,6 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     let names = crate::mirror::SessionNamePlanner::new(
         config.hosts.iter().map(|host| host.name.clone()),
     );
-    let rosemary_gate = RosemaryProjectionGate::default();
     let mut pokers: Vec<mpsc::Sender<HostSignal>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
@@ -1054,7 +971,6 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
             names: names.clone(),
-            rosemary_gate: rosemary_gate.clone(),
             #[cfg(test)]
             remote_override: None,
             #[cfg(test)]
@@ -1070,10 +986,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         config.hosts.clone(),
         env.state_dir.clone(),
         log.clone(),
-        LocalEventGuards {
-            closes: closes.clone(),
-            rosemary_gate,
-        },
+        LocalEventGuards { closes: closes.clone() },
     )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -1345,7 +1258,6 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     let names = crate::mirror::SessionNamePlanner::new(
         connected.iter().map(|(host, _, _)| host.name.clone()),
     );
-    let rosemary_gate = RosemaryProjectionGate::default();
     // First pass supplies every configured source snapshot to the shared plan;
     // the second applies that complete plan to hosts encountered before it was
     // ready. RemoteHost owners stay alive for both passes.
@@ -1363,7 +1275,6 @@ pub async fn cmd_once(env: Env) -> Result<()> {
                 // closes a remote object, which is the correct conservative default
                 closes: crate::closes::new_closes(),
                 names: names.clone(),
-                rosemary_gate: rosemary_gate.clone(),
             })
             .await?;
         }
@@ -1454,8 +1365,6 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine;
     use std::sync::{Arc, Mutex};
 
     /// The defect, as a sequence.
@@ -1686,16 +1595,10 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    type MetadataPause =
-        Arc<Mutex<Option<(String, oneshot::Sender<()>, Arc<tokio::sync::Notify>)>>>;
-
     struct ProtocolPeer {
         path: PathBuf,
-        snapshot: Arc<Mutex<Value>>,
         requests: Arc<Mutex<Vec<Value>>>,
-        routes: Arc<Mutex<HashMap<String, String>>>,
-        terminal_inputs: Arc<Mutex<Vec<Value>>>,
-        metadata_pause: MetadataPause,
+        projection_events: Arc<std::sync::atomic::AtomicBool>,
         events: tokio::sync::broadcast::Sender<Value>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1713,25 +1616,18 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             let listener = UnixListener::bind(&path).unwrap();
             let snapshot = Arc::new(Mutex::new(snapshot));
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let routes: Arc<Mutex<HashMap<String, String>>> =
-                Arc::new(Mutex::new(HashMap::new()));
-            let terminal_inputs = Arc::new(Mutex::new(Vec::new()));
-            let metadata_pause: MetadataPause = Arc::new(Mutex::new(None));
+            let projection_events = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (events, _) = tokio::sync::broadcast::channel::<Value>(32);
             let snapshots = snapshot.clone();
             let captured = requests.clone();
-            let prompt_routes = routes.clone();
-            let pane_inputs = terminal_inputs.clone();
-            let pauses = metadata_pause.clone();
+            let emit_projection_events = projection_events.clone();
             let event_bus = events.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else { break };
                     let snapshots = snapshots.clone();
                     let captured = captured.clone();
-                    let prompt_routes = prompt_routes.clone();
-                    let pane_inputs = pane_inputs.clone();
-                    let pauses = pauses.clone();
+                    let emit_projection_events = emit_projection_events.clone();
                     let mut event_rx = event_bus.subscribe();
                     let event_tx = event_bus.clone();
                     tokio::spawn(async move {
@@ -1741,11 +1637,27 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                         let request: Value = serde_json::from_str(&line).unwrap();
                         captured.lock().unwrap().push(request.clone());
                         if request["method"] == "events.subscribe" {
+                            let subscriptions: std::collections::HashSet<String> = request
+                                ["params"]["subscriptions"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|subscription| subscription["type"].as_str())
+                                .map(str::to_string)
+                                .collect();
                             let response = json!({"id": request["id"], "result": {"type": "subscription_started"}});
                             write.write_all(format!("{response}\n").as_bytes()).await.unwrap();
                             while let Ok(event) = event_rx.recv().await {
                                 if event["disconnect"] == true {
                                     break;
+                                }
+                                let subscribed = event["event"]
+                                    .as_str()
+                                    .and_then(|name| name.split_once('_'))
+                                    .map(|(scope, name)| format!("{scope}.{name}"))
+                                    .is_some_and(|name| subscriptions.contains(&name));
+                                if !subscribed {
+                                    continue;
                                 }
                                 if write.write_all(format!("{event}\n").as_bytes()).await.is_err() {
                                     break;
@@ -1756,39 +1668,9 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
 
                         let method = request["method"].as_str().unwrap_or("");
                         let params = &request["params"];
-                        let pause = if method == "pane.report_metadata" {
-                            let source = params["source"].as_str().unwrap_or("");
-                            let mut pause = pauses.lock().unwrap();
-                            if pause.as_ref().is_some_and(|(expected, _, _)| expected == source) {
-                                pause.take().map(|(_, started, release)| {
-                                    let _ = started.send(());
-                                    release
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(release) = pause {
-                            release.notified().await;
-                        }
                         let result = if method == "session.snapshot" {
                             json!({"snapshot": snapshots.lock().unwrap().clone()})
                         } else {
-                            if method == "agent.prompt" {
-                                if let Some(target) = params["target"].as_str() {
-                                    let route = prompt_routes.lock().unwrap().get(target).cloned();
-                                    if let Some(remote_target) = route {
-                                        let text = params["text"].as_str().unwrap_or("");
-                                        let mut bytes = text.as_bytes().to_vec();
-                                        bytes.push(b'\r');
-                                        let mut terminal = crate::pane::test_typed_prompt_through_data_plane(&bytes).await;
-                                        terminal["pane_id"] = json!(remote_target);
-                                        pane_inputs.lock().unwrap().push(terminal);
-                                    }
-                                }
-                            }
                             let mut snapshot = snapshots.lock().unwrap();
                             if method == "workspace.report_metadata" {
                                 let workspace_id = params["workspace_id"].as_str();
@@ -1862,7 +1744,9 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                                     }
                                 }
                             }
-                            if method == "pane.report_metadata" && params["seq"] == 999 {
+                            if emit_projection_events.load(std::sync::atomic::Ordering::SeqCst)
+                                && matches!(method, "pane.report_agent" | "pane.report_metadata")
+                            {
                                 if let Some(pane_id) = pane_id {
                                     let _ = event_tx.send(json!({
                                         "event": "pane_updated",
@@ -1879,49 +1763,26 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             });
             Self {
                 path,
-                snapshot,
                 requests,
-                routes,
-                terminal_inputs,
-                metadata_pause,
+                projection_events,
                 events,
                 task,
             }
-        }
-
-        fn set_snapshot(&self, snapshot: Value) {
-            *self.snapshot.lock().unwrap() = snapshot;
-        }
-
-        fn attach_pane_streamer(&self, local_pane: &str, remote_pane: &str) {
-            self.routes
-                .lock()
-                .unwrap()
-                .insert(local_pane.to_string(), remote_pane.to_string());
         }
 
         fn requests(&self) -> Vec<Value> {
             self.requests.lock().unwrap().clone()
         }
 
-        fn terminal_inputs(&self) -> Vec<Value> {
-            self.terminal_inputs.lock().unwrap().clone()
+        fn emit_projection_updates(&self, enabled: bool) {
+            self.projection_events
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
         }
 
-        fn disconnect_subscribers(&self) {
-            let _ = self.events.send(json!({"disconnect": true}));
+        fn send_event(&self, event: Value) {
+            let _ = self.events.send(event);
         }
 
-        fn pause_next_metadata_from(
-            &self,
-            source: &str,
-        ) -> (oneshot::Receiver<()>, Arc<tokio::sync::Notify>) {
-            let (started, observed) = oneshot::channel();
-            let release = Arc::new(tokio::sync::Notify::new());
-            *self.metadata_pause.lock().unwrap() =
-                Some((source.to_string(), started, release.clone()));
-            (observed, release)
-        }
     }
 
     impl Drop for ProtocolPeer {
@@ -2026,6 +1887,112 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
         panic!("condition did not become true");
     }
 
+    fn request_count(peer: &ProtocolPeer, method: &str) -> usize {
+        peer.requests()
+            .iter()
+            .filter(|request| request["method"] == method)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn local_projection_echo_is_ignored_but_remote_status_event_still_projects() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hm-no-local-projection-feedback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let local = ProtocolPeer::start("no-feedback-local", local_facade_snapshot()).await;
+        let remote = ProtocolPeer::start(
+            "no-feedback-remote",
+            remote_snapshot("rp-a", "conductor", "run-1"),
+        )
+        .await;
+        seed_host_state(&state_dir, "alpha", "rp-a", "lp-a", "lw-a", "lt-a");
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let remote_api = ApiClient::connect(&remote.path).await.unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let host_task_handle = tokio::spawn(host_task(
+            HostCtx {
+                env_state_dir: state_dir.clone(),
+                host: test_host("alpha"),
+                local: local_api.clone(),
+                log: Logger::new(&state_dir, false),
+                close_remote_on_local_close: false,
+                closes: crate::closes::new_closes(),
+                names: crate::mirror::SessionNamePlanner::new(["alpha".to_string()]),
+                remote_override: Some(remote_api),
+                connect_attempts: None,
+            },
+            rx,
+        ));
+        let event_task_handle = tokio::spawn(local_events_task(
+            local_api,
+            vec![tx],
+            vec!["alpha".into()],
+            vec![test_host("alpha")],
+            state_dir.clone(),
+            Logger::new(&state_dir, false),
+            LocalEventGuards { closes: crate::closes::new_closes() },
+        ));
+
+        wait_until(|| request_count(&local, "pane.report_metadata") >= 2).await;
+        wait_until(|| request_count(&local, "events.subscribe") >= 1).await;
+        // local_events_task deliberately waits three seconds after subscribing
+        // before it consumes events, so let the real listener reach its loop.
+        tokio::time::sleep(Duration::from_millis(3_100)).await;
+        local.emit_projection_updates(true);
+        let before_echo = request_count(&remote, "session.snapshot");
+        local.send_event(json!({
+            "event": "pane_updated",
+            "data": {"pane_id": "lp-a"}
+        }));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            request_count(&remote, "session.snapshot"),
+            before_echo,
+            "a local projection echo reached the remote converge path"
+        );
+
+        let changed_request_index = local.requests().len();
+        let before_remote_event = request_count(&remote, "session.snapshot");
+        remote.send_event(json!({
+            "event": "pane_agent_status_changed",
+            "data": {
+                "pane_id": "rp-a",
+                "agent": "codex",
+                "display_agent": "Codex",
+                "name": "conductor",
+                "agent_status": "working",
+                "interactive_ready": true,
+                "agent_session": {"value": "session-rp-a"},
+                "tokens": {
+                    "rosemary_binding": "run-1",
+                    "rosemary_outcome": "complete",
+                    "rosemary_commit": "abc123",
+                    "rosemary_summary": "done"
+                }
+            }
+        }));
+        wait_until(|| {
+            local.requests()[changed_request_index..].iter().any(|request| {
+                request["method"] == "pane.report_agent"
+                    && request["params"]["state"] == "working"
+            })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            request_count(&remote, "session.snapshot"),
+            before_remote_event,
+            "the complete upstream lifecycle event should use the status fast path"
+        );
+
+        host_task_handle.abort();
+        event_task_handle.abort();
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     #[tokio::test]
     async fn hidden_host_admission_makes_no_remote_request_until_show() {
         let state_dir = std::env::temp_dir().join(format!(
@@ -2057,7 +2024,6 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             close_remote_on_local_close: false,
             closes: crate::closes::new_closes(),
             names: crate::mirror::SessionNamePlanner::new(["studio".to_string()]),
-            rosemary_gate: RosemaryProjectionGate::default(),
             remote_override: Some(remote_api),
             connect_attempts: Some(connect_attempts.clone()),
         };
@@ -2091,297 +2057,6 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
         );
 
         task.abort();
-        let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
-    async fn daemon_public_protocol_journey_covers_clear_restart_routing_and_readiness() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "hm-daemon-rosemary-journey-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&state_dir);
-        std::fs::create_dir_all(&state_dir).unwrap();
-        seed_host_state(&state_dir, "alpha", "rp-a", "lp-a", "lw-a", "lt-a");
-        seed_host_state(&state_dir, "alpha-beta", "rp-b", "lp-b", "lw-b", "lt-b");
-
-        let remote_a = ProtocolPeer::start(
-            "remote-a",
-            remote_snapshot("rp-a", "beta-conductor-rosie", " run-1 "),
-        )
-        .await;
-        let mut remote_b_snapshot = remote_snapshot("rp-b", "conductor-rosie", "run-b");
-        remote_b_snapshot["agents"][0]["interactive_ready"] = json!(false);
-        remote_b_snapshot["agents"][0]["agent_session"] = Value::Null;
-        let remote_b = ProtocolPeer::start("remote-b", remote_b_snapshot).await;
-        let local = ProtocolPeer::start("local", local_facade_snapshot()).await;
-        local.attach_pane_streamer("lp-a", "rp-a");
-        let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let native_before = local.snapshot.lock().unwrap()["agents"][2].clone();
-        let closes = crate::closes::new_closes();
-        let names = crate::mirror::SessionNamePlanner::new([
-            "alpha".to_string(),
-            "alpha-beta".to_string(),
-        ]);
-        let log = Logger::new(&state_dir, false);
-        let rosemary_gate = RosemaryProjectionGate::default();
-        let remote_a_api = ApiClient::connect(&remote_a.path).await.unwrap();
-        let remote_b_api = ApiClient::connect(&remote_b.path).await.unwrap();
-        let (tx_a, rx_a) = mpsc::channel(8);
-        let (tx_b, rx_b) = mpsc::channel(8);
-        let ctx_a = HostCtx {
-            env_state_dir: state_dir.clone(),
-            host: test_host("alpha"),
-            local: local_api.clone(),
-            log: log.clone(),
-            close_remote_on_local_close: false,
-            closes: closes.clone(),
-            names: names.clone(),
-            rosemary_gate: rosemary_gate.clone(),
-            remote_override: Some(remote_a_api.clone()),
-            connect_attempts: None,
-        };
-        let ctx_b = HostCtx {
-            env_state_dir: state_dir.clone(),
-            host: test_host("alpha-beta"),
-            local: local_api.clone(),
-            log: log.clone(),
-            close_remote_on_local_close: false,
-            closes: closes.clone(),
-            names: names.clone(),
-            rosemary_gate: rosemary_gate.clone(),
-            remote_override: Some(remote_b_api.clone()),
-            connect_attempts: None,
-        };
-        let task_a = tokio::spawn(host_task(ctx_a, rx_a));
-        let task_b = tokio::spawn(host_task(ctx_b, rx_b));
-        let event_task = tokio::spawn(local_events_task(
-            local_api.clone(),
-            vec![tx_a.clone(), tx_b.clone()],
-            vec!["alpha".into(), "alpha-beta".into()],
-            vec![test_host("alpha"), test_host("alpha-beta")],
-            state_dir.clone(),
-            log.clone(),
-            LocalEventGuards {
-                closes: closes.clone(),
-                rosemary_gate: rosemary_gate.clone(),
-            },
-        ));
-
-        wait_until(|| {
-            let snapshot = local.snapshot.lock().unwrap();
-            let agents = snapshot["agents"].as_array().unwrap();
-            let a = agents.iter().find(|agent| agent["pane_id"] == "lp-a").unwrap();
-            let b = agents.iter().find(|agent| agent["pane_id"] == "lp-b").unwrap();
-            a["name"].as_str().is_some()
-                && b["name"].as_str().is_some()
-                && a["name"] != b["name"]
-                && a["interactive_ready"] == true
-        })
-        .await;
-
-        local_api
-            .request("agent.prompt", json!({"target": "lp-a", "text": "continue"}))
-            .await
-            .unwrap();
-        wait_until(|| {
-            local.terminal_inputs().iter().any(|input| {
-                input["type"] == "terminal.input"
-                    && input["pane_id"] == "rp-a"
-                    && input["bytes"] == B64.encode(b"continue\r")
-            })
-        })
-        .await;
-
-        // Force the clear to overlap a converge which has already taken its
-        // snapshots but has not reached the Rosemary write. This is the exact
-        // ordering which used to let that pass restore the tuple before the
-        // queued pane.updated signal could be consumed.
-        let (projection_started, release_projection) =
-            local.pause_next_metadata_from("plugin:mirror:alpha");
-        tx_a.send(HostSignal::Converge).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), projection_started)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Use the same public metadata request Rosemary uses. The fake local
-        // Herdr mutates its snapshot and emits pane_updated while the earlier
-        // converge remains suspended inside its ordinary metadata projection.
-        local_api
-            .request(
-                "pane.report_metadata",
-                json!({
-                    "pane_id": "lp-a",
-                    "source": "rosemary-run",
-                    "tokens": {
-                        "rosemary_binding": null,
-                        "rosemary_outcome": null,
-                        "rosemary_commit": null,
-                        "rosemary_summary": null
-                    },
-                    "seq": 999
-                }),
-            )
-            .await
-            .unwrap();
-        wait_until(|| rosemary_gate.has_local_update("lp-a")).await;
-        release_projection.notify_one();
-        wait_until(|| {
-            load_state(&state_dir, "alpha")
-                .rosemary_suppressions
-                .get("beta-conductor-rosie")
-                .is_some_and(|run| run.binding == " run-1 ")
-        })
-        .await;
-        assert!(local.snapshot.lock().unwrap()["agents"][0]["tokens"]
-            .get("rosemary_binding")
-            .is_none());
-
-        // Actual task restart and socket re-subscription, with both peer pane
-        // identities recreated. The queued clear is inserted before the new
-        // connected phase and must be acknowledged before its initial converge.
-        task_a.abort();
-        task_b.abort();
-        event_task.abort();
-        let mut local_recreated = local.snapshot.lock().unwrap().clone();
-        for pane in local_recreated["panes"].as_array_mut().unwrap() {
-            if pane["pane_id"] == "lp-a" {
-                pane["pane_id"] = json!("lp-a2");
-            }
-        }
-        for agent in local_recreated["agents"].as_array_mut().unwrap() {
-            if agent["pane_id"] == "lp-a" {
-                agent["pane_id"] = json!("lp-a2");
-            }
-        }
-        local.set_snapshot(local_recreated);
-        let mut remote_recreated = remote_snapshot("rp-a2", "beta-conductor-rosie", " run-1 ");
-        remote_recreated["panes"][0]["pane_id"] = json!("rp-a2");
-        remote_a.set_snapshot(remote_recreated);
-        let mut restarted_state = load_state(&state_dir, "alpha");
-        let mut pane = restarted_state.panes.remove("rp-a").unwrap();
-        pane.local_id = "lp-a2".into();
-        restarted_state.panes.insert("rp-a2".into(), pane);
-        save_state(&state_dir, "alpha", &restarted_state).unwrap();
-        local.attach_pane_streamer("lp-a2", "rp-a2");
-
-        let names = crate::mirror::SessionNamePlanner::new([
-            "alpha".to_string(),
-            "alpha-beta".to_string(),
-        ]);
-        let (tx_a2, rx_a2) = mpsc::channel(8);
-        let (ack_tx, ack_rx) = oneshot::channel();
-        tx_a2
-            .send(HostSignal::LocalPaneUpdated {
-                pane_id: "lp-a2".into(),
-                acknowledged: ack_tx,
-            })
-            .await
-            .unwrap();
-        let (tx_b2, rx_b2) = mpsc::channel(8);
-        let ctx_a2 = HostCtx {
-            env_state_dir: state_dir.clone(), host: test_host("alpha"), local: local_api.clone(),
-            log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
-            rosemary_gate: rosemary_gate.clone(),
-            remote_override: Some(remote_a_api.clone()),
-            connect_attempts: None,
-        };
-        let ctx_b2 = HostCtx {
-            env_state_dir: state_dir.clone(), host: test_host("alpha-beta"), local: local_api.clone(),
-            log: log.clone(), close_remote_on_local_close: false, closes: closes.clone(), names: names.clone(),
-            rosemary_gate: rosemary_gate.clone(),
-            remote_override: Some(remote_b_api.clone()),
-            connect_attempts: None,
-        };
-        let restart_request_index = local.requests().len();
-        let task_a2 = tokio::spawn(host_task(ctx_a2, rx_a2));
-        let task_b2 = tokio::spawn(host_task(ctx_b2, rx_b2));
-        tokio::time::timeout(Duration::from_secs(2), ack_rx).await.unwrap().unwrap();
-        wait_until(|| {
-            local.requests()[restart_request_index..]
-                .iter()
-                .any(|request| request["method"] == "pane.report_metadata")
-        })
-        .await;
-        let restarted_requests = local.requests();
-        let restarted_requests = &restarted_requests[restart_request_index..];
-        let capture_snapshot = restarted_requests
-            .iter()
-            .position(|request| request["method"] == "session.snapshot")
-            .unwrap();
-        let first_projection = restarted_requests
-            .iter()
-            .position(|request| request["method"] == "pane.report_metadata")
-            .unwrap();
-        assert!(capture_snapshot < first_projection);
-        assert!(load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie"));
-
-        // Drop the remote event stream under the full host task. Its ordinary
-        // disconnect/backoff/reconnect loop must open a new subscription and
-        // preserve suppression without a direct connected_session call.
-        let subscriptions_before = remote_a.requests().iter().filter(|r| r["method"] == "events.subscribe").count();
-        remote_a.disconnect_subscribers();
-        // The first rung of the reconnect ladder is 30 s, so this waits the host
-        // up rather than waiting it out — through the same
-        // disconnect/backoff/reconnect loop, which is what is under test here.
-        // Repeatedly, because a poke that arrives before the task has reached
-        // its sleep is consumed by the connected phase and the marker with it.
-        let resubscribed = || {
-            remote_a.requests().iter().filter(|r| r["method"] == "events.subscribe").count()
-                > subscriptions_before
-        };
-        for _ in 0..400 {
-            if resubscribed() {
-                break;
-            }
-            crate::state::request_wake(&state_dir, "alpha").unwrap();
-            let _ = tx_a2.try_send(HostSignal::Converge);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(resubscribed(), "the host never reconnected after its stream dropped");
-        assert!(load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie"));
-
-        remote_a.set_snapshot(remote_snapshot("rp-a2", "beta-conductor-rosie", "run-2"));
-        tx_a2.send(HostSignal::Converge).await.unwrap();
-        wait_until(|| {
-            !load_state(&state_dir, "alpha").rosemary_suppressions.contains_key("beta-conductor-rosie")
-                && local.snapshot.lock().unwrap()["agents"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|agent| agent["pane_id"] == "lp-a2")
-                    .and_then(|agent| agent["tokens"]["rosemary_binding"].as_str())
-                    == Some("run-2")
-        })
-        .await;
-
-        let final_snapshot = local.snapshot.lock().unwrap().clone();
-        let conductor = final_snapshot["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|agent| agent["pane_id"] == "lp-a2")
-            .unwrap();
-        assert!(conductor["name"]
-            .as_str()
-            .is_some_and(|name| name.ends_with("-conductor-rosie")));
-        assert_eq!(conductor["present"], true);
-        assert_eq!(conductor["interactive_ready"], true);
-        assert_eq!(conductor["agent_session"]["value"], "session-rp-a2");
-        assert_eq!(conductor["agent_status"], "idle");
-        let workspace = final_snapshot["workspaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|workspace| workspace["workspace_id"] == "lw-a")
-            .unwrap();
-        assert_eq!(workspace["tokens"]["rosemary_project"], "garden");
-        assert_eq!(final_snapshot["agents"][2], native_before);
-        task_a2.abort();
-        task_b2.abort();
-        let _ = tx_a2;
-        let _ = tx_b2;
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

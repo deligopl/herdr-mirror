@@ -451,36 +451,6 @@ pub struct ConvergeDeps {
     /// One planner for the whole local Herdr session. It sees every configured
     /// source before allowing any mirrored dispatch identity.
     pub names: SessionNamePlanner,
-    /// Local `pane.updated` events enter this lightweight gate before they are
-    /// queued to a host task. A converge already in progress checks the marker
-    /// before its next Rosemary write. The marker is only advisory: suppression
-    /// is created solely from the authoritative snapshot read by the host task.
-    pub rosemary_gate: RosemaryProjectionGate,
-}
-
-#[derive(Clone, Default)]
-pub struct RosemaryProjectionGate {
-    pending_local_panes: Arc<Mutex<HashSet<String>>>,
-}
-
-impl RosemaryProjectionGate {
-    pub fn note_local_update(&self, pane_id: &str) {
-        if let Ok(mut pending) = self.pending_local_panes.lock() {
-            pending.insert(pane_id.to_string());
-        }
-    }
-
-    pub fn finish_local_update(&self, pane_id: &str) {
-        if let Ok(mut pending) = self.pending_local_panes.lock() {
-            pending.remove(pane_id);
-        }
-    }
-
-    pub(crate) fn has_local_update(&self, pane_id: &str) -> bool {
-        self.pending_local_panes
-            .lock()
-            .is_ok_and(|pending| pending.contains(pane_id))
-    }
 }
 
 pub struct PaneStatusDeps<'a> {
@@ -488,7 +458,6 @@ pub struct PaneStatusDeps<'a> {
     pub state_dir: &'a std::path::Path,
     pub host_name: &'a str,
     pub log: &'a Logger,
-    pub rosemary_gate: &'a RosemaryProjectionGate,
 }
 
 #[derive(Clone)]
@@ -1909,45 +1878,6 @@ fn ordinary_projected_tokens(tokens: &HashMap<String, String>) -> BTreeMap<Strin
     ordinary
 }
 
-/// A local `pane.updated` is only a doorbell. Read the authoritative pane and,
-/// when Rosemary removed the exact tuple we most recently projected, persist
-/// suppression before the host task is allowed to reconcile again.
-pub async fn capture_local_rosemary_clear(
-    local: &ApiClient,
-    state_dir: &std::path::Path,
-    host_name: &str,
-    local_pane_id: &str,
-    log: &Logger,
-) -> Result<bool> {
-    let mut state = load_state(state_dir, host_name);
-    let Some(entry) = state.panes.values().find(|entry| entry.local_id == local_pane_id) else {
-        return Ok(false);
-    };
-    let (Some(remote_name), Some(projected)) =
-        (entry.remote_agent_name.clone(), entry.projected_rosemary_run.clone())
-    else {
-        return Ok(false);
-    };
-    let snapshot = fetch_snapshot(local).await?;
-    let tokens = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.pane_id == local_pane_id)
-        .map(|agent| &agent.tokens);
-    let cleared = tokens.is_some_and(|tokens| {
-        ROSEMARY_RUN_KEYS.iter().all(|key| !tokens.contains_key(*key))
-    });
-    if !cleared {
-        return Ok(false);
-    }
-    state.rosemary_suppressions.insert(remote_name.clone(), projected);
-    save_state(state_dir, host_name, &state).map_err(|error| {
-        log.log(&format!("[{host_name}] could not persist Rosemary suppression for {remote_name}: {error}"));
-        error
-    })?;
-    Ok(true)
-}
-
 async fn keep_agent_ineligible(
     deps: &PaneStatusDeps<'_>,
     remote_id: &str,
@@ -2045,7 +1975,7 @@ pub async fn push_pane_status(
     desired_name: Option<String>,
     local_agent_present: bool,
 ) {
-    let PaneStatusDeps { local, state_dir, host_name, log, rosemary_gate } = deps;
+    let PaneStatusDeps { local, state_dir, host_name, log } = deps;
     if state.panes.get(remote_id).is_none_or(PaneEntry::is_tombstoned) {
         return;
     }
@@ -2185,35 +2115,6 @@ pub async fn push_pane_status(
             }
             if let Err(error) = local.request("pane.report_metadata", meta).await {
                 log.log(&format!("report_metadata {}: {error}", entry.local_id));
-            }
-            // A local update may have arrived while this converge waited on
-            // earlier RPCs. Read the authoritative snapshot before the next
-            // Rosemary write and reload any durable suppression into this
-            // pass. Herdr exposes no revision/CAS: if an already-started RPC
-            // overwrote a transient clear before this read, there is no clear
-            // left for Mirror to claim it observed.
-            if rosemary_gate.has_local_update(&entry.local_id) {
-                match capture_local_rosemary_clear(local, state_dir, host_name, &entry.local_id, log).await {
-                    Ok(_) => {
-                        if let Some(remote_name) = remote_name {
-                            let durable = load_state(state_dir, host_name);
-                            match durable.rosemary_suppressions.get(remote_name) {
-                                Some(run) => {
-                                    state.rosemary_suppressions.insert(remote_name.to_string(), run.clone());
-                                }
-                                None => {
-                                    state.rosemary_suppressions.remove(remote_name);
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        log.log(&format!(
-                            "[{host_name}] local Rosemary update is pending; projection remains blocked: {error}"
-                        ));
-                        return;
-                    }
-                }
             }
             let (.., projected_rosemary_tokens, projected_run) =
                 projected_tokens(state, remote_name, &agent.tokens);
@@ -2520,7 +2421,6 @@ pub async fn push_statuses(
                 state_dir: &deps.state_dir,
                 host_name: &deps.host.name,
                 log: &deps.log,
-                rosemary_gate: &deps.rosemary_gate,
             },
             &remote_id,
             state,
@@ -2809,31 +2709,6 @@ mod tests {
             self.task.abort();
             let _ = std::fs::remove_file(&self.path);
         }
-    }
-
-    fn local_rosemary_snapshot(local_pane: &str, include_run: bool) -> Value {
-        let tokens = if include_run {
-            json!({"rosemary_binding": "run-1", "rosemary_outcome": "complete",
-                "rosemary_commit": "abc123", "rosemary_summary": "done"})
-        } else {
-            json!({})
-        };
-        json!({
-            "workspaces": [
-                {"workspace_id": "lw", "label": "vps: feature", "tab_count": 1, "pane_count": 1, "active_tab_id": "lt"},
-                {"workspace_id": "native-w", "label": "native", "tab_count": 1, "pane_count": 1, "active_tab_id": "native-t"}],
-            "tabs": [{"tab_id": "lt", "workspace_id": "lw", "label": "main"},
-                {"tab_id": "native-t", "workspace_id": "native-w", "label": "main"}],
-            "panes": [{"pane_id": local_pane, "tab_id": "lt", "workspace_id": "lw", "label": null,
-                    "cwd": "/tmp", "foreground_cwd": "/tmp"},
-                {"pane_id": "native-p", "tab_id": "native-t", "workspace_id": "native-w", "label": null,
-                    "cwd": "/native", "foreground_cwd": "/native"}],
-            "agents": [{"pane_id": local_pane, "agent": "codex", "name": "vps-conductor-rosie",
-                    "agent_status": "idle", "tokens": tokens},
-                {"pane_id": "native-p", "agent": "codex", "name": "native-agent", "agent_status": "idle",
-                    "interactive_ready": true, "agent_session": {"value": "native-session"}, "tokens": {}}],
-            "layouts": []
-        })
     }
 
     fn ssh_host() -> HostConfig {
@@ -3128,14 +3003,12 @@ mod tests {
             ..AgentInfo::default()
         };
         let log = Logger::new(&state_dir, false);
-        let rosemary_gate = RosemaryProjectionGate::default();
         push_pane_status(
             &PaneStatusDeps {
                 local: &local_api,
                 state_dir: &state_dir,
                 host_name: "configured-host",
                 log: &log,
-                rosemary_gate: &rosemary_gate,
             },
             "remote-pane",
             &mut state,
@@ -3192,7 +3065,6 @@ mod tests {
                 state_dir: &state_dir,
                 host_name: "configured-host",
                 log: &Logger::new(&state_dir, false),
-                rosemary_gate: &RosemaryProjectionGate::default(),
             },
             "remote-pane",
             &mut state,
@@ -3259,7 +3131,6 @@ mod tests {
                 state_dir: &state_dir,
                 host_name: "configured-host",
                 log: &log,
-                rosemary_gate: &RosemaryProjectionGate::default(),
             },
             "remote-pane",
             &mut state,
@@ -3333,7 +3204,6 @@ mod tests {
                     state_dir: &state_dir,
                     host_name: "configured-host",
                     log: &Logger::new(&state_dir, false),
-                    rosemary_gate: &RosemaryProjectionGate::default(),
                 },
                 "remote-pane",
                 &mut state,
@@ -3361,7 +3231,6 @@ mod tests {
                 state_dir: &state_dir,
                 host_name: "configured-host",
                 log: &Logger::new(&state_dir, false),
-                rosemary_gate: &RosemaryProjectionGate::default(),
             },
             "remote-pane",
             &mut state,
@@ -3428,7 +3297,6 @@ mod tests {
                     state_dir: &state_dir,
                     host_name: "configured-host",
                     log: &Logger::new(&state_dir, false),
-                    rosemary_gate: &RosemaryProjectionGate::default(),
                 },
                 "remote-pane",
                 &mut state,
@@ -3452,50 +3320,6 @@ mod tests {
                 .count(),
             1
         );
-        let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
-    async fn local_clear_is_not_acknowledged_when_the_suppression_cannot_be_saved() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let state_dir = std::env::temp_dir().join(format!(
-            "hm-rosemary-save-failure-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&state_dir);
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let local = FakePeer::start("save-failure", local_rosemary_snapshot("lp", false)).await;
-        let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let mut state = HostState::default();
-        state.panes.insert(
-            "rp".into(),
-            PaneEntry {
-                local_id: "lp".into(),
-                remote_agent_name: Some("conductor-rosie".into()),
-                projected_rosemary_run: Some(RosemaryRun {
-                    binding: "run-1".into(),
-                    outcome: Some("complete".into()),
-                    commit: Some("abc123".into()),
-                    summary: Some("done".into()),
-                }),
-                ..PaneEntry::default()
-            },
-        );
-        save_state(&state_dir, "vps", &state).unwrap();
-        let path = crate::state::state_path(&state_dir, "vps");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let result = capture_local_rosemary_clear(
-            &local_api,
-            &state_dir,
-            "vps",
-            "lp",
-            &Logger::new(&state_dir, false),
-        )
-        .await;
-        assert!(result.is_err(), "a failed durable write must not acknowledge the clear");
-        assert!(load_state(&state_dir, "vps").rosemary_suppressions.is_empty());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
