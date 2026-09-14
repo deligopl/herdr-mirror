@@ -81,6 +81,11 @@ pub struct Args {
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
     pub ctl_path: Option<String>,
+    /// Daemon-owned API forward used for pane metadata.  It is a local Unix
+    /// socket even when its remote side is direct-tcpip.
+    pub api_socket: Option<String>,
+    /// Mirror host key for the daemon's shared HostHealth admission gate.
+    pub host_name: Option<String>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
 }
@@ -108,6 +113,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         max_cols: None,
         max_rows: None,
         ctl_path: None,
+        api_socket: None,
+        host_name: None,
         container: None,
     };
     let mut container_name: Option<String> = None;
@@ -146,6 +153,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     .filter(|&n| n > 0)
             }
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
+            "--api-socket" => args.api_socket = Some(next("--api-socket")?),
+            "--host-name" => args.host_name = Some(next("--host-name")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,
@@ -1010,6 +1019,7 @@ const OUTPUT_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 /// Stream children notice it quickly, leave through their normal attach-client
 /// cleanup, and let the stable supervisor keep the local pane alive.
 const STREAM_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const HOST_HEALTH_WAIT: Duration = Duration::from_secs(1);
 
 /// Spread an explicit all-pane resume over eight seconds. This is deliberately
 /// a stable local calculation rather than a scheduler: every supervisor can
@@ -1020,6 +1030,20 @@ const STREAM_RESUME_SLOT: Duration = Duration::from_millis(100);
 
 fn stream_may_connect(state_dir: &std::path::Path) -> bool {
     !crate::daemon::streams_paused(state_dir)
+}
+
+/// Pane processes are consumers of daemon health, never additional health
+/// trial owners.  While the daemon publishes a pending retry, every streamer
+/// waits on local state instead of adding session, cleanup or metadata work to
+/// the failed host.  Missing health remains permissive for standalone pane
+/// mode and the instant before a daemon's first successful sync.
+fn host_admission_open(
+    state_dir: &std::path::Path,
+    host_name: Option<&str>,
+) -> bool {
+    host_name
+        .and_then(|host| crate::state::read_host_health(state_dir, host))
+        .is_none_or(|health| health.next_retry_unix.is_none())
 }
 
 fn stream_resume_delay(local_pane_id: &str) -> Duration {
@@ -1149,6 +1173,9 @@ impl App {
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
     fn spawn_foreground_poll(&mut self, force: bool) {
+        if !host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+            return;
+        }
         let now = Instant::now();
         if !force && self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
             return;
@@ -1165,6 +1192,7 @@ impl App {
         let session = self.args.session.clone();
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
+        let api_socket = self.args.api_socket.clone();
         let container = self.args.container.clone();
         tokio::spawn(async move {
             // dropped on completion or cancellation, so the gate never stays
@@ -1177,6 +1205,7 @@ impl App {
                     session.as_deref(),
                     &pane,
                     ctl.as_deref(),
+                    api_socket.as_deref(),
                     container.as_ref(),
                 )
                 .await;
@@ -1353,6 +1382,12 @@ impl App {
         // the new session repaints from scratch, so a span from the old one
         // points at text that no longer exists
         self.select.clear();
+        if !host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+            self.renderer.status("waiting for Mirror host health trial");
+            self.paint();
+            self.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, m));
+            return;
+        }
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
             Mode::Control => self.control_size(),
@@ -2445,6 +2480,14 @@ pub async fn run(args: Args) -> Result<()> {
                     app.paint();
                     break;
                 }
+                if !host_admission_open(&state_dir, app.args.host_name.as_deref())
+                    && app.session.is_some()
+                {
+                    app.stop_session();
+                    app.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, app.mode));
+                    app.renderer.status("waiting for Mirror host health trial");
+                    app.paint();
+                }
             }
             _ = sleep => {
                 let now = Instant::now();
@@ -2502,7 +2545,9 @@ pub async fn run(args: Args) -> Result<()> {
     // Bounded by REMOTE_KILL_TIMEOUT for the batch: a supervisor waiting to
     // replace this child, or a pane closing, must not be held up. Whatever is
     // left unconfirmed stays recorded for the next streamer of this pane.
-    app.reap_remote_clients().await;
+    if host_admission_open(&state_dir, app.args.host_name.as_deref()) {
+        app.reap_remote_clients().await;
+    }
     // A record outliving its streamer would let the sweep judge a pane that no
     // longer has one; that pane's recovery is `heal_zombie_mirrors`, not a
     // restart request addressed to nobody.
@@ -2932,6 +2977,44 @@ mod tests {
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
     }
 
+    #[test]
+    fn disconnected_host_health_admits_no_pane_attempts_until_daemon_success() {
+        let state = std::env::temp_dir().join(format!(
+            "mirror-host-admission-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        crate::state::publish_host_health(
+            &state,
+            "cargo",
+            &crate::state::HostHealth {
+                summary: "disconnected (hung transport)".into(),
+                at_iso: "2026-09-14T10:00:00Z".into(),
+                next_retry_unix: Some(crate::state::unix_now() + 300.0),
+            },
+        );
+        let mut new_attempts = 0;
+        for _ in 0..600 {
+            if host_admission_open(&state, Some("cargo")) {
+                new_attempts += 1;
+            }
+        }
+        assert_eq!(new_attempts, 0, "local retries admitted new transport attempts");
+
+        crate::state::publish_host_health(
+            &state,
+            "cargo",
+            &crate::state::HostHealth {
+                summary: "connected and synced".into(),
+                at_iso: "2026-09-14T10:05:00Z".into(),
+                next_retry_unix: None,
+            },
+        );
+        assert!(host_admission_open(&state, Some("cargo")));
+        let _ = std::fs::remove_dir_all(state);
+    }
+
     fn test_args(container: Option<ContainerArg>) -> Args {
         Args {
             ssh_target: "omnidev-greenroom".into(),
@@ -2946,6 +3029,8 @@ mod tests {
             max_cols: None,
             max_rows: None,
             ctl_path: None,
+            api_socket: None,
+            host_name: None,
             container,
         }
     }

@@ -36,9 +36,16 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    /// A client for an already-selected socket, without an extra ping.
+    /// Callers that need capability probing use `connect`; pane metadata polls
+    /// already make real requests and should not double their connection load.
+    pub fn at(socket_path: &Path) -> ApiClient {
+        ApiClient { socket_path: socket_path.to_path_buf() }
+    }
+
     /// Connect-check the socket (one ping round-trip), then hand back a client.
     pub async fn connect(socket_path: &Path) -> Result<ApiClient> {
-        let client = ApiClient { socket_path: socket_path.to_path_buf() };
+        let client = ApiClient::at(socket_path);
         client.request("ping", json!({})).await?;
         Ok(client)
     }

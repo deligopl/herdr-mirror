@@ -1,6 +1,7 @@
 // hosts.toml loader. Real TOML via the `toml` crate (the TS version hand-rolled
 // a subset only because it had to stay dependency-free).
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -103,6 +104,10 @@ pub struct HostConfig {
     pub session: Option<String>,
     /// ssh hosts only; see `ApiTransport`. Default `Auto`.
     pub api_transport: ApiTransport,
+    /// Optional private Herdr API endpoint on the remote host.  This is not the
+    /// server's native Unix socket and never replaces status discovery: it is
+    /// an explicitly-owned loopback bridge selected for OpenSSH direct-tcpip.
+    pub api_tcp_endpoint: Option<SocketAddrV4>,
     /// keep each mirror pane in control (writable, no idle release, and sized to
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
@@ -182,6 +187,7 @@ struct RawHost {
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
+    api_tcp_endpoint: Option<String>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -312,6 +318,30 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 }
             },
         };
+        let api_tcp_endpoint = match h.api_tcp_endpoint.as_deref() {
+            None => None,
+            Some(raw) => match raw.parse::<SocketAddrV4>() {
+                Ok(endpoint)
+                    if endpoint.ip() == &Ipv4Addr::LOCALHOST && endpoint.port() != 0 =>
+                {
+                    Some(endpoint)
+                }
+                _ => {
+                    warnings.push(format!(
+                        "skipping host: [hosts.{name}]: api_tcp_endpoint must be canonical \
+                         IPv4 loopback 127.0.0.1:<port>, with port 1-65535"
+                    ));
+                    continue;
+                }
+            },
+        };
+        if api_tcp_endpoint.is_some() && api_transport != ApiTransport::Socket {
+            warnings.push(format!(
+                "skipping host: [hosts.{name}]: api_tcp_endpoint requires \
+                 api_transport = \"socket\""
+            ));
+            continue;
+        }
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
@@ -322,6 +352,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
+            api_tcp_endpoint,
             kind,
             target,
             name,
@@ -546,6 +577,32 @@ mod tests {
 
         let c = parse_config("[hosts.a]\ntarget = \"a\"\napi_transport = \"exec\"\n").unwrap();
         assert_eq!(c.hosts[0].api_transport, ApiTransport::Exec);
+    }
+
+    #[test]
+    fn tcp_api_endpoint_is_private_explicit_and_paired_with_socket_transport() {
+        let c = parse_config(
+            "[hosts.cargo]\ntarget = \"odx-cargo.sbx\"\n\
+             api_transport = \"socket\"\napi_tcp_endpoint = \"127.0.0.1:24680\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.hosts[0].api_tcp_endpoint,
+            Some("127.0.0.1:24680".parse().unwrap())
+        );
+
+        for endpoint in ["0.0.0.0:24680", "127.0.0.1:0", "[::1]:24680", "localhost:24680"] {
+            let text = format!(
+                "[hosts.cargo]\ntarget = \"odx-cargo.sbx\"\napi_transport = \"socket\"\napi_tcp_endpoint = \"{endpoint}\"\n"
+            );
+            assert!(parse_config(&text).unwrap_err().to_string().contains("127.0.0.1"));
+        }
+        let wrong_transport =
+            "[hosts.cargo]\ntarget = \"odx-cargo.sbx\"\napi_transport = \"exec\"\napi_tcp_endpoint = \"127.0.0.1:24680\"\n";
+        assert!(parse_config(wrong_transport)
+            .unwrap_err()
+            .to_string()
+            .contains("requires api_transport"));
     }
 
     /// An unknown value must be as loud as any other malformed host: skipped

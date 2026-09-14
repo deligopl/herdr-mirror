@@ -637,6 +637,10 @@ pub(crate) fn cmd_for_pane(
     let max_rows = host.max_rows;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
+    let host_name = host.name.clone();
+    let api_socket = host
+        .api_tcp_endpoint
+        .map(|_| crate::remote::forward_socket_path(state_dir, &host.name).display().to_string());
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
     let ctl_path = crate::remote::control_path(state_dir, &host.name)
@@ -649,6 +653,8 @@ pub(crate) fn cmd_for_pane(
             "pane".into(),
             target.clone(),
             pane_id.to_string(),
+            "--host-name".into(),
+            host_name.clone(),
         ];
         // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
         // defaults to the same resolution so the argv stays short
@@ -675,6 +681,9 @@ pub(crate) fn cmd_for_pane(
         match &kind {
             crate::config::HostKind::Ssh => {
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+                if let Some(socket) = &api_socket {
+                    argv.extend(["--api-socket".into(), socket.clone()]);
+                }
             }
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
@@ -2724,6 +2733,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
+            api_tcp_endpoint: None,
         }
     }
 
@@ -3434,6 +3444,8 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
+                "--host-name",
+                "vps",
                 // no --remote-bin: auto (PATH then ~/.local/bin/herdr)
                 "--always-control",
                 "--ctl-path",
@@ -3458,6 +3470,8 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
+                "--host-name",
+                "vps",
                 "--remote-bin",
                 "/opt/herdr",
                 "--always-control",
@@ -3479,6 +3493,8 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
+                "--host-name",
+                "vps",
                 "--session",
                 "work",
                 "--always-control",
@@ -3507,6 +3523,8 @@ mod tests {
                 "pane",
                 "/Users/n/proj",
                 "w1:p1",
+                "--host-name",
+                "token",
                 "--always-control",
                 // no identity token at all: healing asks herdr per pane
                 "--container-folder",
@@ -3549,8 +3567,19 @@ mod tests {
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
+            ["pane", "vps", "w1:p1", "--host-name", "vps", "--ctl-path", "/state/vps.ctl"]
         );
+    }
+
+    #[test]
+    fn tcp_api_socket_reaches_the_streamer_metadata_path() {
+        let mut host = ssh_host();
+        host.api_transport = crate::config::ApiTransport::Socket;
+        host.api_tcp_endpoint = Some("127.0.0.1:24680".parse().unwrap());
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert_eq!(parsed.host_name.as_deref(), Some("vps"));
+        assert_eq!(parsed.api_socket.as_deref(), Some("/state/vps-api.sock"));
     }
 
     /// An uncapped host's argv must not grow, and a capped one must round-trip

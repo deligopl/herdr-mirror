@@ -504,12 +504,19 @@ pub(crate) fn control_path(state_dir: &std::path::Path, host_name: &str) -> Path
     state_dir.join(format!("{}.ctl", socket_stem(state_dir, host_name)))
 }
 
+pub(crate) fn forward_socket_path(
+    state_dir: &std::path::Path,
+    host_name: &str,
+) -> PathBuf {
+    state_dir.join(format!("{}-api.sock", socket_stem(state_dir, host_name)))
+}
+
 impl RemoteHost {
     pub fn new(cfg: &HostConfig, state_dir: &std::path::Path) -> RemoteHost {
         let stem = socket_stem(state_dir, &cfg.name);
         RemoteHost {
             ctl_path: state_dir.join(format!("{stem}.ctl")),
-            fwd_sock: state_dir.join(format!("{stem}-api.sock")),
+            fwd_sock: forward_socket_path(state_dir, &cfg.name),
             transport_hint: cfg.api_transport,
             cfg: cfg.clone(),
             forwarded: false,
@@ -695,7 +702,7 @@ impl RemoteHost {
             self.forwarded = true;
             return Ok(self.fwd_sock.clone());
         }
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+        let spec = self.api_forward_spec(remote_socket);
         // a dead process can leave the forward registered on the master with
         // its socket file unlinked — cancel before re-adding
         let mut cancel = self.base_args();
@@ -710,6 +717,24 @@ impl RemoteHost {
         }
         self.forwarded = true;
         Ok(self.fwd_sock.clone())
+    }
+
+    /// OpenSSH `-L` spec for the configured API path.
+    ///
+    /// Without an explicit TCP endpoint the established streamlocal behavior
+    /// remains unchanged.  With one, the local side is still a mode-private
+    /// Unix socket while the remote side is exactly the validated guest
+    /// loopback address.  No shell parses this value.
+    fn api_forward_spec(&self, remote_socket: &str) -> String {
+        match self.cfg.api_tcp_endpoint {
+            Some(endpoint) => format!(
+                "{}:{}:{}",
+                self.fwd_sock.display(),
+                endpoint.ip(),
+                endpoint.port()
+            ),
+            None => format!("{}:{}", self.fwd_sock.display(), remote_socket),
+        }
     }
 
     /// Try the streamlocal `-L` forward, verified with a real ping — not just
@@ -736,7 +761,7 @@ impl RemoteHost {
     /// socket file unlinked. Unlike `forward_api`'s guard this cannot steal a
     /// healthy forward: it only runs after a real ping failed.
     async fn cancel_forward(&mut self, remote_socket: &str) {
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+        let spec = self.api_forward_spec(remote_socket);
         let mut args = self.base_args();
         args.extend(["-O".into(), "cancel".into(), "-L".into(), spec, self.cfg.target.clone()]);
         let _ = ssh(&args, 15000).await;
@@ -793,6 +818,12 @@ impl RemoteHost {
                 != ApiTransport::Exec;
 
         if start_with_socket {
+            if let Some(endpoint) = self.cfg.api_tcp_endpoint {
+                self.log.log(&format!(
+                    "[{}] API forward via private remote loopback {}",
+                    self.cfg.name, endpoint
+                ));
+            }
             match self.try_socket_transport(remote_socket).await {
                 Ok(api) => {
                     self.last_api_transport = Some(ApiTransport::Socket);
@@ -947,6 +978,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             api_transport: ApiTransport::Auto,
+            api_tcp_endpoint: None,
             always_control: true,
         }
     }
@@ -1374,6 +1406,21 @@ while :; do /bin/sleep 1; done
         let deep = PathBuf::from("/Users/example/".to_string() + &"d".repeat(80));
         assert_ne!(socket_stem(&deep, "alpha-host-name"), socket_stem(&deep, "beta-host-name"));
         assert!(!socket_stem(&deep, "alpha-host-name").is_empty());
+    }
+
+    #[test]
+    fn explicit_tcp_api_uses_direct_tcpip_without_rewriting_native_status_socket() {
+        let state = test_path("tcp-api-forward");
+        let mut cfg = ssh_host("cargo");
+        cfg.api_transport = ApiTransport::Socket;
+        cfg.api_tcp_endpoint = Some("127.0.0.1:24680".parse().unwrap());
+        let remote = RemoteHost::new(&cfg, &state);
+        let native = "/home/agent/.config/herdr/herdr.sock";
+        assert_eq!(
+            remote.api_forward_spec(native),
+            format!("{}:127.0.0.1:24680", remote.fwd_sock.display())
+        );
+        assert!(!remote.api_forward_spec(native).contains(native));
     }
 
     #[test]

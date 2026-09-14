@@ -1802,6 +1802,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             remote_bin: None,
             session: None,
             api_transport: crate::config::ApiTransport::Auto,
+            api_tcp_endpoint: None,
             always_control: true,
             max_cols: None,
             max_rows: None,

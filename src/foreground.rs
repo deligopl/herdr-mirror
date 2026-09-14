@@ -9,6 +9,7 @@
 // stand-in until herdr exposes the pane's mouse-reporting state through the API.
 
 use std::ffi::OsStr;
+use std::path::Path;
 
 use crate::pane::sh_quote;
 use crate::remote::{ssh_with_program, SSH_COMMON_OPTS};
@@ -174,8 +175,33 @@ pub async fn poll(
     session: Option<&str>,
     pane: &str,
     ctl_path: Option<&str>,
+    api_socket: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
 ) -> (Option<Fg>, Option<u64>) {
+    // A selected API forward already reaches this exact Herdr server.  Keep
+    // foreground classification and revision on that transport as well: each
+    // API call is a fresh direct-tcpip channel, but neither is an ssh `session`
+    // channel and neither invokes the sandbox lifecycle-gated exec path.
+    if let Some(socket) = api_socket {
+        let api = crate::api::ApiClient::at(Path::new(socket));
+        let pane_value = match api
+            .request("pane.get", serde_json::json!({ "pane_id": pane }))
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return (None, None),
+        };
+        let process_value = match api
+            .request("pane.process_info", serde_json::json!({ "pane_id": pane }))
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return (None, None),
+        };
+        let pane_json = serde_json::json!({ "result": pane_value }).to_string();
+        let process_json = serde_json::json!({ "result": process_value }).to_string();
+        return (classify(&pane_json, &process_json), revision(&pane_json));
+    }
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
     // both answers in ONE hop: same ssh round trip cost as the old single query
@@ -287,6 +313,54 @@ mod tests {
         assert_eq!(classify(&none, "not json"), None);
         assert_eq!(classify("not json", &proc_with("zsh")), None);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_api_metadata_never_falls_through_to_ssh() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = std::env::temp_dir().join(format!("fg-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let line = lines.next_line().await.unwrap().unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                let result = match request["method"].as_str().unwrap() {
+                    "pane.get" => serde_json::json!({
+                        "pane": { "pane_id": "w1:p1", "agent": "codex", "revision": 42 }
+                    }),
+                    "pane.process_info" => serde_json::json!({
+                        "process_info": { "foreground_processes": [{ "name": "node" }] }
+                    }),
+                    other => panic!("unexpected method {other}"),
+                };
+                let response = serde_json::json!({ "id": id, "result": result }).to_string() + "\n";
+                write.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let socket_text = socket.to_string_lossy().into_owned();
+        let (fg, revision) = poll(
+            "ssh-must-not-run.invalid",
+            None,
+            None,
+            "w1:p1",
+            None,
+            Some(&socket_text),
+            None,
+        )
+        .await;
+        server.await.unwrap();
+        assert_eq!(fg, Some(Fg::Agent));
+        assert_eq!(revision, Some(42));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +411,7 @@ mod hung_poll_is_bounded {
         };
 
         let started = Instant::now();
-        let (fg, revision) = poll("unused", None, None, "w1:p1", None, Some(&container)).await;
+        let (fg, revision) = poll("unused", None, None, "w1:p1", None, None, Some(&container)).await;
         let took = started.elapsed();
 
         // the deadline held: it returned, and near the ceiling rather than at
@@ -426,7 +500,7 @@ mod one_poll_per_pane {
         Some(tokio::spawn(async move {
             let permit = permit;
             loop {
-                let _ = poll("unused", None, None, "w1:p1", None, Some(ct.as_ref())).await;
+                let _ = poll("unused", None, None, "w1:p1", None, None, Some(ct.as_ref())).await;
                 if !permit.another_pass_wanted() {
                     break;
                 }
