@@ -317,32 +317,48 @@ pub fn clear_stream_health(state_dir: &Path, local_pane_id: &str) {
     let _ = std::fs::remove_file(stream_health_path(state_dir, local_pane_id));
 }
 
-/// How long the remote may have produced output that never arrived before the
-/// stream is called stalled.
+/// How long the remote may have produced output that never arrived, AND the
+/// local pane may have drawn nothing at all, before the stream is called
+/// stalled.
 ///
-/// Well above any latency this transport shows — the measured worst single
-/// keystroke round trip through Mirror on this fleet is 304 ms — and above the
-/// streamer's own reconnect ladder, so a stream that is merely re-attaching is
-/// never mistaken for a dead one.
-pub const OUTPUT_STALL_GRACE_SECS: f64 = 45.0;
+/// Raised from 45 s on 2026-09-15. At 45 s this window was shorter than the
+/// daemon's own 60 s heal sweep, so a pane that tripped the verdict once
+/// tripped it on every sweep: the two Codex workspaces (cfo-studio and
+/// cargo-studio) accounted for 137 of 146 streamer restarts in a day, and on
+/// CFO every one of them named the same agent pane. Three minutes is longer
+/// than any drawing gap a working agent pane shows and still well inside the
+/// hours-long freeze this policy exists to end.
+pub const OUTPUT_STALL_GRACE_SECS: f64 = 180.0;
 
 /// Whether a live streamer's OUTPUT direction has stalled.
 ///
-/// Neither half means anything alone. A mirror pane showing nothing may simply
-/// have nothing to show, which is why silence is not the signal; and a remote
-/// pane that produced output proves nothing on its own, because the frame may
-/// still be in flight. Stalled is the conjunction: the remote definitely
-/// produced output at a moment, no frame has arrived since that moment, and
-/// enough time has passed that ordinary latency cannot explain it.
+/// No single clock means anything alone. A mirror pane showing nothing may
+/// simply have nothing to show, which is why silence is not the signal; and a
+/// remote pane that produced output proves nothing on its own, because the
+/// frame may still be in flight. Stalled is the conjunction of three facts:
+/// the remote definitely produced output at a moment, no frame has arrived
+/// since that moment, and THIS STREAMER HAS DRAWN NOTHING for longer than the
+/// grace.
 ///
-/// Pure, because the two clocks and the three-way comparison are the whole
-/// decision and the live shape it was written from cannot be reproduced on
-/// demand.
+/// That third clause is the 2026-09-15 fix. Without it the verdict rested on
+/// an ordering between two different measurements — a revision the foreground
+/// poll happened to observe, and the arrival of a frame — and any remote bump
+/// that produces no drawable frame satisfies it permanently: `last_frame` is
+/// pinned below `advanced` and never climbs back, so the pane is condemned on
+/// every sweep for as long as it lives. A Codex agent pane bumps its revision
+/// that way, which is why the restart log was two workspaces and one pane.
+/// Frames drawn is the direct measurement of the direction being judged: a
+/// stream that is painting is carrying output, whatever any revision says.
+///
+/// Pure, because the three clocks and their comparison are the whole decision
+/// and the live shape it was written from cannot be reproduced on demand.
 pub fn output_direction_stalled(health: &StreamHealth, now: f64, grace_secs: f64) -> bool {
     let Some(advanced) = health.remote_advanced_unix else {
         return false; // the remote has produced nothing we know of
     };
-    health.last_frame_unix < advanced && now - advanced >= grace_secs
+    health.last_frame_unix < advanced
+        && now - advanced >= grace_secs
+        && now - health.last_frame_unix >= grace_secs
 }
 
 /// An explicit "replace the streamer in this pane", written by the daemon's
@@ -527,26 +543,32 @@ mod tests {
     #[test]
     fn only_output_the_remote_produced_and_never_delivered_counts_as_a_stall() {
         let grace = OUTPUT_STALL_GRACE_SECS;
-        let now = 1_000.0;
+        let now = 10_000.0;
 
         // idle: nothing produced remotely, nothing drawn locally. Not a stall,
         // and this is the common case — most mirror panes sit at a prompt.
         assert!(!output_direction_stalled(
-            &StreamHealth { last_frame_unix: 100.0, remote_advanced_unix: None },
+            &StreamHealth { last_frame_unix: now - 9_000.0, remote_advanced_unix: None },
             now,
             grace
         ));
 
         // healthy: the remote produced output and a frame arrived after it
         assert!(!output_direction_stalled(
-            &StreamHealth { last_frame_unix: 901.0, remote_advanced_unix: Some(900.0) },
+            &StreamHealth {
+                last_frame_unix: now - 99.0,
+                remote_advanced_unix: Some(now - 100.0),
+            },
             now,
             grace
         ));
 
         // in flight: produced, not yet delivered, but only a moment ago
         assert!(!output_direction_stalled(
-            &StreamHealth { last_frame_unix: 900.0, remote_advanced_unix: Some(999.0) },
+            &StreamHealth {
+                last_frame_unix: now - 100.0,
+                remote_advanced_unix: Some(now - 1.0),
+            },
             now,
             grace
         ));
@@ -556,17 +578,76 @@ mod tests {
         // consults, because a working input direction is exactly what made the
         // freeze invisible to every existing check.
         assert!(output_direction_stalled(
-            &StreamHealth { last_frame_unix: 500.0, remote_advanced_unix: Some(900.0) },
+            &StreamHealth {
+                last_frame_unix: now - (grace + 400.0),
+                remote_advanced_unix: Some(now - (grace + 100.0)),
+            },
             now,
             grace
         ));
 
         // and the boundary is inclusive, so a sweep landing exactly on it acts
         assert!(output_direction_stalled(
-            &StreamHealth { last_frame_unix: 500.0, remote_advanced_unix: Some(now - grace) },
+            &StreamHealth {
+                last_frame_unix: now - (grace + 400.0),
+                remote_advanced_unix: Some(now - grace),
+            },
             now,
             grace
         ));
+    }
+
+    /// The regression this policy grew on 2026-09-15: a pane that is drawing.
+    ///
+    /// The shape comes from cfo-studio's agent pane, which was restarted on
+    /// every 60 s sweep for hours while a Codex agent typed into it and it
+    /// painted throughout. Its revision advanced (the poll saw it) after the
+    /// frame that was on screen at that instant, and nothing ever lifted
+    /// `last_frame` back above `advanced` — so the old two-clause verdict was
+    /// permanently true. Drawn frames are the tiebreak.
+    #[test]
+    fn a_pane_that_is_still_drawing_is_never_stalled_however_old_the_revision() {
+        let grace = OUTPUT_STALL_GRACE_SECS;
+        let now = 10_000.0;
+
+        // the agent pane: revision advanced long ago and after the frame the
+        // poll raced, but frames have kept arriving ever since
+        assert!(!output_direction_stalled(
+            &StreamHealth {
+                last_frame_unix: now - 0.4,
+                remote_advanced_unix: Some(now - 3_600.0),
+            },
+            now,
+            grace
+        ));
+
+        // sparse but alive: one frame just inside the grace still acquits
+        assert!(!output_direction_stalled(
+            &StreamHealth {
+                last_frame_unix: now - (grace - 0.1),
+                remote_advanced_unix: Some(now - 3_600.0),
+            },
+            now,
+            grace
+        ));
+
+        // and the dead direction is still convicted: nothing drawn for the
+        // whole grace, with the remote known to have produced output
+        assert!(output_direction_stalled(
+            &StreamHealth {
+                last_frame_unix: now - (grace + 1.0),
+                remote_advanced_unix: Some(now - grace),
+            },
+            now,
+            grace
+        ));
+    }
+
+    /// The grace must outlast the sweep that consumes it, or one verdict
+    /// becomes a restart per sweep for as long as the condition holds.
+    #[test]
+    fn the_stall_grace_is_longer_than_the_daemon_heal_sweep() {
+        assert!(OUTPUT_STALL_GRACE_SECS >= 120.0, "{OUTPUT_STALL_GRACE_SECS}");
     }
 
     #[test]

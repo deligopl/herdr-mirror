@@ -961,8 +961,10 @@ struct App {
     /// screen rows the selection overlay covered on the last paint, so they can
     /// be repainted when it moves away
     last_select_rows: Option<(usize, usize)>,
-    /// last time a foreground poll was kicked off (throttles the ssh handshakes)
+    /// last time a foreground poll was kicked off (throttles the polls)
     fg_poll_at: Option<Instant>,
+    /// this pane's one metadata channel, shared with the tasks that poll on it
+    fg_poller: crate::foreground::Shared,
     /// when a frame last reached us
     last_frame_at: Instant,
     /// the remote pane's content revision as of the last successful poll, and
@@ -1162,22 +1164,13 @@ impl App {
         }
         self.fg_poll_at = Some(now);
         let tx = self.tx.clone();
-        let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
         let session = self.args.session.clone();
         let pane = self.args.pane_target.clone();
-        let ctl = self.args.ctl_path.clone();
-        let container = self.args.container.clone();
+        let poller = self.fg_poller.clone();
         tokio::spawn(async move {
-            let (fg, revision) = crate::foreground::poll(
-                &ssh,
-                bin.as_deref(),
-                session.as_deref(),
-                &pane,
-                ctl.as_deref(),
-                container.as_ref(),
-            )
-            .await;
+            let (fg, revision) =
+                crate::foreground::poll(&poller, bin.as_deref(), session.as_deref(), &pane).await;
             let _ = tx.send(Msg::Foreground(fg)).await;
             let _ = tx.send(Msg::RemoteRevision(revision)).await;
         });
@@ -2267,6 +2260,19 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
+    // One metadata channel for this pane, opened lazily on the first poll and
+    // kept for the streamer's life (see `poll_channel`).
+    let fg_poller = crate::foreground::shared(match &args.container {
+        Some(ct) => crate::poll_channel::Transport::Docker {
+            docker_bin: ct.docker_bin.clone(),
+            kind: ct.kind.clone(),
+        },
+        None => crate::poll_channel::Transport::Ssh {
+            target: args.ssh_target.clone(),
+            ctl_path: args.ctl_path.clone(),
+        },
+    });
+
     let mut app = App {
         args,
         state_dir: state_dir.clone(),
@@ -2293,6 +2299,7 @@ pub async fn run(args: Args) -> Result<()> {
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,
+        fg_poller,
         last_frame_at: Instant::now(),
         remote_revision: None,
         remote_advanced_at: None,

@@ -27,6 +27,7 @@ mod mirror;
 mod pane;
 mod paste;
 mod pick;
+mod poll_channel;
 mod predict;
 mod remote;
 mod remote_action;

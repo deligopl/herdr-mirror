@@ -8,12 +8,7 @@
 // as a possible mouse-aware TUI and clicks are forwarded. This is a heuristic
 // stand-in until herdr exposes the pane's mouse-reporting state through the API.
 
-use std::process::Stdio;
-
-use tokio::process::Command;
-
 use crate::pane::sh_quote;
-use crate::remote::SSH_COMMON_OPTS;
 
 /// Interactive shells: at a prompt these don't enable mouse reporting, so mouse
 /// events over them should stay local rather than being forwarded to the pty.
@@ -87,70 +82,49 @@ pub fn revision(pane_json: &str) -> Option<u64> {
     pane.get("result")?.get("pane")?.get("revision")?.as_u64()
 }
 
-/// Query the remote pane over ssh: its foreground classification, and its
-/// content revision. `None` on any failure (ssh/network/parse) so the caller
-/// keeps its last known value.
+/// One pane's poller, shared between the pane loop and the tasks it spawns.
+///
+/// A mutex rather than a channel because the serialization IS the feature: one
+/// shell, one script at a time, and a poll that arrives while another is in
+/// flight is dropped rather than queued — it would ask the same question and
+/// get the same answer a moment later.
+pub type Shared = std::sync::Arc<tokio::sync::Mutex<crate::poll_channel::Poller>>;
+
+pub fn shared(transport: crate::poll_channel::Transport) -> Shared {
+    std::sync::Arc::new(tokio::sync::Mutex::new(crate::poll_channel::Poller::new(transport)))
+}
+
+/// Query the remote pane down the pane's existing channel: its foreground
+/// classification, and its content revision. `None` on any failure
+/// (transport/parse) so the caller keeps its last known value.
+///
+/// Both answers still come back in ONE round trip, and since 2026-09-15 that
+/// round trip no longer costs a session: the script is written into the shell
+/// this pane already has open. On a guest behind the loopback bridge that is
+/// the difference between one `exec` per poll and one per streamer.
 pub async fn poll(
-    ssh_target: &str,
+    poller: &Shared,
     remote_bin: Option<&str>,
     session: Option<&str>,
     pane: &str,
-    ctl_path: Option<&str>,
-    container: Option<&crate::pane::ContainerArg>,
 ) -> (Option<Fg>, Option<u64>) {
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
-    // both answers in ONE hop: same ssh round trip cost as the old single query
-    let cmd = format!(
-        "{b} pane get {p}; echo '<<>>'; exec {b} pane process-info --pane {p}",
+    // no `exec` on the second command any more: it would replace the shell we
+    // are keeping, turning every poll back into a new channel
+    let script = format!(
+        "{b} pane get {p}; echo '<<>>'; {b} pane process-info --pane {p}",
         b = bin,
         p = sh_quote(pane)
     );
-    let mut sc = match container {
-        Some(ct) => {
-            // async resolve, not the blocking one: this runs on the pane's
-            // single-threaded runtime and fires on every keystroke burst, so a
-            // blocking `docker ps` would stall input and rendering (and hang
-            // the pane outright if the Docker daemon wedges).
-            //
-            // No ControlMaster equivalent is needed — docker exec is local, so
-            // there is no handshake to amortize.
-            let Some(id) = crate::docker::resolve(&ct.docker_bin, &ct.kind)
-                .await
-                .ok()
-                .and_then(|ids| ids.into_iter().next())
-            else {
-                return (None, None);
-            };
-            let mut c = Command::new(&ct.docker_bin);
-            // `sh -c` not `-lc`: match ssh's non-login remote shell
-            c.args(["exec", &id, "sh", "-c", &cmd]);
-            c
-        }
-        None => {
-            let mut c = Command::new("ssh");
-            // reuse the daemon's ControlMaster when given so the poll skips the
-            // handshake; `-S` without `-M` uses an existing master or, if the socket
-            // isn't there, connects directly — so this degrades gracefully
-            if let Some(path) = ctl_path {
-                c.arg("-S").arg(path);
-            }
-            c.args(SSH_COMMON_OPTS).arg(ssh_target).arg(cmd);
-            c
-        }
-    };
-    let Some(out) = sc
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()
-        .filter(|out| out.status.success())
-    else {
+    // Busy means a poll is already asking this exact question. Skip rather than
+    // wait: the caller keeps its last value and the next tick gets the fresh one.
+    let Ok(mut poller) = poller.try_lock() else {
         return (None, None);
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(text) = poller.ask(&script).await else {
+        return (None, None);
+    };
     let Some((pane_json, proc_json)) = text.split_once("<<>>") else {
         return (None, None);
     };
