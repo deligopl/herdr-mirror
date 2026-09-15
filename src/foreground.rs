@@ -8,21 +8,9 @@
 // as a possible mouse-aware TUI and clicks are forwarded. This is a heuristic
 // stand-in until herdr exposes the pane's mouse-reporting state through the API.
 
-use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::pane::sh_quote;
-use crate::remote::{ssh_with_program, SSH_COMMON_OPTS};
-
-/// How long one metadata poll may take before it is stopped and reaped.
-///
-/// A healthy poll is one ssh round trip over an existing ControlMaster, tens
-/// of milliseconds. This ceiling exists for the unhealthy case: a remote
-/// `herdr pane get` that never answers. Spawning is throttled to
-/// `FG_POLL_INTERVAL`, so bounding each poll here is what keeps the number of
-/// outstanding ones finite rather than growing for as long as the remote stays
-/// unresponsive.
-const FG_POLL_TIMEOUT_MS: u64 = 8_000;
 
 /// Interactive shells: at a prompt these don't enable mouse reporting, so mouse
 /// events over them should stay local rather than being forwarded to the pty.
@@ -72,8 +60,7 @@ pub enum Fg {
 /// foreground process GROUP, so an agent's leaf is whatever tool it just spawned
 /// (`node`, `rg`, `bash`) and moves every few seconds. `agent` does not move.
 pub fn classify(pane_json: &str, proc_json: &str) -> Option<Fg> {
-    let pane: serde_json::Value = serde_json::from_str(pane_json).ok()?;
-    if pane.get("result")?.get("pane")?.get("agent").and_then(|v| v.as_str()).is_some() {
+    if agent_pane(pane_json)? {
         return Some(Fg::Agent);
     }
     let v: serde_json::Value = serde_json::from_str(proc_json).ok()?;
@@ -82,6 +69,17 @@ pub fn classify(pane_json: &str, proc_json: &str) -> Option<Fg> {
     // classifies on `vim`, not `sudo`
     let name = fg.last()?.get("name")?.as_str()?;
     Some(if is_shell(name) { Fg::Shell } else { Fg::Mouse })
+}
+
+/// Has herdr identified an agent CLI in this pane? Read out of the `pane get`
+/// answer on its own, which is what lets a transport that pays per call decide
+/// whether the second call is worth making. `None` when the answer does not
+/// parse or does not describe a pane — never `Some(false)`, because "I could
+/// not tell" and "no agent" lead to different next steps.
+fn agent_pane(pane_json: &str) -> Option<bool> {
+    let pane: serde_json::Value = serde_json::from_str(pane_json).ok()?;
+    let pane = pane.get("result")?.get("pane")?;
+    Some(pane.get("agent").and_then(|v| v.as_str()).is_some())
 }
 
 /// The remote pane's own content revision, from the same `pane get` answer the
@@ -166,96 +164,105 @@ impl Drop for PollPermit {
     }
 }
 
-/// Query the remote pane over ssh: its foreground classification, and its
-/// content revision. `None` on any failure (ssh/network/parse) so the caller
-/// keeps its last known value.
+/// One pane's poller, shared between the pane loop and the tasks it spawns.
+///
+/// A mutex rather than a channel because the serialization IS the feature: one
+/// shell, one script at a time, and a poll that arrives while another is in
+/// flight is dropped rather than queued — it would ask the same question and
+/// get the same answer a moment later.
+pub type Shared = std::sync::Arc<tokio::sync::Mutex<crate::poll_channel::Poller>>;
+
+pub fn shared(transport: crate::poll_channel::Transport) -> Shared {
+    std::sync::Arc::new(tokio::sync::Mutex::new(crate::poll_channel::Poller::new(transport)))
+}
+
+/// Query the remote pane down the pane's existing channel: its foreground
+/// classification, and its content revision. `None` on any failure
+/// (transport/parse) so the caller keeps its last known value.
+///
+/// Both answers still come back in ONE round trip, and since 2026-09-15 that
+/// round trip no longer costs a session: the script is written into the shell
+/// this pane already has open. On a guest behind the loopback bridge that is
+/// the difference between one `exec` per poll and one per streamer.
+///
+/// A host reached over the daemon's API forward (`api_socket`) takes neither:
+/// see `api_poll`.
+/// Pane metadata over the daemon's API forward, for a host that has one.
+///
+/// Why this is not the reused channel below. The channel works because a shell
+/// can be held open and written to again; the Herdr API cannot be used that
+/// way. Its server answers ONE request per connection and closes (see
+/// `api.rs`), so "one long-lived connection per pane" is not a thing this
+/// protocol offers — the only held connection it has is `events.subscribe`,
+/// which pushes events rather than answering questions. Every request is
+/// therefore its own connection, and over the `-L` forward of a sandbox guest
+/// every connection is its own direct-tcpip channel and its own guest `exec`.
+///
+/// What is left is to ask less often and to ask for less. The cadence is the
+/// caller's job (`pane::fg_poll_interval`). Asking for less is this function's:
+/// `pane.get` alone settles the classification whenever herdr has identified an
+/// agent in the pane — which on these hosts is the ordinary case, since they
+/// exist to mirror agent panes — so the second call is made only when the first
+/// one left the question open. An idle agent pane costs one connection per
+/// poll, not two.
+async fn api_poll(socket: &str, pane: &str) -> (Option<Fg>, Option<u64>) {
+    let api = crate::api::ApiClient::at(Path::new(socket));
+    let Ok(pane_value) = api
+        .request("pane.get", serde_json::json!({ "pane_id": pane }))
+        .await
+    else {
+        return (None, None);
+    };
+    let pane_json = serde_json::json!({ "result": pane_value }).to_string();
+    let revision = revision(&pane_json);
+    match agent_pane(&pane_json) {
+        Some(true) => return (Some(Fg::Agent), revision),
+        // unparseable: a second call cannot rescue a first answer we could not
+        // read, and the caller keeps its last classification either way
+        None => return (None, revision),
+        Some(false) => {}
+    }
+    let Ok(process_value) = api
+        .request("pane.process_info", serde_json::json!({ "pane_id": pane }))
+        .await
+    else {
+        return (None, revision);
+    };
+    let process_json = serde_json::json!({ "result": process_value }).to_string();
+    (classify(&pane_json, &process_json), revision)
+}
+
 pub async fn poll(
-    ssh_target: &str,
+    poller: &Shared,
     remote_bin: Option<&str>,
     session: Option<&str>,
     pane: &str,
-    ctl_path: Option<&str>,
     api_socket: Option<&str>,
-    container: Option<&crate::pane::ContainerArg>,
 ) -> (Option<Fg>, Option<u64>) {
-    // A selected API forward already reaches this exact Herdr server.  Keep
-    // foreground classification and revision on that transport as well: each
-    // API call is a fresh direct-tcpip channel, but neither is an ssh `session`
-    // channel and neither invokes the sandbox lifecycle-gated exec path.
+    // A host with a selected API forward answers there and nowhere else: the
+    // forward already reaches this exact Herdr server, and going over an ssh
+    // `session` channel instead would invoke the sandbox's lifecycle-gated
+    // exec path for metadata it is already serving.
     if let Some(socket) = api_socket {
-        let api = crate::api::ApiClient::at(Path::new(socket));
-        let pane_value = match api
-            .request("pane.get", serde_json::json!({ "pane_id": pane }))
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => return (None, None),
-        };
-        let process_value = match api
-            .request("pane.process_info", serde_json::json!({ "pane_id": pane }))
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => return (None, None),
-        };
-        let pane_json = serde_json::json!({ "result": pane_value }).to_string();
-        let process_json = serde_json::json!({ "result": process_value }).to_string();
-        return (classify(&pane_json, &process_json), revision(&pane_json));
+        return api_poll(socket, pane).await;
     }
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
-    // both answers in ONE hop: same ssh round trip cost as the old single query
-    let cmd = format!(
-        "{b} pane get {p}; echo '<<>>'; exec {b} pane process-info --pane {p}",
+    // no `exec` on the second command any more: it would replace the shell we
+    // are keeping, turning every poll back into a new channel
+    let script = format!(
+        "{b} pane get {p}; echo '<<>>'; {b} pane process-info --pane {p}",
         b = bin,
         p = sh_quote(pane)
     );
-    // One guarded spawn for both transports. `remote::ssh_with_program` owns
-    // the complete process group, enforces the deadline and reaps on timeout,
-    // so a poll that never answers is stopped instead of being left behind —
-    // the behaviour a bare `output().await` here did not have.
-    let (program, args) = match container {
-        Some(ct) => {
-            // async resolve, not the blocking one: this runs on the pane's
-            // single-threaded runtime and fires on every keystroke burst, so a
-            // blocking `docker ps` would stall input and rendering (and hang
-            // the pane outright if the Docker daemon wedges).
-            //
-            // No ControlMaster equivalent is needed — docker exec is local, so
-            // there is no handshake to amortize.
-            let Some(id) = crate::docker::resolve(&ct.docker_bin, &ct.kind)
-                .await
-                .ok()
-                .and_then(|ids| ids.into_iter().next())
-            else {
-                return (None, None);
-            };
-            // `sh -c` not `-lc`: match ssh's non-login remote shell
-            (
-                ct.docker_bin.clone(),
-                vec!["exec".to_string(), id, "sh".to_string(), "-c".to_string(), cmd],
-            )
-        }
-        None => {
-            let mut args = Vec::new();
-            // reuse the daemon's ControlMaster when given so the poll skips the
-            // handshake; `-S` without `-M` uses an existing master or, if the socket
-            // isn't there, connects directly — so this degrades gracefully
-            if let Some(path) = ctl_path {
-                args.push("-S".to_string());
-                args.push(path.to_string());
-            }
-            args.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
-            args.push(ssh_target.to_string());
-            args.push(cmd);
-            ("ssh".to_string(), args)
-        }
-    };
-    let out = ssh_with_program(OsStr::new(&program), &args, FG_POLL_TIMEOUT_MS).await;
-    if out.code != 0 {
+    // Busy means a poll is already asking this exact question. Skip rather than
+    // wait: the caller keeps its last value and the next tick gets the fresh one.
+    let Ok(mut poller) = poller.try_lock() else {
         return (None, None);
-    }
-    let text = out.out.as_str();
+    };
+    let Some(text) = poller.ask(&script).await else {
+        return (None, None);
+    };
     let Some((pane_json, proc_json)) = text.split_once("<<>>") else {
         return (None, None);
     };
@@ -314,52 +321,148 @@ mod tests {
         assert_eq!(classify("not json", &proc_with("zsh")), None);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn selected_api_metadata_never_falls_through_to_ssh() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    /// A Herdr API server that answers exactly like the guest's does: one
+    /// request per connection, then close. Every accepted connection is
+    /// recorded, because on a sandbox guest behind the daemon's `-L` forward a
+    /// connection is a direct-tcpip channel and a guest `exec` — so the count
+    /// of accepts IS the cost this ticket is about.
+    struct FakeApi {
+        _dir: std::path::PathBuf,
+        socket: String,
+        methods: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
 
-        let dir = std::env::temp_dir().join(format!("fg-api-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("api.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (read, mut write) = stream.into_split();
-                let mut lines = BufReader::new(read).lines();
-                let line = lines.next_line().await.unwrap().unwrap();
-                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                let id = request["id"].clone();
-                let result = match request["method"].as_str().unwrap() {
-                    "pane.get" => serde_json::json!({
-                        "pane": { "pane_id": "w1:p1", "agent": "codex", "revision": 42 }
-                    }),
-                    "pane.process_info" => serde_json::json!({
-                        "process_info": { "foreground_processes": [{ "name": "node" }] }
-                    }),
-                    other => panic!("unexpected method {other}"),
-                };
-                let response = serde_json::json!({ "id": id, "result": result }).to_string() + "\n";
-                write.write_all(response.as_bytes()).await.unwrap();
+    impl FakeApi {
+        fn start(tag: &str, agent: Option<&'static str>) -> FakeApi {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            let dir = std::env::temp_dir()
+                .join(format!("fg-api-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = methods.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else { return };
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let Ok(Some(line)) = lines.next_line().await else { continue };
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap().to_string();
+                    let result = match method.as_str() {
+                        "pane.get" => match agent {
+                            Some(a) => serde_json::json!({
+                                "pane": { "pane_id": "w1:p1", "agent": a, "revision": 42 }
+                            }),
+                            None => serde_json::json!({
+                                "pane": { "pane_id": "w1:p1", "revision": 42 }
+                            }),
+                        },
+                        "pane.process_info" => serde_json::json!({
+                            "process_info": { "foreground_processes": [{ "name": "vim" }] }
+                        }),
+                        other => panic!("unexpected method {other}"),
+                    };
+                    seen.lock().unwrap().push(method);
+                    let response =
+                        serde_json::json!({ "id": request["id"], "result": result }).to_string()
+                            + "\n";
+                    let _ = write.write_all(response.as_bytes()).await;
+                    // one request per connection, then close — the real server's
+                    // contract, and the reason a connection cannot be reused
+                }
+            });
+            FakeApi {
+                socket: socket.to_string_lossy().into_owned(),
+                methods,
+                server,
+                _dir: dir,
             }
-        });
+        }
 
-        let socket_text = socket.to_string_lossy().into_owned();
+        fn calls(&self) -> Vec<String> {
+            self.methods.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeApi {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
+    /// The poller a host with an API forward is given. If the poll ever falls
+    /// through to it the test fails loudly rather than quietly opening a
+    /// session channel to the guest — the thing `.26` did on these hosts.
+    fn poller_that_must_not_be_used() -> Shared {
+        shared(crate::poll_channel::Transport::Local {
+            program: "/nonexistent/ssh-must-not-run".into(),
+        })
+    }
+
+    /// The socket transport: metadata rides the daemon's API forward, and the
+    /// pane's shell channel is never opened.
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_api_metadata_never_falls_through_to_the_pane_channel() {
+        let api = FakeApi::start("agent", Some("codex"));
+        let (fg, revision) =
+            poll(&poller_that_must_not_be_used(), None, None, "w1:p1", Some(&api.socket)).await;
+        assert_eq!(fg, Some(Fg::Agent));
+        assert_eq!(revision, Some(42));
+    }
+
+    /// The bound this ticket turns on: an agent pane — what these hosts exist
+    /// to mirror — costs ONE connection per poll, because `pane.get` already
+    /// carries the answer `pane.process_info` would be asked for. Twenty idle
+    /// polls are twenty connections, not forty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_agent_pane_costs_one_bridge_connection_per_poll() {
+        let api = FakeApi::start("one-call", Some("codex"));
+        let poller = poller_that_must_not_be_used();
+        for _ in 0..20 {
+            let (fg, revision) = poll(&poller, None, None, "w1:p1", Some(&api.socket)).await;
+            assert_eq!(fg, Some(Fg::Agent));
+            assert_eq!(revision, Some(42));
+        }
+        let calls = api.calls();
+        assert_eq!(calls.len(), 20, "one connection per poll, not two: {calls:?}");
+        assert!(
+            calls.iter().all(|m| m == "pane.get"),
+            "process_info was asked for anyway: {calls:?}"
+        );
+    }
+
+    /// A pane herdr has NOT identified an agent in still needs the second
+    /// question, and still gets it — the saving is a skipped question, never a
+    /// guessed answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pane_without_an_agent_still_pays_for_its_process_group() {
+        let api = FakeApi::start("two-calls", None);
+        let (fg, revision) =
+            poll(&poller_that_must_not_be_used(), None, None, "w1:p1", Some(&api.socket)).await;
+        assert_eq!(fg, Some(Fg::Mouse)); // the stub's leaf is `vim`
+        assert_eq!(revision, Some(42));
+        assert_eq!(api.calls(), vec!["pane.get", "pane.process_info"]);
+    }
+
+    /// A bridge that has gone away costs one failed connection, and the pane
+    /// keeps its last classification rather than being told something false.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreachable_bridge_answers_nothing_and_opens_no_session() {
         let (fg, revision) = poll(
-            "ssh-must-not-run.invalid",
+            &poller_that_must_not_be_used(),
             None,
             None,
             "w1:p1",
-            None,
-            Some(&socket_text),
-            None,
+            Some("/nonexistent/api.sock"),
         )
         .await;
-        server.await.unwrap();
-        assert_eq!(fg, Some(Fg::Agent));
-        assert_eq!(revision, Some(42));
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!((fg, revision), (None, None));
     }
 }
 
@@ -410,17 +513,24 @@ mod hung_poll_is_bounded {
             docker_bin,
         };
 
+        let poller = shared(crate::poll_channel::Transport::Docker {
+            docker_bin: container.docker_bin.clone(),
+            kind: container.kind.clone(),
+        });
+
         let started = Instant::now();
-        let (fg, revision) = poll("unused", None, None, "w1:p1", None, None, Some(&container)).await;
+        let (fg, revision) = poll(&poller, None, None, "w1:p1", None).await;
         let took = started.elapsed();
 
         // the deadline held: it returned, and near the ceiling rather than at
-        // the stub's own 600s
+        // the stub's own 600s. One ceiling, not two — a timed-out ask is not
+        // retried on a fresh channel (see `poll_channel::AskFailure`).
+        let bound = crate::poll_channel::ASK_TIMEOUT;
         assert!(
-            took < Duration::from_millis(FG_POLL_TIMEOUT_MS + 4_000),
+            took < bound + Duration::from_secs(4),
             "poll ran {took:?}, so nothing bounded it"
         );
-        assert!(took >= Duration::from_millis(FG_POLL_TIMEOUT_MS - 1_000));
+        assert!(took >= bound - Duration::from_secs(1));
         // a failed poll says nothing, so the caller keeps its last known value
         assert!(fg.is_none() && revision.is_none());
 
@@ -451,7 +561,6 @@ mod one_poll_per_pane {
 
     use super::*;
     use std::io::Write;
-    use std::sync::Arc;
     use std::time::Duration;
 
     /// Records every invocation's pid, then hangs, so the test can count how
@@ -483,24 +592,24 @@ mod one_poll_per_pane {
             .collect()
     }
 
-    fn container(docker_bin: String) -> crate::pane::ContainerArg {
-        crate::pane::ContainerArg {
-            kind: crate::config::HostKind::DockerContainer("whatever".into()),
+    fn docker_poller(docker_bin: String) -> Shared {
+        shared(crate::poll_channel::Transport::Docker {
             docker_bin,
-        }
+            kind: crate::config::HostKind::DockerContainer("whatever".into()),
+        })
     }
 
     /// What the pane does: run under a permit, and do one more pass if a
     /// refresh was asked for while this one ran.
     fn spawn_under_gate(
         gate: &PollGate,
-        ct: Arc<crate::pane::ContainerArg>,
+        poller: Shared,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let permit = gate.begin()?;
         Some(tokio::spawn(async move {
             let permit = permit;
             loop {
-                let _ = poll("unused", None, None, "w1:p1", None, None, Some(ct.as_ref())).await;
+                let _ = poll(&poller, None, None, "w1:p1", None).await;
                 if !permit.another_pass_wanted() {
                     break;
                 }
@@ -512,7 +621,7 @@ mod one_poll_per_pane {
     async fn a_burst_of_forced_polls_puts_exactly_one_client_on_the_wire() {
         let dir = std::env::temp_dir().join(format!("fg-gate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ct = Arc::new(container(recording_docker(&dir, "600")));
+        let ct = docker_poller(recording_docker(&dir, "600"));
         let gate = PollGate::new();
 
         // one slow poll in flight, then fifty forced triggers on top of it
@@ -545,7 +654,7 @@ mod one_poll_per_pane {
     async fn cancelling_a_poll_reopens_the_gate_for_the_next_one() {
         let dir = std::env::temp_dir().join(format!("fg-cancel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ct = Arc::new(container(recording_docker(&dir, "600")));
+        let ct = docker_poller(recording_docker(&dir, "600"));
         let gate = PollGate::new();
 
         let running = spawn_under_gate(&gate, ct.clone()).expect("gate was free");

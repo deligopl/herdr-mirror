@@ -961,10 +961,13 @@ struct App {
     /// screen rows the selection overlay covered on the last paint, so they can
     /// be repainted when it moves away
     last_select_rows: Option<(usize, usize)>,
-    /// last time a foreground poll was kicked off (throttles the ssh handshakes)
+    /// last time a foreground poll was kicked off (throttles the polls)
     fg_poll_at: Option<Instant>,
     /// at most one metadata poll per pane is ever in the air; see `PollGate`
     fg_poll_gate: crate::foreground::PollGate,
+    /// this pane's one metadata channel, shared with the tasks that poll on it.
+    /// Unused by a pane whose host has an API forward: see `foreground::poll`.
+    fg_poller: crate::foreground::Shared,
     /// when a frame last reached us
     last_frame_at: Instant,
     /// the remote pane's content revision as of the last successful poll, and
@@ -999,6 +1002,48 @@ struct App {
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
 /// poll lazily (only around mouse activity) and no faster than this
 const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Hard floor between foreground polls on a host whose pane metadata rides the
+/// daemon's API forward. Forced polls included — every caller, no exceptions.
+///
+/// The Herdr API answers one request per connection, so a poll there is at
+/// least one fresh connection, and on a sandbox guest each connection is one
+/// direct-tcpip channel and one guest `exec` — against the very exec service
+/// these guests wedged on twice in a day. The cost is therefore the poll RATE,
+/// and the rate has to be bounded by something that cannot be argued around.
+///
+/// The number comes from the measurement: before the rolled-back `.26`, an
+/// idle four-pane Studio guest showed 26 forwards/min, which is each pane
+/// polled on its 20 s output-health tick at two connections a poll — 6 per
+/// minute per pane. A poll now costs one connection, so a 10 s floor caps a
+/// pane at 6 per minute whatever asks for a poll, forced or not, busy or idle.
+/// That makes the pre-`.26` idle cost a ceiling instead of an average; at rest
+/// the health tick remains the only caller and the real figure is 3 per minute.
+///
+/// What it costs. On these hosts a shell→TUI change can take up to 10 s to
+/// reach the local pane's mouse and cursor-key handling, where elsewhere it is
+/// immediate. Cheap where it applies: a host is on this transport because it is
+/// a sandbox guest being mirrored for its agent pane, and an agent pane is
+/// classified from `pane.get`'s own `agent` field, which does not move.
+const API_FG_POLL_FLOOR: Duration = Duration::from_secs(10);
+
+/// How long after the last poll the next one may run.
+///
+/// Free-standing so the policy can be asserted without an `App`: it is the
+/// whole rate limit on the API forward, and the number that decides how much
+/// `exec` load an idle mirrored guest carries.
+fn fg_poll_spacing(force: bool, over_api_forward: bool) -> Duration {
+    // One rule on the API forward, and it does not care who is asking: a
+    // ceiling that a forced caller could step over would not be a ceiling.
+    if over_api_forward {
+        return API_FG_POLL_FLOOR;
+    }
+    if force {
+        Duration::ZERO
+    } else {
+        FG_POLL_INTERVAL
+    }
+}
 
 /// after input settles, re-poll once this much later to catch a foreground
 /// change the input caused (e.g. a TUI just exited); bypasses FG_POLL_INTERVAL
@@ -1169,6 +1214,19 @@ impl App {
         self.hint_clear_at = None;
     }
 
+    /// How long after the last poll this one may run. Zero for a forced poll on
+    /// a transport where an extra one is cheap, `API_FG_POLL_FLOOR` for a
+    /// forced poll on the API forward, `FG_POLL_INTERVAL` otherwise.
+    ///
+    /// This is the whole rate limit, and it is deliberately the only one: with
+    /// the health tick forcing a poll every `OUTPUT_HEALTH_INTERVAL`, an idle
+    /// pane on the API forward costs one poll per 20 s whatever this returns,
+    /// and the floor is what stops an input burst turning that into one poll
+    /// per settle.
+    fn fg_poll_spacing(&self, force: bool) -> Duration {
+        fg_poll_spacing(force, self.args.api_socket.is_some())
+    }
+
     /// Kick a background poll of the remote pane's foreground process, throttled
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
@@ -1177,7 +1235,7 @@ impl App {
             return;
         }
         let now = Instant::now();
-        if !force && self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
+        if self.fg_poll_at.is_some_and(|t| now.duration_since(t) < self.fg_poll_spacing(force)) {
             return;
         }
         self.fg_poll_at = Some(now);
@@ -1187,26 +1245,22 @@ impl App {
         // pass rather than starting or queueing another.
         let Some(permit) = self.fg_poll_gate.begin() else { return };
         let tx = self.tx.clone();
-        let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
         let session = self.args.session.clone();
         let pane = self.args.pane_target.clone();
-        let ctl = self.args.ctl_path.clone();
         let api_socket = self.args.api_socket.clone();
-        let container = self.args.container.clone();
+        let poller = self.fg_poller.clone();
         tokio::spawn(async move {
             // dropped on completion or cancellation, so the gate never stays
             // shut on a poll that will not finish
             let permit = permit;
             loop {
                 let (fg, revision) = crate::foreground::poll(
-                    &ssh,
+                    &poller,
                     bin.as_deref(),
                     session.as_deref(),
                     &pane,
-                    ctl.as_deref(),
                     api_socket.as_deref(),
-                    container.as_ref(),
                 )
                 .await;
                 let _ = tx.send(Msg::Foreground(fg)).await;
@@ -2308,6 +2362,19 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
+    // One metadata channel for this pane, opened lazily on the first poll and
+    // kept for the streamer's life (see `poll_channel`).
+    let fg_poller = crate::foreground::shared(match &args.container {
+        Some(ct) => crate::poll_channel::Transport::Docker {
+            docker_bin: ct.docker_bin.clone(),
+            kind: ct.kind.clone(),
+        },
+        None => crate::poll_channel::Transport::Ssh {
+            target: args.ssh_target.clone(),
+            ctl_path: args.ctl_path.clone(),
+        },
+    });
+
     let mut app = App {
         args,
         state_dir: state_dir.clone(),
@@ -2335,6 +2402,7 @@ pub async fn run(args: Args) -> Result<()> {
         last_select_rows: None,
         fg_poll_at: None,
         fg_poll_gate: crate::foreground::PollGate::new(),
+        fg_poller,
         last_frame_at: Instant::now(),
         remote_revision: None,
         remote_advanced_at: None,
@@ -3013,6 +3081,40 @@ mod tests {
         );
         assert!(host_admission_open(&state, Some("cargo")));
         let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// The rate limit that has to hold on the transport the wedges happen on.
+    ///
+    /// `.26` took the foreground poll off the API forward and onto an ssh
+    /// session per pane; rolled back, because on the socket-transport guests
+    /// that ran the poll at its full cadence straight into the exec service.
+    /// Back on the forward, the only thing bounding the idle cost is this
+    /// spacing, so it is asserted rather than described.
+    #[test]
+    fn a_forced_poll_over_the_api_forward_still_keeps_its_distance() {
+        // ssh and docker: unchanged. Lazy by default, immediate when forced.
+        assert_eq!(fg_poll_spacing(false, false), FG_POLL_INTERVAL);
+        assert_eq!(fg_poll_spacing(true, false), Duration::ZERO);
+
+        // the API forward: one floor, and `force` does not lift it
+        assert_eq!(fg_poll_spacing(false, true), API_FG_POLL_FLOOR);
+        assert_eq!(fg_poll_spacing(true, true), API_FG_POLL_FLOOR);
+
+        // and the floor is worth what it claims. A poll there costs one
+        // connection (see `foreground::api_poll`), so this is a hard ceiling of
+        // six per minute per pane — the idle cost measured before `.26`, when
+        // the same 20 s tick spent two connections a poll.
+        let ceiling_per_minute = 60.0 / API_FG_POLL_FLOOR.as_secs_f64();
+        let pre_26_idle_per_minute = (60.0 / OUTPUT_HEALTH_INTERVAL.as_secs_f64()) * 2.0;
+        assert!(
+            ceiling_per_minute <= pre_26_idle_per_minute,
+            "worst case {ceiling_per_minute}/min exceeds the pre-.26 idle \
+             {pre_26_idle_per_minute}/min"
+        );
+
+        // at rest nothing else asks, so the health tick is the real cadence:
+        // one poll and one connection per tick, half of what it used to be
+        assert!(OUTPUT_HEALTH_INTERVAL >= API_FG_POLL_FLOOR);
     }
 
     fn test_args(container: Option<ContainerArg>) -> Args {
