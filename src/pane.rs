@@ -1113,6 +1113,13 @@ struct App {
     claim: Option<crate::view::ViewClaim>,
     /// sidebar copy only: where its input goes while claimed
     forward: crate::view::Forwarder,
+    /// sidebar copy only: stream released because nobody views the pane
+    /// (idle release, see `visibility.rs`)
+    idle_released: bool,
+    /// sidebar copy only: last moment the pane was on screen or got input
+    last_seen: Instant,
+    /// sidebar copy only: the daemon's published view of what is on screen
+    visibility: crate::visibility::Reader,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -1264,8 +1271,8 @@ async fn wait_for_stream_resume(state_dir: &std::path::Path, local_pane_id: &str
 
 impl App {
     fn paint(&mut self) {
-        // a sidebar copy standing aside for a view shows only its notice
-        if !self.tty || self.claim.is_some() {
+        // a sidebar copy standing aside shows only its notice
+        if !self.tty || self.aside() {
             return;
         }
         let (cols, rows) = term_size();
@@ -1407,7 +1414,7 @@ impl App {
     /// daemon's sweep. Wall-clock, because the reader is another process.
     fn publish_stream_health(&self, local_pane_id: Option<&str>) {
         let Some(id) = local_pane_id else { return };
-        if self.args.dump || self.is_view || self.claim.is_some() {
+        if self.args.dump || self.is_view || self.aside() {
             return;
         }
         let now_instant = Instant::now();
@@ -1548,8 +1555,8 @@ impl App {
 
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
-        if self.claim.is_some() {
-            // standing aside for a view: the terminal is the view's
+        if self.aside() {
+            // standing aside (for a view, or idle): no stream now
             return;
         }
         // re-earn prediction confidence against the new session's frames
@@ -2163,12 +2170,16 @@ impl App {
         }
     }
 
-    /// Stand aside for a view: release the remote terminal the way every other
-    /// retire path does (graceful `terminal.release` for control, then the
-    /// transport and the remote client), tell the view, and show a notice.
-    /// This process — and the agent identity Herdr ties to it — stays.
-    async fn enter_view_claim(&mut self, claim: crate::view::ViewClaim) {
-        self.claim = Some(claim);
+    /// Standing aside: a view holds the terminal, or the pane is idle-released.
+    fn aside(&self) -> bool {
+        self.claim.is_some() || self.idle_released
+    }
+
+    /// Release the remote terminal the way every other retire path does
+    /// (graceful `terminal.release` for control, then the transport and the
+    /// remote client). This process — and the agent identity Herdr ties to
+    /// it — stays. Shared by view claims and idle release.
+    async fn release_stream(&mut self) {
         self.reconnect_at = None;
         self.switching_to = None;
         self.switch_at = None;
@@ -2190,6 +2201,33 @@ impl App {
         }
         if let Some(id) = &self.local_pane_id {
             crate::state::clear_stream_health(&self.state_dir, id);
+        }
+    }
+
+    /// Stop standing aside and attach again.
+    async fn reattach(&mut self) {
+        if self.tty {
+            write_stdout(crate::view::NOTICE_END);
+            self.sync_mouse_grab();
+        }
+        self.last_seen = Instant::now();
+        self.renderer.status("");
+        self.renderer.invalidate();
+        self.backoff_idx = 0;
+        self.control_failures = 0;
+        self.control_sticky = false;
+        self.attach_conflict_retried = false;
+        self.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
+        self.connect(initial_mode(self.args.always_control, term_size())).await;
+    }
+
+    /// Stand aside for a view: release the remote terminal, tell the view,
+    /// and show a notice. A view supersedes an idle release.
+    async fn enter_view_claim(&mut self, claim: crate::view::ViewClaim) {
+        self.claim = Some(claim);
+        self.set_idle_released(false);
+        self.release_stream().await;
+        if let Some(id) = &self.local_pane_id {
             crate::view::mark_released(&self.state_dir, id);
         }
         self.draw_view_notice();
@@ -2218,18 +2256,77 @@ impl App {
             &self.args.pane_target,
         );
         self.queue_remote_kill(orphan);
-        if self.tty {
-            write_stdout(crate::view::NOTICE_END);
-            self.sync_mouse_grab();
+        self.reattach().await;
+    }
+
+    fn set_idle_released(&mut self, on: bool) {
+        self.idle_released = on;
+        if let Some(id) = &self.local_pane_id {
+            if on {
+                crate::visibility::mark_idle_released(&self.state_dir, id);
+            } else {
+                crate::visibility::clear_idle_released(&self.state_dir, id);
+            }
         }
-        self.renderer.status("");
-        self.renderer.invalidate();
-        self.backoff_idx = 0;
-        self.control_failures = 0;
-        self.control_sticky = false;
-        self.attach_conflict_retried = false;
-        self.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
-        self.connect(initial_mode(self.args.always_control, term_size())).await;
+    }
+
+    /// Sidebar copy, unclaimed: release the stream when nobody has viewed the
+    /// pane for the grace period, and take it back when it is on screen again.
+    async fn poll_idle_release(&mut self) {
+        if self.claim.is_some() {
+            return;
+        }
+        let Some(id) = self.local_pane_id.clone() else { return };
+        let now = Instant::now();
+        let visible = self.visibility.read(&self.state_dir).cloned();
+        if visible.as_ref().is_some_and(|v| v.shows(&id)) {
+            self.last_seen = now;
+        }
+        match crate::visibility::idle_step(
+            self.idle_released,
+            visible.as_ref(),
+            &id,
+            self.last_seen,
+            now,
+        ) {
+            crate::visibility::IdleStep::Stay => {}
+            crate::visibility::IdleStep::Release => self.enter_idle_release().await,
+            crate::visibility::IdleStep::Resume => self.leave_idle_release().await,
+        }
+    }
+
+    async fn enter_idle_release(&mut self) {
+        self.set_idle_released(true);
+        self.release_stream().await;
+        self.draw_idle_notice();
+    }
+
+    fn draw_idle_notice(&mut self) {
+        if self.tty && self.idle_released && self.claim.is_none() {
+            write_stdout(&crate::visibility::idle_notice());
+            self.mouse_grabbed = false;
+        }
+    }
+
+    async fn leave_idle_release(&mut self) {
+        self.set_idle_released(false);
+        self.reattach().await;
+    }
+
+    /// Input while idle-released: a focus-in or anything typed (or sent by
+    /// `herdr agent prompt`) resumes at once, no daemon involved; the input
+    /// is then handled exactly as if the stream had been up, which queues it
+    /// until the new session is there to take it.
+    async fn resume_from_input(&mut self, buf: Vec<u8>) {
+        let (rest, focus_in) = crate::view::strip_focus_reports(&buf);
+        // a lone focus-out is the pane being left, not looked at
+        if rest.is_empty() && !focus_in {
+            return;
+        }
+        self.leave_idle_release().await;
+        if !rest.is_empty() {
+            self.handle_stdin(rest).await;
+        }
     }
 
     /// Sidebar copy input while a view holds the terminal: focus reports turn
@@ -2720,6 +2817,9 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
         local_pane_id: local_pane_id.clone(),
         claim: None,
         forward: crate::view::Forwarder::default(),
+        idle_released: false,
+        last_seen: Instant::now(),
+        visibility: crate::visibility::Reader::default(),
     };
     // A view takes the sidebar copy's input from its socket, exactly as if it
     // had been typed into the tile.
@@ -2819,14 +2919,19 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => if app.claim.is_some() {
                         app.forward_to_view(buf).await;
+                    } else if app.idle_released {
+                        app.resume_from_input(buf).await;
                     } else {
+                        app.last_seen = Instant::now();
                         app.handle_stdin(buf).await;
                     },
                     // a tile whose terminal went away: the view is over. A
                     // sidebar copy's lifecycle belongs to its pane (SIGHUP).
                     Some(Msg::StdinEof) => if app.is_view { break },
                     // keep the last good classification if a poll failed (None)
-                    Some(Msg::Foreground(v)) => if v.is_some() {
+                    // (a poll answered after the stream was released must not
+                    // re-grab the mouse under the notice)
+                    Some(Msg::Foreground(v)) => if v.is_some() && !app.aside() {
                         // a foreground change means the screen belongs to a
                         // different program now, so the old highlight points at
                         // text that is gone
@@ -2844,10 +2949,15 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
             }
             _ = claim_tick.tick(), if claimable => {
                 app.poll_view_claim().await;
+                app.poll_idle_release().await;
             }
             _ = sigwinch.recv() => {
                 if app.claim.is_some() {
                     app.draw_view_notice();
+                    continue;
+                }
+                if app.idle_released {
+                    app.draw_idle_notice();
                     continue;
                 }
                 app.renderer.invalidate();
@@ -2968,8 +3078,11 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
     if let Some(id) = local_pane_id.as_deref().filter(|_| !is_view) {
         crate::state::clear_stream_health(&state_dir, id);
     }
+    if let Some(id) = local_pane_id.as_deref().filter(|_| app.idle_released) {
+        crate::visibility::clear_idle_released(&state_dir, id);
+    }
     if tty {
-        if app.claim.is_some() {
+        if app.aside() {
             write_stdout(crate::view::NOTICE_END);
         }
         // ?1l with the rest: leaving the hosting pane in application cursor mode
@@ -3989,6 +4102,136 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn show(dir: &std::path::Path, secs: u64, panes: &[&str]) {
+        crate::visibility::publish(
+            dir,
+            &crate::visibility::Visible {
+                pid: std::process::id() as i32,
+                idle_release_secs: secs,
+                workspace_id: Some("wS".into()),
+                tab_id: Some("wS:t1".into()),
+                panes: panes.iter().map(|p| p.to_string()).collect(),
+            },
+        );
+    }
+
+    fn idle_app(tag: &str) -> (App, std::path::PathBuf) {
+        let dir = closed_admission_dir(tag);
+        let args = parse_args(&["t".into(), "w1:p1".into(), "--host-name".into(), "h".into()])
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = test_app(args, dir.clone(), false, tx);
+        app.local_pane_id = Some("wS:p1".into());
+        (app, dir)
+    }
+
+    #[tokio::test]
+    async fn an_unviewed_sidebar_copy_releases_after_the_grace_and_resumes_when_shown() {
+        let (mut app, dir) = idle_app("idle");
+        let sink = dir.join("session-input");
+        let (session, mut child) = local_session(1, &sink);
+        app.session = Some(session);
+        app.mode = Mode::Control;
+        app.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
+
+        // on screen: never released, however long ago anything else happened
+        show(&dir, 120, &["wS:p1"]);
+        app.last_seen = Instant::now() - Duration::from_secs(600);
+        app.poll_idle_release().await;
+        assert!(!app.idle_released && app.session.is_some());
+
+        // off screen: the grace runs from the last moment it was on screen
+        show(&dir, 120, &["wS:p9"]);
+        app.poll_idle_release().await;
+        assert!(!app.idle_released, "inside the grace");
+        app.last_seen = Instant::now() - Duration::from_secs(121);
+        app.poll_idle_release().await;
+        assert!(app.idle_released);
+        assert!(app.session.is_none());
+        assert!(app.reconnect_at.is_none());
+        assert!(app.health_at.is_none());
+        assert!(crate::visibility::is_idle_released(&dir, "wS:p1"));
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        let written = std::fs::read_to_string(&sink).unwrap();
+        assert!(written.contains("terminal.release"), "{written:?}");
+        // nothing reattaches while idle-released
+        app.connect(Mode::Control).await;
+        assert!(app.session.is_none() && app.reconnect_at.is_none());
+        app.poll_idle_release().await;
+        assert!(app.idle_released, "still off screen");
+
+        // its tab comes on screen: reattach (here into the closed admission
+        // gate, so it only schedules)
+        show(&dir, 120, &["wS:p1", "wS:p9"]);
+        app.poll_idle_release().await;
+        assert!(!app.idle_released);
+        assert!(app.reconnect_at.is_some());
+        assert!(app.health_at.is_some());
+        assert!(!crate::visibility::is_idle_released(&dir, "wS:p1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn focus_or_input_resumes_an_idle_pane_and_the_input_is_kept_for_the_new_session() {
+        let (mut app, dir) = idle_app("idlein");
+        show(&dir, 120, &["wS:p9"]);
+        app.enter_idle_release().await;
+        assert!(app.idle_released);
+
+        // a lone focus-out is the pane being left: nothing happens
+        app.resume_from_input(b"\x1b[O".to_vec()).await;
+        assert!(app.idle_released);
+        // focus-in resumes, without the daemon
+        app.resume_from_input(b"\x1b[I".to_vec()).await;
+        assert!(!app.idle_released);
+        assert!(app.reconnect_at.is_some() || app.switch_at.is_some());
+        assert!(app.pending_input.is_empty(), "focus reports are not input");
+
+        // typed or prompted input resumes and is queued for the new session
+        app.enter_idle_release().await;
+        assert!(app.idle_released && app.pending_input.is_empty());
+        app.resume_from_input(b"\x1b[Iship it\r".to_vec()).await;
+        assert!(!app.idle_released);
+        assert_eq!(app.pending_input.concat(), b"ship it\r".to_vec());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unpublished_idle_release_keeps_streaming_and_a_view_takes_over() {
+        let (mut app, dir) = idle_app("idleoff");
+        app.last_seen = Instant::now() - Duration::from_secs(10_000);
+        // no daemon has published anything: no release
+        app.poll_idle_release().await;
+        assert!(!app.idle_released);
+        // disabled
+        show(&dir, 0, &[]);
+        app.poll_idle_release().await;
+        assert!(!app.idle_released);
+        // switching it off resumes a released pane
+        app.enter_idle_release().await;
+        app.poll_idle_release().await;
+        assert!(!app.idle_released);
+
+        // a view claiming an idle-released pane supersedes the idle release
+        show(&dir, 120, &[]);
+        app.last_seen = Instant::now() - Duration::from_secs(10_000);
+        app.poll_idle_release().await;
+        assert!(app.idle_released);
+        let (guard, _listener) =
+            crate::view::create_claim(&dir, "wS:p1", "wM:p2", None).unwrap();
+        app.poll_view_claim().await;
+        assert!(app.claim.is_some() && !app.idle_released);
+        assert!(crate::view::is_released(&dir, "wS:p1"));
+        assert!(!crate::visibility::is_idle_released(&dir, "wS:p1"));
+        // a claimed pane is not the idle logic's business
+        app.poll_idle_release().await;
+        assert!(!app.idle_released);
+        drop(guard);
+        app.poll_view_claim().await;
+        assert!(app.claim.is_none() && !app.idle_released, "the grace restarts after a view");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn a_view_keeps_retrying_while_the_sidebar_copy_still_holds_the_terminal() {
         let dir = closed_admission_dir("vconf");
@@ -4091,6 +4334,9 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         local_pane_id: None,
         claim: None,
         forward: crate::view::Forwarder::default(),
+        idle_released: false,
+        last_seen: Instant::now(),
+        visibility: crate::visibility::Reader::default(),
     }
     }
 

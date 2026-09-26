@@ -134,6 +134,9 @@ pub struct MirrorConfig {
     /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
+    /// seconds a mirror pane may go unviewed before its stream is released
+    /// (idle release, see `visibility.rs`); 0 disables. Default 120.
+    pub idle_release_secs: u64,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -162,6 +165,7 @@ struct RawConfig {
     poll_seconds: Option<u64>,
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
+    idle_release_secs: Option<u64>,
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
@@ -379,6 +383,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        idle_release_secs: raw
+            .idle_release_secs
+            .unwrap_or(crate::visibility::DEFAULT_IDLE_RELEASE_SECS),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -404,6 +411,16 @@ mod tests {
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert_eq!(h.session, None); // default remote session
         assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn idle_release_defaults_on_and_zero_disables() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.idle_release_secs, 120);
+        let c = parse_config("idle_release_secs = 0\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.idle_release_secs, 0);
+        let c = parse_config("idle_release_secs = 300\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.idle_release_secs, 300);
     }
 
     #[test]

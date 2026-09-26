@@ -739,6 +739,11 @@ fn streamer_output_stalled(state_dir: &std::path::Path, local_pane_id: &str, now
     if crate::view::live_claim(state_dir, local_pane_id).is_some() {
         return false;
     }
+    // Likewise a sidebar copy idle-released because nobody views it: no
+    // stream by design, and a restart would only bring one back unviewed.
+    if crate::visibility::is_idle_released(state_dir, local_pane_id) {
+        return false;
+    }
     crate::state::read_stream_health(state_dir, local_pane_id).is_some_and(|health| {
         crate::state::output_direction_stalled(
             &health,
@@ -995,6 +1000,19 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         log.clone(),
         LocalEventGuards { closes: closes.clone() },
     )));
+    // Its own subscription, not the one above: every event there pokes a
+    // converge and a sidebar regroup (each a `session.snapshot`), and focus
+    // events are far too frequent for that.
+    let idle_release_secs = crate::visibility::effective_idle_release_secs(
+        config.idle_release_secs,
+        std::env::var(crate::visibility::IDLE_RELEASE_ENV).ok().as_deref(),
+    );
+    tasks.push(tokio::spawn(crate::visibility::visibility_task(
+        local.clone(),
+        env.state_dir.clone(),
+        idle_release_secs,
+        log.clone(),
+    )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -1041,6 +1059,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     for t in &tasks {
         t.abort();
     }
+    crate::visibility::withdraw(&env.state_dir);
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);
         for entry in state.panes.values() {
@@ -1537,6 +1556,30 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
         assert_eq!(human_countdown(300.0), "in 5m");
         assert_eq!(human_countdown(30.0), "in 30s");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An idle-released sidebar copy streams nothing on purpose; a leftover
+    /// record that reads as frozen must not get it restarted.
+    #[test]
+    fn an_idle_released_sidebar_copy_is_never_judged_stalled() {
+        let dir = std::env::temp_dir().join(format!("hm-stall-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pane = "w7R:p8";
+        let now = 10_000.0;
+        crate::state::publish_stream_health(
+            &dir,
+            pane,
+            &crate::state::StreamHealth {
+                last_frame_unix: now - 600.0,
+                remote_advanced_unix: Some(now - 300.0),
+            },
+        );
+        assert!(streamer_output_stalled(&dir, pane, now));
+        crate::visibility::mark_idle_released(&dir, pane);
+        assert!(!streamer_output_stalled(&dir, pane, now));
+        crate::visibility::clear_idle_released(&dir, pane);
+        assert!(streamer_output_stalled(&dir, pane, now));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

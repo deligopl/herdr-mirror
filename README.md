@@ -96,6 +96,14 @@ only stop mirroring and leave the remote — and its agent — running). When th
 remote is left running, the **restore** action (`herdr-mirror restore`) brings
 back mirrors you closed.
 
+**Idle release** — a mirror pane that is not on screen (not in the focused
+workspace's active tab) and has had no input or focus for `idle_release_secs`
+(default 120) stops streaming: its process, agent identity and status stay, and
+it shows "paused while not viewed". Showing its tab, focusing it, or typing
+into it (including `herdr agent prompt`) resumes it at once; the input is
+delivered after the stream reattaches. `idle_release_secs = 0` (or the daemon's
+`HERDR_MIRROR_IDLE_RELEASE_SECS=0`) disables it.
+
 **One writer per state directory** — the daemon holds `daemon.lock` for its
 entire lifetime. A second `daemon`/`run` or `once` refuses the same directory,
 even if `daemon.pid` has been lost. `start` serializes launchers separately and
@@ -328,6 +336,10 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
+# idle_release_secs = 120
+                         # default. A mirror pane off screen with no input
+                         # for this long stops streaming until viewed or
+                         # typed into. 0 disables.
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
