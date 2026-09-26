@@ -9,12 +9,18 @@
 // stands aside while keeping its process — and with it the local agent
 // identity Herdr ties to that process — alive.
 //
-// The handshake is one claim file per sidebar pane, under the state dir:
+// The handshake is one claim per mirrored REMOTE pane, under the state dir:
 //
-//   view-claims/<sidebar>.json      who holds the view (tile pane, pid, socket)
-//   view-claims/<sidebar>.lock      flock held by the view for its whole life
-//   view-claims/<sidebar>.sock      the view's input socket
-//   view-claims/<sidebar>.released  the sidebar's "I let go of the terminal"
+//   view-claims/<key>.json      who holds the view (tile pane, pid, socket)
+//   view-claims/<key>.lock      flock held by the view for its whole life
+//   view-claims/<key>.sock      the view's input socket
+//   view-claims/<key>.released  the sidebar's "I let go of the terminal"
+//
+// <key> is `claim_key(host, remote pane)`: the identity the sidebar copy and
+// the view both know from the same streamer argv. Not the sidebar copy's local
+// pane id — a roll (suspend + show) or any recreation gives the sidebar copy a
+// new local pane, and a claim keyed by the old one would leave the new copy
+// unclaimed, fighting the tile for the terminal.
 //
 // The lock is what makes a claim live: the kernel drops it with the process,
 // so a SIGKILLed view (or a recycled pid) can never pin a sidebar copy.
@@ -64,8 +70,25 @@ fn claims_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("view-claims")
 }
 
-fn claim_file(state_dir: &Path, sidebar: &str, ext: &str) -> PathBuf {
-    claims_dir(state_dir).join(format!("{}.{ext}", sane_component(sidebar)))
+/// The claim key for one mirrored remote pane of one host.
+pub fn claim_key(host: &str, remote_pane: &str) -> String {
+    format!("{}--{}", sane_component(host), sane_component(remote_pane))
+}
+
+/// The claim key a streamer's argv implies: `--host-name` (the ssh target
+/// when a hand-run streamer has none) and the remote pane target. The sidebar
+/// copy and the view parse the same argv, so they always agree.
+pub fn claim_key_for(args: &crate::pane::Args) -> String {
+    claim_key(args.host_name.as_deref().unwrap_or(&args.ssh_target), &args.pane_target)
+}
+
+fn claim_file(state_dir: &Path, key: &str, ext: &str) -> PathBuf {
+    claims_dir(state_dir).join(format!("{}.{ext}", sane_component_keep_dash(key)))
+}
+
+/// Keys are built by `claim_key`; anything else is made path-safe here.
+fn sane_component_keep_dash(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
 }
 
 pub fn claim_path(state_dir: &Path, sidebar: &str) -> PathBuf {
@@ -102,11 +125,13 @@ fn read_claim(state_dir: &Path, sidebar: &str) -> Option<ViewClaim> {
     serde_json::from_str(&fs::read_to_string(claim_path(state_dir, sidebar)).ok()?).ok()
 }
 
-/// Remove what a dead view left. Only ever called while holding the lock, so
-/// a new view (which locks before it writes) cannot lose its fresh claim.
+/// Remove what a dead view left, its released marker included. Only ever
+/// called while holding the lock, so a new view (which locks before it
+/// writes) cannot lose its fresh claim.
 fn remove_claim_files(state_dir: &Path, sidebar: &str) {
     let _ = fs::remove_file(claim_path(state_dir, sidebar));
     let _ = fs::remove_file(socket_path(state_dir, sidebar));
+    let _ = fs::remove_file(released_path(state_dir, sidebar));
 }
 
 /// The live claim on this sidebar pane, if any. A claim whose holder is gone
@@ -114,6 +139,15 @@ fn remove_claim_files(state_dir: &Path, sidebar: &str) {
 pub fn live_claim(state_dir: &Path, sidebar: &str) -> Option<ViewClaim> {
     let claim_file = claim_path(state_dir, sidebar);
     if !claim_file.exists() {
+        // a released marker a sidebar copy wrote as the view went away must
+        // not linger; only an unheld lock proves no view is starting up
+        if released_path(state_dir, sidebar).exists() {
+            if let Ok(lock) = open_lock(state_dir, sidebar) {
+                if try_lock(&lock) {
+                    let _ = fs::remove_file(released_path(state_dir, sidebar));
+                }
+            }
+        }
         return None;
     }
     let lock = open_lock(state_dir, sidebar).ok()?;
@@ -138,7 +172,6 @@ pub struct ClaimGuard {
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
         remove_claim_files(&self.state_dir, &self.sidebar);
-        let _ = fs::remove_file(released_path(&self.state_dir, &self.sidebar));
     }
 }
 
@@ -168,7 +201,6 @@ pub fn create_claim(
     }
     // Anything on disk now is left over from a dead view.
     remove_claim_files(state_dir, sidebar);
-    let _ = fs::remove_file(released_path(state_dir, sidebar));
     let socket = socket_path(state_dir, sidebar);
     let listener = std::os::unix::net::UnixListener::bind(&socket)?;
     let claim = ViewClaim {
@@ -457,15 +489,17 @@ pub async fn cmd_view(env: crate::util::Env, rest: &[String]) -> Result<()> {
     let args = crate::pane::parse_args(&argv[2..])?;
 
     let herdr_socket = env.local_socket.display().to_string();
-    let (guard, listener) =
-        create_claim(&env.state_dir, &found.sidebar_pane_id, &tile, Some(&herdr_socket))?;
+    // keyed by the remote pane, so the claim survives the sidebar copy being
+    // recreated under a new local pane id
+    let key = claim_key_for(&args);
+    let (guard, listener) = create_claim(&env.state_dir, &key, &tile, Some(&herdr_socket))?;
 
     // Give the sidebar copy's stream its moment to let go; with no stream
     // running (paused, or between respawns) nothing holds the terminal.
     if crate::util::streamer_alive(&env.state_dir, &args.ssh_target, &args.pane_target) {
         println!("waiting for {} to release {}…", found.sidebar_pane_id, found.remote_pane_id);
         let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
-        while !is_released(&env.state_dir, &found.sidebar_pane_id)
+        while !is_released(&env.state_dir, &key)
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(RELEASE_POLL).await;
@@ -552,6 +586,37 @@ mod tests {
         let (_g, _l) = create_claim(&d, "w1:p2", "w9:p3", None).unwrap();
         assert_eq!(live_claim(&d, "w1:p2").unwrap().tile_pane_id, "w9:p3");
         let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_released_marker_never_outlives_its_claim() {
+        let d = dir("rel");
+        let key = claim_key("cfo-studio", "w1:p7");
+        assert_eq!(key, "cfo_studio--w1_p7");
+        // left behind by a sidebar copy that marked as the view went away
+        mark_released(&d, &key);
+        assert!(is_released(&d, &key));
+        assert_eq!(live_claim(&d, &key), None);
+        assert!(!is_released(&d, &key), "cleaned with no view holding the lock");
+        // and a dead view's claim takes its marker with it
+        let d2 = dir("rel2");
+        fs::create_dir_all(claims_dir(&d2)).unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id() as i32;
+        dead.wait().unwrap();
+        let claim = ViewClaim {
+            tile_pane_id: "w9:p1".into(),
+            pid: dead_pid,
+            socket: socket_path(&d2, &key).display().to_string(),
+            herdr_socket: None,
+            started: 1.0,
+        };
+        fs::write(claim_path(&d2, &key), serde_json::to_string(&claim).unwrap()).unwrap();
+        mark_released(&d2, &key);
+        assert_eq!(live_claim(&d2, &key), None);
+        assert!(!is_released(&d2, &key));
+        let _ = fs::remove_dir_all(d);
+        let _ = fs::remove_dir_all(d2);
     }
 
     #[test]

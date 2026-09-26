@@ -727,16 +727,22 @@ fn heal_interval_seconds(poll_seconds: u64) -> u64 {
 }
 
 /// Whether the streamer drawing `local_pane_id` has stopped rendering.
+/// `claim_key` is the view-claim key of the remote pane it mirrors.
 ///
 /// Reads the record that streamer publishes and applies the stall policy to it.
 /// Split out so the whole path — the streamer's own file format, the two
 /// clocks, and the verdict — is testable without a live pane, which is the only
 /// way to cover a shape that took a real transport fault to produce.
-fn streamer_output_stalled(state_dir: &std::path::Path, local_pane_id: &str, now: f64) -> bool {
+fn streamer_output_stalled(
+    state_dir: &std::path::Path,
+    claim_key: &str,
+    local_pane_id: &str,
+    now: f64,
+) -> bool {
     // A sidebar copy standing aside for a view (`herdr-mirror view`) draws
     // nothing and carries no stream by design; it is neither stalled nor due
     // a restart, and restarting it would only fight the view for the terminal.
-    if crate::view::live_claim(state_dir, local_pane_id).is_some() {
+    if crate::view::live_claim(state_dir, claim_key).is_some() {
         return false;
     }
     // Likewise a sidebar copy idle-released because nobody views it: no
@@ -803,7 +809,9 @@ async fn heal_zombie_mirrors(
             // and only recreating the pane cleared it. The streamer publishes
             // what it knows; the verdict is here, because a stall is invisible
             // from inside a loop that is still running.
-            if !streamer_output_stalled(state_dir, &local_pane_id, crate::state::unix_now()) {
+            let claim_key = crate::view::claim_key(&h.name, &remote_pane_id);
+            if !streamer_output_stalled(state_dir, &claim_key, &local_pane_id, crate::state::unix_now())
+            {
                 continue;
             }
             // Drop the record with the request: the replacement republishes on
@@ -1575,11 +1583,11 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                 remote_advanced_unix: Some(now - 300.0),
             },
         );
-        assert!(streamer_output_stalled(&dir, pane, now));
+        assert!(streamer_output_stalled(&dir, "h--w1_p1", pane, now));
         crate::visibility::mark_idle_released(&dir, pane);
-        assert!(!streamer_output_stalled(&dir, pane, now));
+        assert!(!streamer_output_stalled(&dir, "h--w1_p1", pane, now));
         crate::visibility::clear_idle_released(&dir, pane);
-        assert!(streamer_output_stalled(&dir, pane, now));
+        assert!(streamer_output_stalled(&dir, "h--w1_p1", pane, now));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1601,11 +1609,11 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                 remote_advanced_unix: Some(now - 300.0),
             },
         );
-        assert!(streamer_output_stalled(&dir, pane, now));
-        let (claim, _listener) = crate::view::create_claim(&dir, pane, "wM:p1", None).unwrap();
-        assert!(!streamer_output_stalled(&dir, pane, now));
+        assert!(streamer_output_stalled(&dir, "h--w1_p1", pane, now));
+        let (claim, _listener) = crate::view::create_claim(&dir, "h--w1_p1", "wM:p1", None).unwrap();
+        assert!(!streamer_output_stalled(&dir, "h--w1_p1", pane, now));
         drop(claim);
-        assert!(streamer_output_stalled(&dir, pane, now));
+        assert!(streamer_output_stalled(&dir, "h--w1_p1", pane, now));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1625,7 +1633,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
 
         // no report yet: a pane whose streamer has not ticked once is not
         // evidence of anything, and must never be restarted on that basis
-        assert!(!streamer_output_stalled(&dir, pane, now));
+        assert!(!streamer_output_stalled(&dir, "h--w1_p1", pane, now));
 
         // healthy: the remote produced output and the frame arrived
         crate::state::publish_stream_health(
@@ -1636,7 +1644,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                 remote_advanced_unix: Some(now - 6.0),
             },
         );
-        assert!(!streamer_output_stalled(&dir, pane, now));
+        assert!(!streamer_output_stalled(&dir, "h--w1_p1", pane, now));
 
         // idle: nothing produced remotely for hours. The mirror shows nothing
         // because there is nothing to show — the case that makes plain output
@@ -1649,7 +1657,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                 remote_advanced_unix: None,
             },
         );
-        assert!(!streamer_output_stalled(&dir, pane, now));
+        assert!(!streamer_output_stalled(&dir, "h--w1_p1", pane, now));
 
         // frozen: the remote kept producing, the last frame predates it
         crate::state::publish_stream_health(
@@ -1660,7 +1668,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
                 remote_advanced_unix: Some(now - 300.0),
             },
         );
-        assert!(streamer_output_stalled(&dir, pane, now));
+        assert!(streamer_output_stalled(&dir, "h--w1_p1", pane, now));
 
         // and the request the sweep then makes reaches this pane and no other,
         // exactly once

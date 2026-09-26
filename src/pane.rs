@@ -2148,7 +2148,12 @@ impl App {
 
     /// Sidebar copy: look for a view claim on this pane, and act on a change.
     async fn poll_view_claim(&mut self) {
-        let Some(id) = self.local_pane_id.clone() else { return };
+        if self.local_pane_id.is_none() {
+            return;
+        }
+        // keyed by host + remote pane, not by our local pane id: a view
+        // outlives this sidebar copy being recreated under a new one
+        let id = crate::view::claim_key_for(&self.args);
         let now = crate::view::live_claim(&self.state_dir, &id);
         match crate::view::sidebar_step(self.claim.is_some(), now.is_some()) {
             crate::view::SidebarStep::Release => {
@@ -2227,8 +2232,8 @@ impl App {
         self.claim = Some(claim);
         self.set_idle_released(false);
         self.release_stream().await;
-        if let Some(id) = &self.local_pane_id {
-            crate::view::mark_released(&self.state_dir, id);
+        if self.local_pane_id.is_some() {
+            crate::view::mark_released(&self.state_dir, &crate::view::claim_key_for(&self.args));
         }
         self.draw_view_notice();
     }
@@ -2245,8 +2250,8 @@ impl App {
     async fn leave_view_claim(&mut self) {
         self.claim = None;
         self.forward.reset();
-        if let Some(id) = &self.local_pane_id {
-            crate::view::clear_released(&self.state_dir, id);
+        if self.local_pane_id.is_some() {
+            crate::view::clear_released(&self.state_dir, &crate::view::claim_key_for(&self.args));
         }
         // a view that died without cleaning up leaves its client attached;
         // clear it before asking for the terminal it is still holding
@@ -4065,13 +4070,13 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         // a view claims the pane: the session is released gracefully and
         // dropped, the release is announced, and nothing reconnects
         let (guard, listener) =
-            crate::view::create_claim(&dir, "wS:p1", "wM:p2", None).unwrap();
+            crate::view::create_claim(&dir, "h--w1_p1", "wM:p2", None).unwrap();
         app.poll_view_claim().await;
         assert_eq!(app.claim.as_ref().map(|c| c.tile_pane_id.as_str()), Some("wM:p2"));
         assert!(app.session.is_none());
         assert!(app.reconnect_at.is_none());
         assert!(app.health_at.is_none());
-        assert!(crate::view::is_released(&dir, "wS:p1"));
+        assert!(crate::view::is_released(&dir, "h--w1_p1"));
         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         let written = std::fs::read_to_string(&sink).unwrap();
         assert!(written.contains("terminal.release"), "{written:?}");
@@ -4096,7 +4101,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         drop(guard);
         app.poll_view_claim().await;
         assert!(app.claim.is_none());
-        assert!(!crate::view::is_released(&dir, "wS:p1"));
+        assert!(!crate::view::is_released(&dir, "h--w1_p1"));
         assert!(app.reconnect_at.is_some());
         assert!(app.health_at.is_some());
         let _ = std::fs::remove_dir_all(dir);
@@ -4218,10 +4223,10 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         app.poll_idle_release().await;
         assert!(app.idle_released);
         let (guard, _listener) =
-            crate::view::create_claim(&dir, "wS:p1", "wM:p2", None).unwrap();
+            crate::view::create_claim(&dir, "h--w1_p1", "wM:p2", None).unwrap();
         app.poll_view_claim().await;
         assert!(app.claim.is_some() && !app.idle_released);
-        assert!(crate::view::is_released(&dir, "wS:p1"));
+        assert!(crate::view::is_released(&dir, "h--w1_p1"));
         assert!(!crate::visibility::is_idle_released(&dir, "wS:p1"));
         // a claimed pane is not the idle logic's business
         app.poll_idle_release().await;
@@ -4229,6 +4234,61 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         drop(guard);
         app.poll_view_claim().await;
         assert!(app.claim.is_none() && !app.idle_released, "the grace restarts after a view");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A roll (suspend + show) or any daemon recreation gives the sidebar copy
+    /// a NEW local pane id. The view resolved the old one; its claim must
+    /// still bind the new copy, because both know the same host + remote pane.
+    #[tokio::test]
+    async fn a_view_survives_its_sidebar_copy_being_recreated_under_a_new_local_pane() {
+        let dir = closed_admission_dir("recreate");
+        let args = || {
+            parse_args(&["t".into(), "w1:p1".into(), "--host-name".into(), "h".into()]).unwrap()
+        };
+        assert_eq!(crate::view::claim_key_for(&args()), crate::view::claim_key("h", "w1:p1"));
+        // the view claimed while the sidebar copy was wHC:p2
+        let key = crate::view::claim_key("h", "w1:p1");
+        let (guard, listener) =
+            crate::view::create_claim(&dir, &key, "wM:p2", Some("/x.sock")).unwrap();
+        let (itx, mut irx) = mpsc::channel::<Vec<u8>>(8);
+        crate::view::spawn_input_listener(listener, move |bytes| {
+            let itx = itx.clone();
+            tokio::spawn(async move { itx.send(bytes).await.is_ok() })
+        })
+        .unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut old = test_app(args(), dir.clone(), false, tx.clone());
+        old.local_pane_id = Some("wHC:p2".into());
+        old.poll_view_claim().await;
+        assert!(old.claim.is_some());
+        drop(old);
+        crate::view::clear_released(&dir, &key); // as if the old copy never said so
+
+        // recreated as wHK:p2: it sees the claim, stands aside, says so
+        let (tx, _rx) = mpsc::channel(16);
+        let mut new = test_app(args(), dir.clone(), false, tx);
+        new.local_pane_id = Some("wHK:p2".into());
+        new.poll_view_claim().await;
+        let claim = new.claim.clone().expect("claimed across the recreation");
+        assert_eq!(claim.tile_pane_id, "wM:p2");
+        assert_eq!(claim.herdr_socket.as_deref(), Some("/x.sock"), "focus redirect target kept");
+        assert!(crate::view::is_released(&dir, &key));
+        assert!(new.session.is_none() && new.reconnect_at.is_none());
+        // input (e.g. `herdr agent prompt`) still reaches the view
+        new.forward_to_view(b"ship it\r".to_vec()).await;
+        let got = tokio::time::timeout(Duration::from_secs(2), irx.recv()).await.unwrap().unwrap();
+        assert_eq!(got, b"ship it\r".to_vec());
+        // a claimed copy never idle-resumes into the tile's terminal
+        show(&dir, 120, &["wHK:p2"]);
+        new.poll_idle_release().await;
+        assert!(new.session.is_none() && new.reconnect_at.is_none());
+
+        // the view ends: claim and released marker go together
+        drop(guard);
+        assert!(!crate::view::is_released(&dir, &key));
+        new.poll_view_claim().await;
+        assert!(new.claim.is_none() && new.reconnect_at.is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
