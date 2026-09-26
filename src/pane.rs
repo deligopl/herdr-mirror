@@ -357,10 +357,25 @@ else kill -TERM \"$p\" 2>/dev/null || true; fi"
 /// reconnect, and a cleanup that delays either is worse than one that misses.
 const REMOTE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long one remote-client kill may take during an explicit host
+/// suspension (`reap_host_remote_clients`). That pass is the last identity-
+/// guarded cleanup before the host transport is closed, nobody is waiting on
+/// a pane, and it may have to open a fresh ssh connection: the daemon's control
+/// master can already be unusable then. On VM hosts (ProxyCommand to the VM
+/// host, then the sandbox proxy) such a round trip measures 4–6 s, so the 2 s
+/// exit-path bound turned every suspension there into a refusal with the
+/// remote client still alive.
+const SUSPEND_REMOTE_KILL_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// Kill a remote client through the same transport that started it. Best
 /// effort: `true` only when the command ran and reported success, so a caller
 /// can keep an unresolved pid for the next attempt instead of leaking it.
 pub(crate) async fn kill_remote_client(args: &Args, pid: i32) -> bool {
+    kill_remote_client_within(args, pid, REMOTE_KILL_TIMEOUT).await
+}
+
+/// `kill_remote_client` with an explicit bound on the whole command.
+async fn kill_remote_client_within(args: &Args, pid: i32, limit: Duration) -> bool {
     if pid <= 1 {
         return true;
     }
@@ -399,7 +414,7 @@ pub(crate) async fn kill_remote_client(args: &Args, pid: i32) -> bool {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .status();
-    matches!(tokio::time::timeout(REMOTE_KILL_TIMEOUT, child).await, Ok(Ok(status)) if status.success())
+    matches!(tokio::time::timeout(limit, child).await, Ok(Ok(status)) if status.success())
 }
 
 /// Clear a remote client recorded by a streamer that is no longer running.
@@ -457,7 +472,7 @@ pub(crate) async fn reap_host_remote_clients(
         ) else {
             continue;
         };
-        if !kill_remote_client(&args, pid).await {
+        if !kill_remote_client_within(&args, pid, SUSPEND_REMOTE_KILL_TIMEOUT).await {
             crate::util::record_remote_client(
                 state_dir,
                 &args.ssh_target,
@@ -3586,6 +3601,32 @@ mod tests {
             host_name: None,
             container,
         }
+    }
+
+    /// A suspension's reap may need a slow fresh transport (VM hosts measure
+    /// 4–6 s), so its per-client bound is its own, longer than the exit path's.
+    #[tokio::test]
+    async fn a_suspend_time_kill_outlasts_a_transport_the_exit_bound_gives_up_on() {
+        assert!(SUSPEND_REMOTE_KILL_TIMEOUT >= Duration::from_secs(10));
+        assert_eq!(REMOTE_KILL_TIMEOUT, Duration::from_secs(2));
+        let dir = std::env::temp_dir().join(format!("hm-slowkill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let docker = dir.join("docker");
+        // `ps` answers at once; the kill itself takes a second, like a slow hop
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\ncase \"$1\" in ps) echo c1 ;; exec) sleep 1 ;; esac\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = test_args(Some(ContainerArg {
+            kind: crate::config::HostKind::DockerContainer("c".into()),
+            docker_bin: docker.display().to_string(),
+        }));
+        assert!(!kill_remote_client_within(&args, 4242, Duration::from_millis(300)).await);
+        assert!(kill_remote_client_within(&args, 4242, Duration::from_secs(5)).await);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The pid line is the whole handle on the remote client. It has to be
