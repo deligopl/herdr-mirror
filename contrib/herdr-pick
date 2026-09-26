@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""herdr-pick — searchable picker to ADD an agent to the current workspace as a live tile.
+
+Type to filter your agents by name, Enter to add the chosen one here as a live tile,
+Esc to cancel. A genuinely local agent is shown with `herdr agent attach`; an agent
+that is a Herdr Mirror sidebar copy of a remote pane is shown with
+`<selected herdr-mirror> view <target>`, which takes the remote stream into the tile
+while the sidebar copy keeps the agent's local identity (see herdr-mirror `view`). The agent stays in its home workspace (tracked in the sidebar);
+this only opens a live view of it here. Agents already shown somewhere (a terminal takes
+only one attach) are marked with a star and sorted to the bottom. No external deps.
+
+Usage:
+  herdr-pick            interactive picker (needs a terminal)
+  herdr-pick --list     print the candidate agents and exit
+  herdr-pick --pick TARGET  attach the named agent or agent in pane TARGET (non-interactive)
+"""
+import json, os, shlex, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+os.environ["PATH"] = ":".join([
+    os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin",
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin", os.environ.get("PATH", ""),
+])
+LOG = os.path.expanduser("~/.herdr/herdr-pick.log")
+ODX_STATE = os.environ.get("ODX_STATE_DIR") or os.path.expanduser("~/.local/state/odx")
+ODX_CONFIG = os.environ.get("ODX_CONFIG_DIR") or os.path.expanduser("~/.config/odx")
+SELECTED = os.path.join(ODX_STATE, "candidate-mirror", "selected.json")
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def sh(*a):
+    return subprocess.run(a, check=True, capture_output=True, text=True).stdout
+
+
+def hj(*a):
+    return json.loads(sh("herdr", *a))["result"]
+
+
+def snap():
+    return hj("api", "snapshot")["snapshot"]
+
+
+def target_ws(s):
+    wid = os.environ.get("HERDR_WORKSPACE_ID")
+    if wid and any(w["workspace_id"] == wid for w in s["workspaces"]):
+        return wid
+    for p in s["panes"]:
+        if p.get("focused"):
+            return p["workspace_id"]
+    return s["workspaces"][0]["workspace_id"]
+
+
+def proj_of(a, labels):
+    return labels.get(a.get("workspace_id", ""), "") or \
+        os.path.basename((a.get("cwd") or "").rstrip("/"))
+
+
+def agent_name(a, s, labels):
+    """Human label for an agent: its own pane's custom name if you set one,
+    else the workspace/project name. Two agents living in the same workspace can
+    thus be told apart by whatever you renamed their panes to — the workspace
+    label alone collapses them into the same string."""
+    home = a.get("pane_id")
+    lbl = next((p.get("label") for p in s["panes"] if p.get("pane_id") == home), None)
+    return lbl or proj_of(a, labels)
+
+
+def foreground_argvs(pane_id):
+    try:
+        pi = json.loads(sh("herdr", "pane", "process-info", "--pane", pane_id))["result"]["process_info"]
+    except Exception:
+        return []
+    return [fp.get("argv", []) for fp in pi.get("foreground_processes", [])]
+
+
+def is_mirror_bin(arg0):
+    return os.path.basename(arg0 or "") == "herdr-mirror"
+
+
+def attach_source(pane_id):
+    """If this pane is a live tile, return the agent target it shows (the argument
+    of its foreground `herdr agent attach <target>` or `herdr-mirror view
+    <target>`), else None."""
+    for argv in foreground_argvs(pane_id):
+        if len(argv) >= 4 and argv[:3] == ["herdr", "agent", "attach"]:
+            return argv[3]
+        if len(argv) >= 3 and is_mirror_bin(argv[0]) and argv[1] == "view":
+            return argv[2]
+    return None
+
+
+def mirror_sidebar_argv(pane_id):
+    """The `herdr-mirror pane ...` supervisor argv if this pane is a Mirror sidebar
+    copy of a remote pane, else None."""
+    for argv in foreground_argvs(pane_id):
+        if len(argv) >= 2 and is_mirror_bin(argv[0]) and argv[1] == "pane":
+            return argv
+    return None
+
+
+def selected_mirror_bin():
+    """The candidate Mirror build odx selected, read fresh on every use."""
+    try:
+        with open(SELECTED) as f:
+            path = json.load(f).get("path")
+    except Exception:
+        return None
+    return path if path and os.access(path, os.X_OK) else None
+
+
+def mirror_env(sidebar_argv):
+    """State/config dirs the view must share with the daemon that owns the sidebar
+    copy. An ssh host's `--ctl-path` lives in that daemon's state dir; otherwise
+    assume the odx candidate daemon."""
+    state = os.path.join(ODX_STATE, "mirror")
+    if "--ctl-path" in sidebar_argv:
+        i = sidebar_argv.index("--ctl-path")
+        if i + 1 < len(sidebar_argv):
+            state = os.path.dirname(sidebar_argv[i + 1])
+    env = {"HERDR_MIRROR_STATE_DIR": state}
+    if os.path.realpath(state) == os.path.realpath(os.path.join(ODX_STATE, "mirror")):
+        env["HERDR_PLUGIN_CONFIG_DIR"] = os.path.join(ODX_CONFIG, "mirror")
+    return env
+
+
+def tile_command(src, target):
+    """`herdr-mirror view` for a mirrored agent, `herdr agent attach` otherwise."""
+    sidebar = mirror_sidebar_argv(src.get("pane_id", ""))
+    if sidebar:
+        binary = selected_mirror_bin()
+        if binary:
+            env = " ".join(f"{k}={shlex.quote(v)}" for k, v in mirror_env(sidebar).items())
+            return f"env {env} {shlex.quote(binary)} view {shlex.quote(target)}"
+        log(f"WARN no usable selected mirror binary in {SELECTED}; falling back to attach")
+    return f"herdr agent attach {shlex.quote(target)}"
+
+
+def attached_source_targets(s):
+    """Agent targets that already have an attach mirror somewhere — read from each
+    mirror pane's actual `herdr agent attach <target>` command, not from a guessed
+    'Proj [agent]' tile label. Label matching collapsed two agents that share a
+    workspace name and agent type into one identity, so it starred both (and
+    blocked adding the second) when only one was really mirrored; the running
+    command is unambiguous. A detected agent's own home pane is never a mirror,
+    so skip those to keep the process-info sweep small."""
+    agent_tids = {a["terminal_id"] for a in s.get("agents", []) if a.get("agent")}
+    cand = [p["pane_id"] for p in s["panes"] if p.get("terminal_id") not in agent_tids]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return {t for t in ex.map(attach_source, cand) if t}
+
+
+def source_aliases(a):
+    """All target spellings used by current and pre-0.7.5 attach commands."""
+    return {v for v in (a.get("name"), a.get("pane_id"), a.get("terminal_id")) if v}
+
+
+def agent_target(a):
+    """Prefer a stable human name; otherwise address the agent by its live pane."""
+    return a.get("name") or a["pane_id"]
+
+
+def candidates(s, tws, me):
+    labels = {w["workspace_id"]: w.get("label", "") for w in s["workspaces"]}
+    tabs = {t["tab_id"]: (t.get("label") or str(t.get("number", ""))) for t in s.get("tabs", [])}
+    out = []
+    attached = attached_source_targets(s)
+    for a in s.get("agents", []):
+        if not a.get("agent"):
+            continue
+        if a.get("workspace_id") == tws or a.get("pane_id") == me:
+            continue
+        is_att = bool(source_aliases(a) & attached)
+        star = "★ " if is_att else "  "
+        tab = tabs.get(a.get("tab_id"), "")
+        cwdtail = os.path.basename((a.get("cwd") or "").rstrip("/"))
+        disp = (f"{star}{agent_name(a, s, labels)} [{a['agent']}]  {a.get('agent_status', '?'):<8}"
+                f" · tab {tab} · {cwdtail} · {a.get('pane_id', '')}")
+        out.append((disp, agent_target(a), is_att))
+    out.sort(key=lambda it: (it[2], it[0]))     # not-yet-attached first, attached at the bottom
+    return out
+
+
+def do_attach(target, tws, me):
+    s = snap()
+    src = next((a for a in s.get("agents", []) if target in source_aliases(a)), None)
+    if not src:
+        log(f"FAIL source target={target} gone")
+        print("source agent gone")
+        return
+    if source_aliases(src) & attached_source_targets(s):
+        log(f"SKIP already-attached target={target}")
+        print("that session is already shown in the matrix (a terminal takes one attach)")
+        return
+    tw = next((w for w in s["workspaces"] if w["workspace_id"] == tws), None)
+    if not tw:
+        log(f"FAIL target ws {tws} gone"); print("target workspace gone"); return
+    # split from the picker pane itself, so the tile lands where you triggered it
+    anchor = me if (me and any(p["pane_id"] == me and p["workspace_id"] == tws for p in s["panes"])) \
+        else next((p["pane_id"] for p in s["panes"] if p["workspace_id"] == tws), None)
+    labels = {w["workspace_id"]: w.get("label", "") for w in s["workspaces"]}
+    agent = src.get("agent", "agent")
+    # Created-tile label stays the WORKSPACE/project name, not the pane's custom
+    # name: it is a cross-tool contract. herdr-matrix builds tiles the same way,
+    # and herdr-prd-prompt maps a mirror back to its real project by stripping
+    # ' [agent]' and matching the rest against a workspace label. The picker LIST
+    # uses agent_name() for human disambiguation, but the persisted tile must not.
+    proj = proj_of(src, labels)
+    try:
+        sh("herdr", "pane", "zoom", anchor, "--off")
+    except Exception:
+        pass
+    try:
+        r = sh("herdr", "pane", "split", anchor, "--direction", "right", "--no-focus")
+        newp = json.loads(r)["result"]["pane"]["pane_id"]
+    except subprocess.CalledProcessError as e:
+        log(f"ERROR split anchor={anchor}: {e.stderr.strip()}"); print("split failed:", e.stderr.strip()); return
+    subprocess.run(["herdr", "pane", "rename", newp, f"{proj} [{agent}]"], check=False)
+    command = tile_command(src, target)
+    subprocess.run(["herdr", "pane", "run", newp, command], check=True)
+    log(f"OK tile target={target} proj={proj} -> ws={tws} newpane={newp} anchor={anchor} cmd={command}")
+    print(f"attached {proj} [{agent}] into '{tw.get('label', tws)}' as {newp}")
+
+
+def pick_curses(items):
+    import curses
+
+    def _run(stdscr):
+        curses.curs_set(0)
+        query, idx = "", 0
+        while True:
+            filt = [it for it in items if query.lower() in it[0].lower()]
+            idx = max(0, min(idx, len(filt) - 1))
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            stdscr.addstr(0, 0, "add agent here (attach) — ★ = already shown; type to filter, Enter, Esc"[:w - 1])
+            stdscr.addstr(1, 0, ("> " + query)[:w - 1])
+            for i, it in enumerate(filt[:max(0, h - 3)]):
+                stdscr.addstr(3 + i, 0, (("> " if i == idx else "  ") + it[0])[:w - 1],
+                              curses.A_REVERSE if i == idx else 0)
+            stdscr.refresh()
+            c = stdscr.getch()
+            if c == 27:
+                return None
+            elif c == curses.KEY_UP:
+                idx -= 1
+            elif c == curses.KEY_DOWN:
+                idx += 1
+            elif c in (10, 13):
+                return filt[idx][1] if filt else None
+            elif c in (curses.KEY_BACKSPACE, 127, 8):
+                query, idx = query[:-1], 0
+            elif 32 <= c < 127:
+                query, idx = query + chr(c), 0
+
+    return curses.wrapper(_run)
+
+
+def main():
+    args = sys.argv[1:]
+    s = snap()
+    tws = target_ws(s)
+    me = os.environ.get("HERDR_PANE_ID")
+    log(f"start tws={tws} me={me} env_ws={os.environ.get('HERDR_WORKSPACE_ID')}")
+    items = candidates(s, tws, me)
+
+    if args and args[0] == "--list":
+        tlabel = next((w.get("label") for w in s["workspaces"] if w["workspace_id"] == tws), tws)
+        print(f"target workspace: {tlabel} ({tws}) — {len(items)} candidates (★ already shown):")
+        for it in items:
+            print(f"  {it[0]:<44} {it[1]}")
+        return
+    if args and args[0] == "--pick":
+        do_attach(args[1], tws, me)
+        return
+    if not items:
+        print("no agents to add"); return
+    if not sys.stdin.isatty():
+        print("interactive picker needs a terminal; use --list or --pick TID"); return
+    tid = pick_curses(items)
+    if tid:
+        do_attach(tid, tws, me)
+
+
+if __name__ == "__main__":
+    main()

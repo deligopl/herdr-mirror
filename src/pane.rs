@@ -226,6 +226,8 @@ enum Msg {
     RemoteRevision(Option<u64>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
+    /// the pane's stdin closed (a view's tile went away)
+    StdinEof,
 }
 
 struct Session {
@@ -1085,6 +1087,17 @@ struct App {
     /// the payload that started the in-flight upload, so it can be forwarded
     /// unchanged when every path turns out to exist on the remote already
     paste_original: Option<Vec<u8>>,
+    /// this process is a `herdr-mirror view` in a tile, not a sidebar copy
+    is_view: bool,
+    /// host key for this streamer's remote-client record (a view keeps its
+    /// own, see `view::view_record_target`)
+    record_target: String,
+    /// the local pane this streamer draws, when it knows it
+    local_pane_id: Option<String>,
+    /// sidebar copy only: the live view claim it is standing aside for
+    claim: Option<crate::view::ViewClaim>,
+    /// sidebar copy only: where its input goes while claimed
+    forward: crate::view::Forwarder,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -1236,7 +1249,8 @@ async fn wait_for_stream_resume(state_dir: &std::path::Path, local_pane_id: &str
 
 impl App {
     fn paint(&mut self) {
-        if !self.tty {
+        // a sidebar copy standing aside for a view shows only its notice
+        if !self.tty || self.claim.is_some() {
             return;
         }
         let (cols, rows) = term_size();
@@ -1378,7 +1392,7 @@ impl App {
     /// daemon's sweep. Wall-clock, because the reader is another process.
     fn publish_stream_health(&self, local_pane_id: Option<&str>) {
         let Some(id) = local_pane_id else { return };
-        if self.args.dump {
+        if self.args.dump || self.is_view || self.claim.is_some() {
             return;
         }
         let now_instant = Instant::now();
@@ -1498,7 +1512,7 @@ impl App {
         if unresolved.is_empty() {
             crate::util::clear_remote_client(
                 &self.state_dir,
-                &self.args.ssh_target,
+                &self.record_target,
                 &self.args.pane_target,
             );
         }
@@ -1519,6 +1533,10 @@ impl App {
 
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
+        if self.claim.is_some() {
+            // standing aside for a view: the terminal is the view's
+            return;
+        }
         // re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
         // the new session repaints from scratch, so a span from the old one
@@ -1685,7 +1703,7 @@ impl App {
                 session.remote_pid = Some(pid);
                 crate::util::record_remote_client(
                     &self.state_dir,
-                    &self.args.ssh_target,
+                    &self.record_target,
                     &self.args.pane_target,
                     pid,
                 );
@@ -1704,6 +1722,15 @@ impl App {
         self.retire_session();
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        // A view attaching while the sidebar copy is still letting go: wait
+        // for it, without spending the control-failure budget on it.
+        if crate::view::retry_attach_conflict(self.is_view, &reason_line) {
+            self.control_failures = 0;
+            self.renderer.status("waiting for the sidebar copy to release the terminal");
+            self.paint();
+            self.reconnect_at = Some((Instant::now() + crate::view::VIEW_CONFLICT_RETRY, exited_mode));
+            return;
+        }
         // A control attach refused because OUR previous client still holds the
         // terminal is not a failing host: clear that client and try once more,
         // rather than dropping the pane to read-only over our own leftovers.
@@ -2096,6 +2123,115 @@ impl App {
             }
         }
     }
+
+    /// Sidebar copy: look for a view claim on this pane, and act on a change.
+    async fn poll_view_claim(&mut self) {
+        let Some(id) = self.local_pane_id.clone() else { return };
+        let now = crate::view::live_claim(&self.state_dir, &id);
+        match crate::view::sidebar_step(self.claim.is_some(), now.is_some()) {
+            crate::view::SidebarStep::Release => {
+                if let Some(claim) = now {
+                    self.enter_view_claim(claim).await;
+                }
+            }
+            crate::view::SidebarStep::Reconnect => self.leave_view_claim().await,
+            crate::view::SidebarStep::Stay => {
+                // one view replaced by another between two polls: the new one
+                // waits for our release marker, which its claim just cleared
+                if let Some(new) = now.filter(|n| Some(n) != self.claim.as_ref()) {
+                    crate::view::mark_released(&self.state_dir, &id);
+                    self.forward.reset();
+                    self.claim = Some(new);
+                    self.draw_view_notice();
+                }
+            }
+        }
+    }
+
+    /// Stand aside for a view: release the remote terminal the way every other
+    /// retire path does (graceful `terminal.release` for control, then the
+    /// transport and the remote client), tell the view, and show a notice.
+    /// This process — and the agent identity Herdr ties to it — stays.
+    async fn enter_view_claim(&mut self, claim: crate::view::ViewClaim) {
+        self.claim = Some(claim);
+        self.reconnect_at = None;
+        self.switching_to = None;
+        self.switch_at = None;
+        self.settle_at = None;
+        self.hint_clear_at = None;
+        // standing aside: no remote traffic and no output health to report
+        self.health_at = None;
+        self.pending_input.clear();
+        self.select.clear();
+        if let Some(mut s) = self.retire_session() {
+            if s.mode == Mode::Control {
+                let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            kill_session_process_group(s.process_group);
+        }
+        if host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+            self.reap_remote_clients().await;
+        }
+        if let Some(id) = &self.local_pane_id {
+            crate::state::clear_stream_health(&self.state_dir, id);
+            crate::view::mark_released(&self.state_dir, id);
+        }
+        self.draw_view_notice();
+    }
+
+    fn draw_view_notice(&mut self) {
+        let Some(claim) = &self.claim else { return };
+        if self.tty {
+            write_stdout(&crate::view::notice(&claim.tile_pane_id));
+            self.mouse_grabbed = false;
+        }
+    }
+
+    /// The view went away: take the terminal back.
+    async fn leave_view_claim(&mut self) {
+        self.claim = None;
+        self.forward.reset();
+        if let Some(id) = &self.local_pane_id {
+            crate::view::clear_released(&self.state_dir, id);
+        }
+        // a view that died without cleaning up leaves its client attached;
+        // clear it before asking for the terminal it is still holding
+        let orphan = crate::util::take_remote_client(
+            &self.state_dir,
+            &crate::view::view_record_target(&self.args.ssh_target),
+            &self.args.pane_target,
+        );
+        self.queue_remote_kill(orphan);
+        if self.tty {
+            write_stdout(crate::view::NOTICE_END);
+            self.sync_mouse_grab();
+        }
+        self.renderer.status("");
+        self.renderer.invalidate();
+        self.backoff_idx = 0;
+        self.control_failures = 0;
+        self.control_sticky = false;
+        self.attach_conflict_retried = false;
+        self.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
+        self.connect(initial_mode(self.args.always_control, term_size())).await;
+    }
+
+    /// Sidebar copy input while a view holds the terminal: focus reports turn
+    /// into a focus redirect, everything else goes to the view.
+    async fn forward_to_view(&mut self, buf: Vec<u8>) {
+        let Some(claim) = self.claim.clone() else { return };
+        let (rest, focus_in) = crate::view::strip_focus_reports(&buf);
+        if focus_in {
+            if let Some(socket) = claim.herdr_socket.clone() {
+                let tile = claim.tile_pane_id.clone();
+                tokio::spawn(async move { crate::view::focus_tile(&socket, &tile).await });
+            }
+        }
+        if !rest.is_empty() {
+            self.forward.send(&claim.socket, &rest).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2390,10 +2526,32 @@ pub async fn supervise(args: Args) -> Result<()> {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    let supervised = std::env::var("HERDR_MIRROR_SUPERVISED").as_deref() == Ok("1");
+    run_with(args, None).await
+}
+
+/// What a `herdr-mirror view` process adds to the ordinary streamer: the input
+/// socket the sidebar copy forwards to, and which sidebar copy it stands for.
+pub struct ViewRuntime {
+    pub listener: std::os::unix::net::UnixListener,
+    pub sidebar_pane_id: String,
+}
+
+/// The streamer, run in a tile on behalf of a sidebar copy (see `view.rs`).
+pub async fn run_view(args: Args, view: ViewRuntime) -> Result<()> {
+    run_with(args, Some(view)).await
+}
+
+async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
+    let is_view = view.is_some();
+    let supervised = !is_view && std::env::var("HERDR_MIRROR_SUPERVISED").as_deref() == Ok("1");
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
     let state_dir = crate::util::state_dir();
+    let record_target = if is_view {
+        crate::view::view_record_target(&args.ssh_target)
+    } else {
+        args.ssh_target.clone()
+    };
 
     // The supervisor owns the visible local pane. A child born during an
     // explicit pause exits before opening any transport; the supervisor holds
@@ -2408,7 +2566,8 @@ pub async fn run(args: Args) -> Result<()> {
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
     // daemon-spawned streamer, so it must not claim the slot
-    let _pidfile = (!args.dump).then(|| {
+    // A view is not the mirror pane's streamer and must not claim its slots.
+    let _pidfile = (!args.dump && !is_view).then(|| {
         let path =
             crate::util::streamer_pid_path(&state_dir, &args.ssh_target, &args.pane_target);
         if let Some(dir) = path.parent() {
@@ -2430,7 +2589,7 @@ pub async fn run(args: Args) -> Result<()> {
     // is talking about and no way to write to it; this is how a hook reaches
     // the streamer sitting in that pane. HERDR_PANE_ID comes from herdr itself
     // and is inherited by whatever it starts in a pane, which is us.
-    let _pane_pidfile = (!supervised).then(|| local_pane_id.as_deref().map(|id| {
+    let _pane_pidfile = (!supervised && !is_view).then(|| local_pane_id.as_deref().map(|id| {
         let path = crate::util::pane_pid_path(&state_dir, id);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -2471,7 +2630,10 @@ pub async fn run(args: Args) -> Result<()> {
             let mut buf = [0u8; 1024];
             loop {
                 match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Msg::StdinEof).await;
+                        break;
+                    }
                     Ok(n) => {
                         if tx.send(Msg::Stdin(buf[..n].to_vec())).await.is_err() {
                             break;
@@ -2538,7 +2700,22 @@ pub async fn run(args: Args) -> Result<()> {
         mouse_flush_at: None,
         paste_queue: Vec::new(),
         paste_original: None,
+        is_view,
+        record_target: record_target.clone(),
+        local_pane_id: local_pane_id.clone(),
+        claim: None,
+        forward: crate::view::Forwarder::default(),
     };
+    // A view takes the sidebar copy's input from its socket, exactly as if it
+    // had been typed into the tile.
+    if let Some(view) = view {
+        let tx = app.tx.clone();
+        crate::view::spawn_input_listener(view.listener, move |bytes| {
+            let tx = tx.clone();
+            tokio::spawn(async move { tx.send(Msg::Stdin(bytes)).await.is_ok() })
+        })?;
+        let _ = view.sidebar_pane_id;
+    }
     // A streamer that was killed before it could clean up (a daemon restart, a
     // closed pane, a SIGKILL) leaves its remote client attached and its pid on
     // disk. We are the next streamer for that same mirror pane, so the record
@@ -2548,7 +2725,7 @@ pub async fn run(args: Args) -> Result<()> {
     if !app.args.dump {
         let adopted = crate::util::take_remote_client(
             &state_dir,
-            &app.args.ssh_target,
+            &record_target,
             &app.args.pane_target,
         );
         app.queue_remote_kill(adopted);
@@ -2573,12 +2750,25 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut pause_tick = tokio::time::interval(STREAM_PAUSE_POLL_INTERVAL);
     pause_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Only a sidebar copy can be claimed by a view.
+    let claimable = !app.is_view && !app.args.dump && app.local_pane_id.is_some();
+    let mut claim_tick = tokio::time::interval(crate::view::VIEW_CLAIM_POLL_INTERVAL);
+    claim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // A view may already hold this pane (the supervisor replaced its child
+    // while a tile was showing it): stand aside from the start.
+    if claimable {
+        app.poll_view_claim().await;
+    }
     app.connect(initial_mode(app.args.always_control, term_size())).await;
-    app.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
+    if app.claim.is_none() {
+        app.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
+    }
     // the pane may have been laid out while the session was spawning; the signal
     // for that is buffered above, but check directly too
-    if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
+    if app.claim.is_some() {
+        // nothing to size or explain: the notice is up
+    } else if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
     {
         app.switch_mode(Mode::Control);
     } else if app.args.always_control && app.mode == Mode::Observe {
@@ -2612,7 +2802,14 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
                     Some(Msg::RemotePid { gen, pid }) => app.handle_remote_pid(gen, pid),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
-                    Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
+                    Some(Msg::Stdin(buf)) => if app.claim.is_some() {
+                        app.forward_to_view(buf).await;
+                    } else {
+                        app.handle_stdin(buf).await;
+                    },
+                    // a tile whose terminal went away: the view is over. A
+                    // sidebar copy's lifecycle belongs to its pane (SIGHUP).
+                    Some(Msg::StdinEof) => if app.is_view { break },
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
                         // a foreground change means the screen belongs to a
@@ -2630,7 +2827,14 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
+            _ = claim_tick.tick(), if claimable => {
+                app.poll_view_claim().await;
+            }
             _ = sigwinch.recv() => {
+                if app.claim.is_some() {
+                    app.draw_view_notice();
+                    continue;
+                }
                 app.renderer.invalidate();
                 // a resize means a client is laying this pane out, so the size is
                 // now a real viewport: take control if that is what we're for.
@@ -2660,7 +2864,7 @@ pub async fn run(args: Args) -> Result<()> {
             _ = sighup.recv() => break,
             _ = pause_tick.tick() => {
                 if !stream_may_connect(&state_dir) {
-                    if let Some(id) = &local_pane_id {
+                    if let Some(id) = local_pane_id.as_ref().filter(|_| !is_view) {
                         // The daemon reload may clear its global marker before
                         // our bounded remote-client cleanup finishes. Leave a
                         // pane-local acknowledgement so the supervisor still
@@ -2746,10 +2950,13 @@ pub async fn run(args: Args) -> Result<()> {
     // A record outliving its streamer would let the sweep judge a pane that no
     // longer has one; that pane's recovery is `heal_zombie_mirrors`, not a
     // restart request addressed to nobody.
-    if let Some(id) = local_pane_id.as_deref() {
+    if let Some(id) = local_pane_id.as_deref().filter(|_| !is_view) {
         crate::state::clear_stream_health(&state_dir, id);
     }
     if tty {
+        if app.claim.is_some() {
+            write_stdout(crate::view::NOTICE_END);
+        }
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
         // 1007 back on: it is a default-on mode we turned off, so leaving it
@@ -3639,6 +3846,213 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
 
     // Exercise the real input routing: a release and the next press can share
     // one stdin read. A local sink stands in for the session; no SSH is used.
+    fn closed_admission_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hmv-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pending health retry closes admission for host "h", which keeps
+        // every connect and remote-client reap in these tests local.
+        crate::state::publish_host_health(
+            &dir,
+            "h",
+            &crate::state::HostHealth {
+                summary: "test".into(),
+                at_iso: "test".into(),
+                next_retry_unix: Some(1e12),
+            },
+        );
+        dir
+    }
+
+    fn local_session(gen: u64, sink: &std::path::Path) -> (Session, tokio::process::Child) {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", &format!("cat > '{}'", sink.display())])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true);
+        isolate_session_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let session = Session {
+            gen,
+            mode: Mode::Control,
+            process_group: child.id().unwrap() as i32,
+            remote_pid: None,
+            stdin: child.stdin.take().unwrap(),
+        };
+        (session, child)
+    }
+
+    #[tokio::test]
+    async fn a_sidebar_copy_stands_aside_for_a_view_and_takes_the_terminal_back() {
+        let dir = closed_admission_dir("side");
+        let args = parse_args(&["t".into(), "w1:p1".into(), "--host-name".into(), "h".into()])
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = test_app(args, dir.clone(), false, tx);
+        app.local_pane_id = Some("wS:p1".into());
+        let sink = dir.join("session-input");
+        let (session, mut child) = local_session(1, &sink);
+        app.session = Some(session);
+        app.mode = Mode::Control;
+        app.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
+
+        // no claim: nothing changes
+        app.poll_view_claim().await;
+        assert!(app.claim.is_none());
+        assert!(app.session.is_some());
+
+        // a view claims the pane: the session is released gracefully and
+        // dropped, the release is announced, and nothing reconnects
+        let (guard, listener) =
+            crate::view::create_claim(&dir, "wS:p1", "wM:p2", None).unwrap();
+        app.poll_view_claim().await;
+        assert_eq!(app.claim.as_ref().map(|c| c.tile_pane_id.as_str()), Some("wM:p2"));
+        assert!(app.session.is_none());
+        assert!(app.reconnect_at.is_none());
+        assert!(app.health_at.is_none());
+        assert!(crate::view::is_released(&dir, "wS:p1"));
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        let written = std::fs::read_to_string(&sink).unwrap();
+        assert!(written.contains("terminal.release"), "{written:?}");
+        // connect is refused while claimed
+        app.connect(Mode::Control).await;
+        assert!(app.session.is_none());
+
+        // input typed (or prompted) into the sidebar copy reaches the view;
+        // focus reports do not
+        let (itx, mut irx) = mpsc::channel::<Vec<u8>>(8);
+        crate::view::spawn_input_listener(listener, move |bytes| {
+            let itx = itx.clone();
+            tokio::spawn(async move { itx.send(bytes).await.is_ok() })
+        })
+        .unwrap();
+        app.forward_to_view(b"\x1b[Iship it\r".to_vec()).await;
+        let got = tokio::time::timeout(Duration::from_secs(2), irx.recv()).await.unwrap().unwrap();
+        assert_eq!(got, b"ship it\r".to_vec());
+
+        // the view ends: the claim is gone, and the sidebar copy reconnects
+        // (here into the closed admission gate, so it only schedules)
+        drop(guard);
+        app.poll_view_claim().await;
+        assert!(app.claim.is_none());
+        assert!(!crate::view::is_released(&dir, "wS:p1"));
+        assert!(app.reconnect_at.is_some());
+        assert!(app.health_at.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_view_keeps_retrying_while_the_sidebar_copy_still_holds_the_terminal() {
+        let dir = closed_admission_dir("vconf");
+        let args = parse_args(&["t".into(), "w1:p1".into(), "--always-control".into()]).unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = test_app(args, dir.clone(), false, tx);
+        app.is_view = true;
+        let sink = dir.join("s");
+        for gen in 1..=3 {
+            let (session, _child) = local_session(gen, &sink);
+            app.session = Some(session);
+            app.mode = Mode::Control;
+            app.handle_exit(
+                gen,
+                Mode::Control,
+                "terminal t9 already has an attached client; retry".into(),
+                Duration::from_millis(50),
+            );
+            // never falls back to read-only over the sidebar copy's release
+            assert_eq!(app.control_failures, 0);
+            assert!(!app.control_sticky);
+            assert!(app.switching_to.is_none());
+            let (at, mode) = app.reconnect_at.expect("retry scheduled");
+            assert_eq!(mode, Mode::Control);
+            assert!(at <= Instant::now() + crate::view::VIEW_CONFLICT_RETRY);
+        }
+        // the same refusal in a sidebar copy keeps the old policy
+        app.is_view = false;
+        for gen in 4..=5 {
+            let (session, _child) = local_session(gen, &sink);
+            app.session = Some(session);
+            app.mode = Mode::Control;
+            app.handle_exit(
+                gen,
+                Mode::Control,
+                "terminal t9 already has an attached client; retry".into(),
+                Duration::from_millis(50),
+            );
+        }
+        assert!(app.control_sticky, "sidebar copy falls back to observe");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An `App` with no transport, for exercising its state machine directly.
+    fn test_app(
+        args: Args,
+        state_dir: std::path::PathBuf,
+        tty: bool,
+        tx: mpsc::Sender<Msg>,
+    ) -> App {
+        let fg_poller = crate::foreground::shared(crate::poll_channel::Transport::Ssh {
+            target: args.ssh_target.clone(),
+            ctl_path: None,
+        });
+    App {
+        args,
+        state_dir: state_dir.clone(),
+        tty,
+        grid: Grid::new(),
+        renderer: Renderer::new(),
+        tx,
+        mode: Mode::Observe,
+        switching_to: None,
+        switch_at: None,
+        session: None,
+        next_gen: 0,
+        backoff_idx: 0,
+        reconnect_at: None,
+        pending_remote_kills: Vec::new(),
+        attach_conflict_retried: false,
+        control_failures: 0,
+        control_sticky: false,
+        pending_input: Vec::new(),
+        last_input: Instant::now(),
+        hint_clear_at: None,
+        predict: Predictor::new(),
+        remote_fg: None,
+        select: Select::new(),
+        last_select_rows: None,
+        fg_poll_at: None,
+        fg_poll_gate: crate::foreground::PollGate::new(),
+        fg_poller,
+        last_frame_at: Instant::now(),
+        remote_revision: None,
+        remote_advanced_at: None,
+        health_at: None,
+        settle_at: None,
+        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+        // startup leaves the pane in normal cursor mode; the first classification
+        // moves it if the remote turns out to be a TUI
+        app_cursor_keys: false,
+        paste_inflight: false,
+        paste_buf: Vec::new(),
+        mouse_buf: Vec::new(),
+        mouse_flush_at: None,
+        paste_queue: Vec::new(),
+        paste_original: None,
+        is_view: false,
+        record_target: "unused".into(),
+        local_pane_id: None,
+        claim: None,
+        forward: crate::view::Forwarder::default(),
+    }
+    }
+
     async fn selection_followed_by_press(next_drag: bool) {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
@@ -3647,54 +4061,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
             "herdr-mirror-selection-{}-{next_drag}",
             std::process::id()
         ));
-        let fg_poller = crate::foreground::shared(crate::poll_channel::Transport::Ssh {
-            target: args.ssh_target.clone(),
-            ctl_path: None,
-        });
-        let mut app = App {
-            args,
-            state_dir: state_dir.clone(),
-            tty,
-            grid: Grid::new(),
-            renderer: Renderer::new(),
-            tx,
-            mode: Mode::Observe,
-            switching_to: None,
-            switch_at: None,
-            session: None,
-            next_gen: 0,
-            backoff_idx: 0,
-            reconnect_at: None,
-            pending_remote_kills: Vec::new(),
-            attach_conflict_retried: false,
-            control_failures: 0,
-            control_sticky: false,
-            pending_input: Vec::new(),
-            last_input: Instant::now(),
-            hint_clear_at: None,
-            predict: Predictor::new(),
-            remote_fg: None,
-            select: Select::new(),
-            last_select_rows: None,
-            fg_poll_at: None,
-            fg_poll_gate: crate::foreground::PollGate::new(),
-            fg_poller,
-            last_frame_at: Instant::now(),
-            remote_revision: None,
-            remote_advanced_at: None,
-            health_at: None,
-            settle_at: None,
-            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-            // startup leaves the pane in normal cursor mode; the first classification
-            // moves it if the remote turns out to be a TUI
-            app_cursor_keys: false,
-            paste_inflight: false,
-            paste_buf: Vec::new(),
-            mouse_buf: Vec::new(),
-            mouse_flush_at: None,
-            paste_queue: Vec::new(),
-            paste_original: None,
-        };
+        let mut app = test_app(args, state_dir.clone(), tty, tx);
         let mut child = tokio::process::Command::new("cat")
             .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
             .spawn().unwrap();

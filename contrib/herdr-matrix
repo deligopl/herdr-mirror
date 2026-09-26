@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""herdr-matrix — build a live matrix of your top-N agents as ATTACH mirrors, natively in herdr.
+
+Each tile runs `herdr agent attach <pane-id>` — a live, interactive view of a real
+agent — or, for an agent that is a Herdr Mirror sidebar copy of a remote pane,
+`<selected herdr-mirror> view <pane-id>`, which takes the remote stream into the tile
+while the sidebar copy keeps the agent's local identity. The agents stay in their home
+workspaces, untouched (nothing is moved or copied).
+Reversible: close the matrix workspace (prefix+shift+d) and the agents are unaffected.
+
+Usage:
+  herdr-matrix [N] [--label NAME]
+
+  N   how many top agents by priority (default 6). Grid is 2 rows: 4->2x2, 6->3x2, 8->4x2.
+"""
+import json, math, os, shlex, subprocess, sys
+
+os.environ["PATH"] = ":".join([
+    os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin",
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin", os.environ.get("PATH", ""),
+])
+ODX_STATE = os.environ.get("ODX_STATE_DIR") or os.path.expanduser("~/.local/state/odx")
+ODX_CONFIG = os.environ.get("ODX_CONFIG_DIR") or os.path.expanduser("~/.config/odx")
+SELECTED = os.path.join(ODX_STATE, "candidate-mirror", "selected.json")
+
+
+def sh(*a):
+    return subprocess.run(a, check=True, capture_output=True, text=True).stdout
+
+
+def hj(*a):
+    return json.loads(sh("herdr", *a))["result"]
+
+
+def snap():
+    return hj("api", "snapshot")["snapshot"]
+
+
+def mirror_sidebar_argv(pane_id):
+    """The `herdr-mirror pane ...` supervisor argv if this pane is a Mirror sidebar
+    copy of a remote pane, else None."""
+    try:
+        pi = json.loads(sh("herdr", "pane", "process-info", "--pane", pane_id))["result"]["process_info"]
+    except Exception:
+        return None
+    for fp in pi.get("foreground_processes", []):
+        argv = fp.get("argv", [])
+        if len(argv) >= 2 and os.path.basename(argv[0]) == "herdr-mirror" and argv[1] == "pane":
+            return argv
+    return None
+
+
+def selected_mirror_bin():
+    """The candidate Mirror build odx selected, read fresh on every run."""
+    try:
+        with open(SELECTED) as f:
+            path = json.load(f).get("path")
+    except Exception:
+        return None
+    return path if path and os.access(path, os.X_OK) else None
+
+
+def mirror_env(sidebar_argv):
+    """State/config dirs the view must share with the daemon that owns the sidebar
+    copy. An ssh host's `--ctl-path` lives in that daemon's state dir; otherwise
+    assume the odx candidate daemon."""
+    state = os.path.join(ODX_STATE, "mirror")
+    if "--ctl-path" in sidebar_argv:
+        i = sidebar_argv.index("--ctl-path")
+        if i + 1 < len(sidebar_argv):
+            state = os.path.dirname(sidebar_argv[i + 1])
+    env = {"HERDR_MIRROR_STATE_DIR": state}
+    if os.path.realpath(state) == os.path.realpath(os.path.join(ODX_STATE, "mirror")):
+        env["HERDR_PLUGIN_CONFIG_DIR"] = os.path.join(ODX_CONFIG, "mirror")
+    return env
+
+
+def tile_command(target):
+    """`herdr-mirror view` for a mirrored agent, `herdr agent attach` otherwise."""
+    sidebar = mirror_sidebar_argv(target)
+    binary = selected_mirror_bin() if sidebar else None
+    if sidebar and binary:
+        env = " ".join(f"{k}={shlex.quote(v)}" for k, v in mirror_env(sidebar).items())
+        return f"env {env} {shlex.quote(binary)} view {shlex.quote(target)}"
+    if sidebar:
+        print(f"warning: no usable mirror binary in {SELECTED}; attaching {target} instead",
+              file=sys.stderr)
+    return f"herdr agent attach {shlex.quote(target)}"
+
+
+def parse(argv):
+    n, label = 6, "matrix"
+    it = iter(argv)
+    for a in it:
+        if a in ("-h", "--help"):
+            print(__doc__); sys.exit(0)
+        elif a == "--label": label = next(it)
+        elif a.isdigit(): n = int(a)
+        else: sys.exit(f"unknown arg {a}")
+    return n, label
+
+
+def main():
+    n, label = parse(sys.argv[1:])
+    s = snap()
+    labels = {w["workspace_id"]: w.get("label", "") for w in s["workspaces"]}
+    me = os.environ.get("HERDR_PANE_ID")
+    sel = []
+    for a in s.get("agents", []):                 # priority order
+        if not a.get("agent"):
+            continue
+        if a.get("pane_id") == me or a.get("focused"):   # skip controlling / active pane
+            continue
+        lbl = labels.get(a.get("workspace_id", ""), "")
+        if lbl == label or lbl.endswith("-matrix") or lbl.startswith("attach"):
+            continue                               # skip an existing matrix's own mirrors
+        proj = lbl or os.path.basename((a.get("cwd") or "").rstrip("/"))
+        sel.append({"target": a["pane_id"], "proj": proj, "agent": a["agent"]})
+    sel = sel[:n]
+    if not sel:
+        sys.exit("no agents to attach")
+    n = len(sel)
+    rows = 2 if n >= 3 else 1
+    cols = math.ceil(n / rows)
+
+    ws = hj("workspace", "create", "--label", label, "--no-focus")
+    root = ws["root_pane"]["pane_id"]
+    panes, top = [root], [root]
+    for _ in range(1, cols):
+        p = hj("pane", "split", top[-1], "--direction", "right", "--no-focus")["pane"]["pane_id"]
+        top.append(p); panes.append(p)
+    col_last, col = list(top), 0
+    while len(panes) < n:
+        p = hj("pane", "split", col_last[col], "--direction", "down", "--no-focus")["pane"]["pane_id"]
+        col_last[col] = p; panes.append(p); col = (col + 1) % cols
+
+    for pane, it in zip(panes, sel):
+        subprocess.run(["herdr", "pane", "rename", pane, f"{it['proj']} [{it['agent']}]"], check=False)
+        command = tile_command(it["target"])
+        subprocess.run(["herdr", "pane", "run", pane, command], check=True)
+
+    wid = ws["workspace"]["workspace_id"]
+    print(f"matrix '{label}' ({wid}) — {n} live tiles, {cols}x{rows}. "
+          f"close the workspace to dismiss (agents untouched).")
+    for pane, it in zip(panes, sel):
+        print(f"  {pane}  {it['agent']:<7} {it['proj']}")
+
+
+if __name__ == "__main__":
+    main()

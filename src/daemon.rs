@@ -733,6 +733,12 @@ fn heal_interval_seconds(poll_seconds: u64) -> u64 {
 /// clocks, and the verdict — is testable without a live pane, which is the only
 /// way to cover a shape that took a real transport fault to produce.
 fn streamer_output_stalled(state_dir: &std::path::Path, local_pane_id: &str, now: f64) -> bool {
+    // A sidebar copy standing aside for a view (`herdr-mirror view`) draws
+    // nothing and carries no stream by design; it is neither stalled nor due
+    // a restart, and restarting it would only fight the view for the terminal.
+    if crate::view::live_claim(state_dir, local_pane_id).is_some() {
+        return false;
+    }
     crate::state::read_stream_health(state_dir, local_pane_id).is_some_and(|health| {
         crate::state::output_direction_stalled(
             &health,
@@ -1531,6 +1537,32 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
         assert_eq!(human_countdown(300.0), "in 5m");
         assert_eq!(human_countdown(30.0), "in 30s");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidebar copy standing aside for `herdr-mirror view` draws nothing on
+    /// purpose. Even with a record that would otherwise read as frozen, the
+    /// sweep must leave it alone while the view holds its claim, and judge it
+    /// normally again once the view is gone.
+    #[test]
+    fn a_sidebar_copy_claimed_by_a_view_is_never_judged_stalled() {
+        let dir = std::env::temp_dir().join(format!("hm-stall-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pane = "w7R:p9";
+        let now = 10_000.0;
+        crate::state::publish_stream_health(
+            &dir,
+            pane,
+            &crate::state::StreamHealth {
+                last_frame_unix: now - 600.0,
+                remote_advanced_unix: Some(now - 300.0),
+            },
+        );
+        assert!(streamer_output_stalled(&dir, pane, now));
+        let (claim, _listener) = crate::view::create_claim(&dir, pane, "wM:p1", None).unwrap();
+        assert!(!streamer_output_stalled(&dir, pane, now));
+        drop(claim);
+        assert!(streamer_output_stalled(&dir, pane, now));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

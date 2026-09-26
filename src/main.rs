@@ -3,6 +3,7 @@
 //
 //   herdr-mirror daemon                 # control plane (foreground; `start` spawns this)
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
+//   herdr-mirror view <agent|pane>      # show a mirrored pane in this tile
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror hide|show [host]       # toggle a connection's mirrors out of view
 //   herdr-mirror suspend <host>         # stop one host's local/remote stream clients
@@ -36,6 +37,7 @@ mod select;
 mod ssh_relay;
 mod state;
 mod util;
+mod view;
 
 use util::{Env, Result};
 
@@ -106,6 +108,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::supervise(args))
         }
+        "view" => rt.block_on(view::cmd_view(Env::resolve()?, &rest[1..])),
         // Internal child of the stable pane supervisor. Kept out of help and
         // user-facing command lists; the supervisor reconstructs these args.
         "pane-stream" => {
@@ -152,7 +155,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|wake|suspend|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|view|start|pause|ensure|status|once|restore|teardown|hide|show|wake|suspend|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }
