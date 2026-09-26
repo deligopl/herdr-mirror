@@ -673,4 +673,18 @@ mod one_poll_per_pane {
         }
         panic!("the gate stayed shut after the poll was cancelled");
     }
+
+    #[test]
+    fn pagers_keep_application_cursor_keys_and_mouse_capability() {
+        let pane = r#"{"result":{"pane":{"agent":null}}}"#;
+        // Fg::Shell also disables DECCKM. A pager's mouse policy must not
+        // change its cursor-key encoding, or assume less --mouse is off.
+        for name in ["less", "more", "most", "pager", "journalctl"] {
+            let proc = serde_json::json!({"result": {"process_info": {
+                "foreground_processes": [{"name": name}]
+            }}}).to_string();
+            assert_eq!(classify(pane, &proc), Some(Fg::Mouse), "{name}");
+        }
+    }
+
 }

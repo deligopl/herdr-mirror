@@ -171,6 +171,7 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
+    "pane.agent_detected",
     // a bare remote resize (no pane created/closed) has no other event to
     // hang a converge off of; falls into the generic converge_at branch below
     // like any subscription this daemon doesn't special-case.
@@ -183,7 +184,7 @@ fn sub_list(pane_ids: &[String]) -> Vec<Value> {
     subs
 }
 
-/// Broadcast structure events + per-pane agent-status subscriptions
+/// Broadcast structure/lifecycle events + per-pane agent-status subscriptions
 /// (pane.agent_status_changed requires a pane_id). A rejected pane
 /// subscription degrades to broadcast-only instead of killing the connection.
 async fn resubscribe(
@@ -1069,7 +1070,8 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         }
         Some(probe) => drop(probe),
     }
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::self_exe_path()
+        .ok_or_else(|| err("cannot locate the herdr-mirror binary to respawn"))?;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -2059,6 +2061,56 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
 
         task.abort();
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// Detection is a separate lifecycle event from later status changes. If
+    /// this broadcast subscription disappears, a newly detected agent can sit
+    /// stale until the periodic poll even though its pane is already mirrored.
+    #[test]
+    fn subscriptions_include_explicit_agent_detection() {
+        let subs = sub_list(&["w1:p1".to_string()]);
+
+        assert!(subs.contains(&json!({ "type": "pane.agent_detected" })));
+        assert!(subs.contains(&json!({
+            "type": "pane.agent_status_changed",
+            "pane_id": "w1:p1",
+        })));
+    }
+
+    fn lock_test_env(tag: &str) -> Env {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-daemon-lock-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        Env { config_search: Vec::new(), state_dir, local_socket: PathBuf::new() }
+    }
+
+    #[test]
+    fn daemon_lifetime_lock_excludes_a_second_owner() {
+        let env = lock_test_env("exclusive");
+        let owner = DaemonOwner::acquire(&env).unwrap();
+        owner.publish().unwrap();
+        assert_eq!(running_pid(&env), Some(std::process::id() as i32));
+        assert!(DaemonOwner::acquire(&env).is_err());
+        drop(owner);
+        assert_eq!(running_pid(&env), None);
+        let _ = fs::remove_dir_all(&env.state_dir);
+    }
+
+    #[test]
+    fn lifetime_guard_does_not_remove_a_newer_pidfile() {
+        let env = lock_test_env("new-owner");
+        let owner = DaemonOwner::acquire(&env).unwrap();
+        owner.publish().unwrap();
+        fs::write(pid_path(&env), "123456").unwrap();
+        drop(owner);
+        assert_eq!(fs::read_to_string(pid_path(&env)).unwrap(), "123456");
+        let _ = fs::remove_dir_all(&env.state_dir);
     }
 
     /// One fallback is not evidence: the probe also fails when the remote herdr

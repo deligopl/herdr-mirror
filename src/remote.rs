@@ -908,7 +908,7 @@ fn nonempty(e: &str, code: i32) -> String {
 }
 
 /// `Some(true)` = supported, `Some(false)` = too old, `None` = unparseable.
-fn version_supported(version: &str) -> Option<bool> {
+pub(crate) fn version_supported(version: &str) -> Option<bool> {
     let core = version.split(['-', '+']).next()?;
     let mut it = core.split('.');
     let maj: u64 = it.next()?.parse().ok()?;
@@ -1406,6 +1406,38 @@ while :; do /bin/sleep 1; done
         let deep = PathBuf::from("/Users/example/".to_string() + &"d".repeat(80));
         assert_ne!(socket_stem(&deep, "alpha-host-name"), socket_stem(&deep, "beta-host-name"));
         assert!(!socket_stem(&deep, "alpha-host-name").is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_proxy_command() {
+        let pid_path = test_path("timed-out-proxy-pid");
+        let proxy = format!(
+            "ProxyCommand=sh -c 'echo $$ > {}; exec sleep 30'",
+            pid_path.display()
+        );
+        let args = vec!["-o".into(), proxy, "timeout-test.invalid".into()];
+
+        let output = ssh(&args, 250).await;
+        let proxy_pid: i32 = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut proxy_survived = false;
+        for _ in 0..20 {
+            proxy_survived = unsafe { libc::kill(proxy_pid, 0) } == 0;
+            if !proxy_survived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        if proxy_survived {
+            unsafe { libc::kill(proxy_pid, libc::SIGKILL) };
+        }
+        let _ = fs::remove_file(pid_path);
+        assert_eq!(output.err, "ssh timeout");
+        assert!(!proxy_survived, "ProxyCommand survived the ssh timeout");
     }
 
     #[test]

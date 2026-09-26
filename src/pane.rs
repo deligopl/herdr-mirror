@@ -231,8 +231,9 @@ enum Msg {
 struct Session {
     gen: u64,
     mode: Mode,
-    /// local transport child (ssh, or `docker exec`)
-    pid: i32,
+    /// local transport child (ssh, or `docker exec`), started as its own
+    /// process-group leader so its pid is also the group id
+    process_group: i32,
     /// remote `herdr … terminal session …` client, once it has announced
     /// itself. `None` until that line arrives — the attach may fail before the
     /// wrapper ever runs — so every cleanup treats it as optional.
@@ -249,9 +250,35 @@ async fn write_terminal_input(
     stdin.write_all(line.as_bytes()).await
 }
 
+/// Stop the transport and every local helper it spawned (notably an ssh
+/// ProxyCommand such as `aws ssm start-session`). Each transport is started as
+/// its own process-group leader, so this cannot signal the pane wrapper itself.
+fn kill_session_process_group(process_group: i32) {
+    if process_group > 0 {
+        unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+}
+
+fn isolate_session_process_group(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
 pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
+    let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    // A pane stream is long-lived and interactive. It must not inherit a
+    // ControlPath from ~/.ssh/config: a stale shared master can hang
+    // the stream before the remote command starts. `-S none` disables control
+    // socket use without changing the daemon's intentional multiplexing.
+    argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]);
+    argv
 }
 
 /// Prefix the remote wrapper prints, on its own line, before it becomes the
@@ -456,7 +483,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(sh_wrapped(&cmd));
+            c.args(ssh_stream_args(&args.ssh_target, &sh_wrapped(&cmd)));
             c
         }
         Some(ct) => {
@@ -475,12 +502,16 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             c
         }
     };
+    // Keep the transport and all of its local descendants in one independently
+    // killable group. Killing only ssh can orphan a ProxyCommand and leave its
+    // remote terminal controller attached after the mirror pane closes.
+    isolate_session_process_group(&mut builder);
     let mut child = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let pid = child.id().map(|p| p as i32).unwrap_or(0);
+    let process_group = child.id().map(|p| p as i32).unwrap_or(0);
     let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
@@ -529,7 +560,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, pid, remote_pid: None, stdin })
+    Ok(Session { gen, mode, process_group, remote_pid: None, stdin })
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +707,60 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
         }
     }
     None
+}
+
+const MOUSE_INPUT_TIMEOUT: Duration = Duration::from_millis(150);
+const MAX_INCOMPLETE_MOUSE_BYTES: usize = 32;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum MouseSplit {
+    Pending,
+    Passthrough(Vec<u8>),
+}
+
+/// Find a possible SGR mouse sequence that ends at the current read boundary.
+/// Only a short, syntactically valid prefix is held; ordinary input keeps
+/// flowing to the existing routing code.
+fn trailing_incomplete_mouse(bytes: &[u8]) -> Option<usize> {
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != 0x1b {
+            continue;
+        }
+        let rest = &bytes[at..];
+        if rest == b"\x1b" || rest == b"\x1b[" {
+            return Some(at);
+        }
+        if rest.starts_with(b"\x1b[<")
+            && rest.len() <= MAX_INCOMPLETE_MOUSE_BYTES
+            && rest[3..].iter().all(|b| b.is_ascii_digit() || *b == b';')
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// Hold only a trailing incomplete mouse sequence across stdin reads.
+pub(crate) fn split_mouse(buf: &mut Vec<u8>, chunk: Vec<u8>) -> MouseSplit {
+    let mut all = std::mem::take(buf);
+    all.extend_from_slice(&chunk);
+    let Some(at) = trailing_incomplete_mouse(&all) else {
+        return MouseSplit::Passthrough(all);
+    };
+    let tail = all.split_off(at);
+    *buf = tail;
+    if all.is_empty() {
+        MouseSplit::Pending
+    } else {
+        MouseSplit::Passthrough(all)
+    }
+}
+
+/// A timed-out lone ESC is still a key; an incomplete mouse prefix is dropped
+/// so it cannot leak as literal input into a remote shell.
+fn flush_mouse(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let pending = std::mem::take(buf);
+    (pending == b"\x1b").then_some(pending)
 }
 
 /// How a parsed mouse event should be routed while in control mode.
@@ -992,6 +1077,9 @@ struct App {
     paste_inflight: bool,
     /// partially-received bracketed paste (see `intercept_paste`)
     paste_buf: Vec<u8>,
+    /// partially-received SGR mouse sequence
+    mouse_buf: Vec<u8>,
+    mouse_flush_at: Option<Instant>,
     /// input held back while an upload is in flight, flushed in order after
     paste_queue: Vec<Queued>,
     /// the payload that started the in-flight upload, so it can be forwarded
@@ -1424,7 +1512,7 @@ impl App {
                     let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                unsafe { libc::kill(s.pid, libc::SIGTERM) };
+                kill_session_process_group(s.process_group);
             });
         }
     }
@@ -1447,7 +1535,7 @@ impl App {
             Mode::Control => self.control_size(),
         };
         if let Some(s) = self.retire_session() {
-            unsafe { libc::kill(s.pid, libc::SIGTERM) };
+            kill_session_process_group(s.process_group);
         }
         // Before attaching, not after: the client we are replacing still holds
         // the remote terminal, and a control attach beside it is refused
@@ -1661,6 +1749,24 @@ impl App {
         }
     }
 
+    /// Route ordinary input after preserving a partial SGR mouse sequence.
+    async fn route_mouse_input(&mut self, bytes: Vec<u8>) {
+        match split_mouse(&mut self.mouse_buf, bytes) {
+            MouseSplit::Pending => {}
+            MouseSplit::Passthrough(bytes) => self.route_input(bytes).await,
+        }
+        self.mouse_flush_at = (!self.mouse_buf.is_empty())
+            .then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
+    }
+
+    /// Flush an unfinished mouse prefix after its short completion window.
+    async fn flush_mouse_input(&mut self) {
+        self.mouse_flush_at = None;
+        if let Some(bytes) = flush_mouse(&mut self.mouse_buf) {
+            self.route_input(bytes).await;
+        }
+    }
+
     /// Drain every complete paste in this chunk, in order.
     ///
     /// Deliberately a loop, not a one-shot: two drops land in a single read
@@ -1673,9 +1779,15 @@ impl App {
         loop {
             match split_paste(&mut self.paste_buf, chunk) {
                 PasteSplit::Pending => return,
-                PasteSplit::Passthrough(bytes) => return self.route_input(bytes).await,
+                PasteSplit::Passthrough(bytes) => return self.route_mouse_input(bytes).await,
                 PasteSplit::Complete { before, body, after } => {
-                    self.route_input(before).await;
+                    self.route_mouse_input(before).await;
+                    // A partial mouse sequence cannot continue into a paste;
+                    // discard it before delivering the paste body directly.
+                    if !self.mouse_buf.is_empty() {
+                        self.mouse_buf.clear();
+                        self.mouse_flush_at = None;
+                    }
                     self.route_paste_body(body).await;
                     if after.is_empty() {
                         return;
@@ -1868,7 +1980,12 @@ impl App {
                             (false, _) => match self.select.release(at, raw) {
                                 // the clipboard holds one thing, so a second
                                 // gesture in the same read legitimately wins
-                                Released::Selection(span) => copy_span = Some(span),
+                                Released::Selection(span) => {
+                                    copy_span = Some(span);
+                                    // Finish this gesture before a later press in
+                                    // the same read starts the next selection.
+                                    sel_changed |= self.select.clear();
+                                },
                                 // It was a click, not a drag. TUI/agent get it
                                 // (claude and codex discard the bytes cleanly).
                                 // A shell does not: the prompt never enabled
@@ -2055,7 +2172,10 @@ fn respawn_decision(success: bool, ran_for: Duration, attempts: u32) -> Option<R
 }
 
 fn spawn_supervised_streamer(agent: Option<&str>) -> Result<tokio::process::Child> {
-    let exe = std::env::current_exe()?;
+    // Same resolution as every other self-respawn: after an in-place rebuild
+    // current_exe() names "<path> (deleted)" on Linux, which cannot run.
+    let exe = crate::util::self_exe_path()
+        .ok_or_else(|| err("cannot locate the herdr-mirror binary to respawn the streamer"))?;
     let mut command = tokio::process::Command::new(exe);
     command.arg("pane-stream").args(std::env::args_os().skip(2));
     command.env("HERDR_MIRROR_SUPERVISED", "1");
@@ -2414,6 +2534,8 @@ pub async fn run(args: Args) -> Result<()> {
         app_cursor_keys: false,
         paste_inflight: false,
         paste_buf: Vec::new(),
+        mouse_buf: Vec::new(),
+        mouse_flush_at: None,
         paste_queue: Vec::new(),
         paste_original: None,
     };
@@ -2480,6 +2602,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.predict.deadline(),
             app.settle_at,
             app.health_at,
+            app.mouse_flush_at,
         ]);
 
         tokio::select! {
@@ -2592,6 +2715,9 @@ pub async fn run(args: Args) -> Result<()> {
                     app.spawn_foreground_poll(true);
                     app.publish_stream_health(local_pane_id.as_deref());
                 }
+                if app.mouse_flush_at.is_some_and(|t| t <= now) {
+                    app.flush_mouse_input().await;
+                }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
@@ -2600,15 +2726,16 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // clean shutdown: release control if held, kill the ssh child AND the
-    // remote client it was carrying, restore tty. Killing only the local side
-    // is what left fifteen attached clients on `caddypayio-vm`.
+    // clean shutdown: release control if held, kill the whole local transport
+    // tree (including any ProxyCommand) AND the remote client it was carrying,
+    // restore tty. Killing only the local side is what left fifteen attached
+    // clients on `caddypayio-vm`.
     if let Some(mut s) = app.retire_session() {
         if s.mode == Mode::Control {
             let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        unsafe { libc::kill(s.pid, libc::SIGTERM) };
+        kill_session_process_group(s.process_group);
     }
     // Bounded by REMOTE_KILL_TIMEOUT for the batch: a supervisor waiting to
     // replace this child, or a pane closing, must not be held up. Whatever is
@@ -2639,6 +2766,85 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pane_transport_cleanup_terminates_proxy_command() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_path = std::env::temp_dir().join(format!(
+            "herdr-mirror-pane-proxy-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        let proxy = format!(
+            "ProxyCommand=sh -c 'echo $$ > {}; exec sleep 30'",
+            pid_path.display()
+        );
+        let mut command = tokio::process::Command::new("ssh");
+        command
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                &proxy,
+                "proxy-test.invalid",
+                "true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_session_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_group = child.id().unwrap() as i32;
+
+        for _ in 0..40 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let proxy_pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        kill_session_process_group(process_group);
+        tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .expect("ssh did not exit after its process group was killed")
+            .unwrap();
+
+        let mut proxy_survived = false;
+        for _ in 0..20 {
+            proxy_survived = unsafe { libc::kill(proxy_pid, 0) } == 0;
+            if !proxy_survived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if proxy_survived {
+            unsafe { libc::kill(proxy_pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_file(pid_path);
+        assert!(!proxy_survived, "ProxyCommand survived pane transport cleanup");
+    }
+
+    #[test]
+    fn pane_ssh_stream_disables_configured_control_sockets() {
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
+
+        assert_eq!(
+            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
+            [
+                "-S",
+                "none",
+                "work",
+                "exec herdr terminal session observe w5:pM",
+            ]
+        );
+    }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
     /// every existing headless-remote config silently changes behaviour.
@@ -2752,6 +2958,44 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    #[test]
+    fn mouse_sequence_split_across_reads_is_reassembled() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            split_mouse(&mut buf, b"pre\x1b[<0;3;2".to_vec()),
+            MouseSplit::Passthrough(b"pre".to_vec())
+        );
+        assert_eq!(buf, b"\x1b[<0;3;2");
+        assert_eq!(
+            split_mouse(&mut buf, b"Mpost".to_vec()),
+            MouseSplit::Passthrough(b"\x1b[<0;3;2Mpost".to_vec())
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn mouse_prefix_can_split_at_escape_and_csi_introducer() {
+        let mut buf = Vec::new();
+        assert_eq!(split_mouse(&mut buf, b"\x1b".to_vec()), MouseSplit::Pending);
+        assert_eq!(split_mouse(&mut buf, b"[".to_vec()), MouseSplit::Pending);
+        assert_eq!(
+            split_mouse(&mut buf, b"<0;3;2M".to_vec()),
+            MouseSplit::Passthrough(b"\x1b[<0;3;2M".to_vec())
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn timed_out_mouse_prefix_is_dropped_but_escape_survives() {
+        let mut mouse = b"\x1b[<0;3;2".to_vec();
+        assert_eq!(flush_mouse(&mut mouse), None);
+        assert!(mouse.is_empty());
+
+        let mut escape = b"\x1b".to_vec();
+        assert_eq!(flush_mouse(&mut escape), Some(b"\x1b".to_vec()));
+        assert!(escape.is_empty());
     }
 
 
@@ -3392,4 +3636,104 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         assert!(slots.len() >= 30, "pane identities should not resume in one herd");
         assert!(slots.iter().all(|delay| *delay < Duration::from_secs(8)));
     }
+
+    // Exercise the real input routing: a release and the next press can share
+    // one stdin read. A local sink stands in for the session; no SSH is used.
+    async fn selection_followed_by_press(next_drag: bool) {
+        let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
+        let tty = true;
+        let (tx, _rx) = mpsc::channel(256);
+        let state_dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-selection-{}-{next_drag}",
+            std::process::id()
+        ));
+        let fg_poller = crate::foreground::shared(crate::poll_channel::Transport::Ssh {
+            target: args.ssh_target.clone(),
+            ctl_path: None,
+        });
+        let mut app = App {
+            args,
+            state_dir: state_dir.clone(),
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            tx,
+            mode: Mode::Observe,
+            switching_to: None,
+            switch_at: None,
+            session: None,
+            next_gen: 0,
+            backoff_idx: 0,
+            reconnect_at: None,
+            pending_remote_kills: Vec::new(),
+            attach_conflict_retried: false,
+            control_failures: 0,
+            control_sticky: false,
+            pending_input: Vec::new(),
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            fg_poll_gate: crate::foreground::PollGate::new(),
+            fg_poller,
+            last_frame_at: Instant::now(),
+            remote_revision: None,
+            remote_advanced_at: None,
+            health_at: None,
+            settle_at: None,
+            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+            // startup leaves the pane in normal cursor mode; the first classification
+            // moves it if the remote turns out to be a TUI
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        };
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
+            .spawn().unwrap();
+        app.session = Some(Session {
+            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
+            remote_pid: None,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.mode = Mode::Control;
+        app.remote_fg = Some(Fg::Mouse);
+        // Keep foreground polling local to this fixture: suppress SSH probes.
+        app.fg_poll_at = Some(Instant::now());
+        // Blank cells exercise copy handling without writing to the clipboard.
+        app.grid.resize(80, 24);
+        app.handle_stdin(
+            b"\x1b[<0;1;1M\x1b[<32;4;1M\x1b[<0;4;1m\x1b[<0;1;2M".to_vec(),
+        ).await;
+        let result = app.select.release(
+            if next_drag { (1, 3) } else { (1, 0) }, b"release",
+        );
+        drop(app);
+        child.kill().await.unwrap();
+        let _ = child.wait().await;
+        let _ = std::fs::remove_dir_all(&state_dir);
+        if next_drag {
+            assert_eq!(result, Released::Selection(((1, 0), (1, 3))));
+        } else {
+            assert_eq!(result, Released::Click(b"\x1b[<0;1;2Mrelease".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn copying_selection_preserves_next_click_in_same_read() {
+        selection_followed_by_press(false).await;
+    }
+
+    #[tokio::test]
+    async fn copying_selection_preserves_next_drag_in_same_read() {
+        selection_followed_by_press(true).await;
+    }
+
 }

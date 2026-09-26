@@ -1,6 +1,6 @@
 [package]
 name = "herdr-mirror"
-version = "0.4.1+omnidev.27"
+version = "0.4.3+omnidev.28"
 edition = "2021"
 license = "MIT"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
@@ -15,6 +15,7 @@ libc = "0.2"
 unicode-width = "0.2"
 fnv = "1.0.7"
 sha2 = "0.10"
+glob = "0.3"
 
 [profile.release]
 lto = true

@@ -2,6 +2,9 @@
 
 use std::fs;
 use std::io::Write;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,6 +27,19 @@ pub fn state_dir() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".local").join("state").join("herdr-mirror"))
+}
+
+/// herdr's own config.toml — same precedence herdr's config_path() uses.
+pub fn herdr_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("HERDR_CONFIG_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("herdr/config.toml"),
+        _ => home_dir().join(".config/herdr/config.toml"),
+    }
 }
 
 /// Resolved runtime environment. Config is searched across candidate dirs so
@@ -73,6 +89,58 @@ pub fn default_config_dir() -> PathBuf {
     home_dir().join(".config").join("herdr-mirror")
 }
 
+const DELETED_MARKER: &[u8] = b" (deleted)";
+
+/// `/proc/self/exe` gains a literal " (deleted)" suffix once the file behind it
+/// is replaced or unlinked. Returns the path without it, or None when there is
+/// no marker to strip. Pure, so the rule is testable without unlinking a binary.
+fn strip_deleted_marker(p: &Path) -> Option<PathBuf> {
+    let stripped = p.as_os_str().as_bytes().strip_suffix(DELETED_MARKER)?;
+    Some(PathBuf::from(OsString::from_vec(stripped.to_vec())))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Resolve the path a future child should execute from a path reported for the
+/// current process. The replacement must already exist and be executable: a
+/// path that merely happens to look right is not safe to put into pane argv.
+fn resolve_reported_exe(reported: &Path) -> Option<PathBuf> {
+    if is_executable_file(reported) {
+        return Some(reported.to_path_buf());
+    }
+    let stripped = strip_deleted_marker(reported)?;
+    is_executable_file(&stripped).then_some(stripped)
+}
+
+/// A path to THIS binary that can still be RUN.
+///
+/// `current_exe()` reads /proc/self/exe, and Linux appends " (deleted)" to that
+/// link the moment the file behind it is replaced -- which every rebuild does to
+/// a running daemon. Rust passes the suffix straight through, so the value went
+/// into the streamer argv and produced `exec '/path/herdr-mirror (deleted)'`: a
+/// command that cannot run, leaving a bare shell parked in the `.mirror-pane`
+/// placeholder where a mirror should be. The same value was also handed to
+/// `Command::new` when respawning the daemon, and symlinked into the CLI link by
+/// `repair_cli_link`, which would have made the breakage outlive the process.
+///
+/// Order: the reported path if it is executable, then the same path with the
+/// Linux marker stripped (a rebuild in place -- the common case). The CLI link
+/// is deliberately not a fallback: this project permits that link to point at
+/// another installation and reports it as `CliLink::Other` below.
+pub fn self_exe_path() -> Option<PathBuf> {
+    let reported = std::env::current_exe().ok()?;
+    resolve_reported_exe(&reported)
+}
+
+/// `self_exe_path` as a command string, falling back to a bare name so PATH
+/// lookup still gives a streamer something to try.
+pub fn self_exe() -> String {
+    self_exe_path().map(|p| p.display().to_string()).unwrap_or_else(|| "herdr-mirror".into())
+}
+
 /// The stable CLI path install.sh links and the README's keybindings use.
 pub fn cli_link_path() -> PathBuf {
     home_dir().join(".local").join("bin").join("herdr-mirror")
@@ -99,7 +167,7 @@ pub fn cli_link_state() -> CliLink {
         Err(_) => CliLink::File,
         Ok(target) => {
             let resolved = fs::canonicalize(&link).ok();
-            let exe = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok());
+            let exe = self_exe_path().and_then(|e| fs::canonicalize(e).ok());
             match resolved {
                 None => CliLink::Dangling(target),
                 Some(r) if exe.as_ref() == Some(&r) => CliLink::Ok(target),
@@ -129,7 +197,7 @@ pub fn cli_link_problem() -> Option<String> {
 pub fn repair_cli_link() -> Option<String> {
     cli_link_problem()?;
     let link = cli_link_path();
-    let exe = std::env::current_exe().ok()?;
+    let exe = self_exe_path()?;
     let _ = fs::create_dir_all(link.parent()?);
     let _ = fs::remove_file(&link);
     Some(match std::os::unix::fs::symlink(&exe, &link) {
@@ -642,5 +710,39 @@ mod tests {
             StreamerSpawnClaim::Claimed
         );
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn deleted_marker_is_stripped_only_when_it_is_a_real_suffix() {
+        use super::{resolve_reported_exe, strip_deleted_marker};
+        assert_eq!(
+            strip_deleted_marker(Path::new("/usr/bin/herdr-mirror (deleted)")),
+            Some(PathBuf::from("/usr/bin/herdr-mirror"))
+        );
+        assert_eq!(strip_deleted_marker(Path::new("/usr/bin/herdr-mirror")), None);
+        // the words appearing mid-path are a directory name, not the kernel marker
+        assert_eq!(strip_deleted_marker(Path::new("/tmp/x (deleted)/herdr-mirror")), None);
+
+        // Model the real replacement case without unlinking the test runner:
+        // the reported path is gone, while the original path names the new,
+        // executable inode installed in its place.
+        let executable = std::env::current_exe().unwrap();
+        let mut reported = executable.as_os_str().as_bytes().to_vec();
+        reported.extend_from_slice(DELETED_MARKER);
+        assert_eq!(
+            resolve_reported_exe(Path::new(&OsString::from_vec(reported))),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn replacement_path_must_exist_and_be_executable() {
+        let root = test_state_dir("replacement-exe");
+        fs::create_dir_all(&root).unwrap();
+        let candidate = root.join("herdr-mirror");
+        fs::write(&candidate, "not executable").unwrap();
+        let reported = PathBuf::from(format!("{} (deleted)", candidate.display()));
+        assert_eq!(resolve_reported_exe(&reported), None);
+        let _ = fs::remove_dir_all(root);
     }
 }
