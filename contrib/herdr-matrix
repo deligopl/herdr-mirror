@@ -21,7 +21,7 @@ os.environ["PATH"] = ":".join([
 ])
 ODX_STATE = os.environ.get("ODX_STATE_DIR") or os.path.expanduser("~/.local/state/odx")
 ODX_CONFIG = os.environ.get("ODX_CONFIG_DIR") or os.path.expanduser("~/.config/odx")
-SELECTED = os.path.join(ODX_STATE, "candidate-mirror", "selected.json")
+SELECTED = os.path.join(ODX_CONFIG, "mirror-binary.json")
 
 
 def sh(*a):
