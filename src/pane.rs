@@ -1104,6 +1104,9 @@ struct App {
     paste_original: Option<Vec<u8>>,
     /// this process is a `herdr-mirror view` in a tile, not a sidebar copy
     is_view: bool,
+    /// view only: the remote pane is gone, so the view leaves this streamer to
+    /// re-resolve its agent instead of retrying a dead pane id
+    view_target_gone: bool,
     /// host key for this streamer's remote-client record (a view keeps its
     /// own, see `view::view_record_target`)
     record_target: String,
@@ -1611,7 +1614,23 @@ impl App {
         }
     }
 
+    /// A view whose remote pane is gone stops here: `cmd_view` re-resolves its
+    /// agent (the remote layout may have moved it to another pane) rather than
+    /// retrying a pane id that no longer exists. Any mode: a view usually
+    /// runs in control, where a sidebar copy would keep its fast retries.
+    fn leave_gone_view(&mut self, reason: &str) -> bool {
+        if !self.is_view || !target_gone(reason, &self.args.pane_target) {
+            return false;
+        }
+        self.view_target_gone = true;
+        self.reconnect_at = None;
+        true
+    }
+
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
+        if self.leave_gone_view(reason) {
+            return;
+        }
         // Only slow down once we are back in observe. In control the existing
         // quick-failure fallback needs its fast retries to reach two failures
         // and drop the pane to observe within seconds; a 60s rung there would
@@ -1744,6 +1763,9 @@ impl App {
         self.retire_session();
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        if self.leave_gone_view(&reason) {
+            return;
+        }
         // A view attaching while the sidebar copy is still letting go: wait
         // for it, without spending the control-failure budget on it.
         if crate::view::retry_attach_conflict(self.is_view, &reason_line) {
@@ -2643,7 +2665,7 @@ pub async fn supervise(args: Args) -> Result<()> {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    run_with(args, None).await
+    run_with(args, None).await.map(|_| ())
 }
 
 /// What a `herdr-mirror view` process adds to the ordinary streamer: the input
@@ -2653,12 +2675,21 @@ pub struct ViewRuntime {
     pub sidebar_pane_id: String,
 }
 
+/// How a view's streamer ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ViewEnd {
+    /// signal, closed tile, pause: the view is over
+    Done,
+    /// the remote pane it streamed no longer exists; re-resolve the target
+    TargetGone,
+}
+
 /// The streamer, run in a tile on behalf of a sidebar copy (see `view.rs`).
-pub async fn run_view(args: Args, view: ViewRuntime) -> Result<()> {
+pub async fn run_view(args: Args, view: ViewRuntime) -> Result<ViewEnd> {
     run_with(args, Some(view)).await
 }
 
-async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
+async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
     let is_view = view.is_some();
     let supervised = !is_view && std::env::var("HERDR_MIRROR_SUPERVISED").as_deref() == Ok("1");
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
@@ -2677,7 +2708,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
         if let Some(id) = &local_pane_id {
             mark_stream_pause(&state_dir, id);
         }
-        return Ok(());
+        return Ok(ViewEnd::Done);
     }
 
     // announce ourselves so the daemon can tell its typed `exec` took
@@ -2818,6 +2849,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
         paste_queue: Vec::new(),
         paste_original: None,
         is_view,
+        view_target_gone: false,
         record_target: record_target.clone(),
         local_pane_id: local_pane_id.clone(),
         claim: None,
@@ -2897,6 +2929,10 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
     }
 
     loop {
+        // a view whose remote pane is gone hands back to `cmd_view`
+        if app.view_target_gone {
+            break;
+        }
         // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
         let idle_at = (app.mode == Mode::Control
             && app.switching_to.is_none()
@@ -3100,7 +3136,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<()> {
     if let Some(raw) = raw {
         raw.restore();
     }
-    Ok(())
+    Ok(if app.view_target_gone { ViewEnd::TargetGone } else { ViewEnd::Done })
 }
 
 #[cfg(test)]
@@ -4335,6 +4371,35 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn a_view_whose_remote_pane_is_gone_stops_retrying_it() {
+        let dir = closed_admission_dir("vgone");
+        let args = parse_args(&["t".into(), "w2:p1".into(), "--always-control".into()]).unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = test_app(args, dir.clone(), false, tx);
+        let sink = dir.join("s");
+        let gone = "terminal session control failed: terminal target w2:p1 not found";
+        // a sidebar copy keeps retrying its pane
+        let (session, _child) = local_session(1, &sink);
+        app.session = Some(session);
+        app.mode = Mode::Control;
+        app.handle_exit(1, Mode::Control, gone.into(), Duration::from_millis(50));
+        assert!(!app.view_target_gone);
+        assert!(app.reconnect_at.is_some());
+        // a view hands back to re-resolve, in control mode too
+        app.is_view = true;
+        let (session, _child) = local_session(2, &sink);
+        app.session = Some(session);
+        app.handle_exit(2, Mode::Control, gone.into(), Duration::from_millis(50));
+        assert!(app.view_target_gone);
+        assert!(app.reconnect_at.is_none());
+        // another pane's absence is not ours
+        app.view_target_gone = false;
+        app.schedule_reconnect(Mode::Control, "terminal target w2:p10 not found");
+        assert!(!app.view_target_gone);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// An `App` with no transport, for exercising its state machine directly.
     fn test_app(
         args: Args,
@@ -4390,6 +4455,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         paste_queue: Vec::new(),
         paste_original: None,
         is_view: false,
+        view_target_gone: false,
         record_target: "unused".into(),
         local_pane_id: None,
         claim: None,

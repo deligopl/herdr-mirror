@@ -24,6 +24,11 @@
 //
 // The lock is what makes a claim live: the kernel drops it with the process,
 // so a SIGKILLed view (or a recycled pid) can never pin a sidebar copy.
+//
+// A remote layout change can move the agent to another remote pane. When the
+// view's pane is reported gone, the view drops its claim, resolves its target
+// again (as at startup) and moves to the new pane under that pane's claim; if
+// the name resolves nowhere yet, it keeps retrying the resolution.
 
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -441,6 +446,49 @@ pub fn retry_attach_conflict(is_view: bool, reason: &str) -> bool {
 // ---------------------------------------------------------------------------
 // command
 
+/// How often a view whose remote pane went away tries to find its agent again.
+const RERESOLVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Resolve `target` from what is on disk and in local Herdr right now. `gone`
+/// is the (host, remote pane) a view just lost: a map not yet updated for the
+/// remote layout change still points the agent there, and that is not an
+/// answer — the caller waits for the daemon to catch up instead.
+pub fn resolve_excluding(
+    target: &str,
+    agents: &[Value],
+    maps: &[(String, crate::state::HostState)],
+    gone: Option<&(String, String)>,
+) -> Option<Resolved> {
+    resolve(target, agents, maps)
+        .filter(|r| gone.map_or(true, |(h, p)| !(r.host == *h && r.remote_pane_id == *p)))
+}
+
+async fn resolve_now(
+    env: &crate::util::Env,
+    target: &str,
+    gone: Option<&(String, String)>,
+) -> Result<(crate::config::MirrorConfig, Option<Resolved>)> {
+    let cfg = crate::config::load_config(&env.config_search)?;
+    let maps: Vec<(String, crate::state::HostState)> = cfg
+        .hosts
+        .iter()
+        .map(|h| (h.name.clone(), crate::state::load_state(&env.state_dir, &h.name)))
+        .collect();
+    let agents = if maps.iter().any(|(_, s)| s.panes.values().any(|e| e.local_id == target)) {
+        Vec::new()
+    } else {
+        crate::api::ApiClient::at(&env.local_socket)
+            .request("agent.list", json!({}))
+            .await?
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let found = resolve_excluding(target, &agents, &maps, gone);
+    Ok((cfg, found))
+}
+
 pub async fn cmd_view(env: crate::util::Env, rest: &[String]) -> Result<()> {
     let target = rest
         .first()
@@ -452,67 +500,109 @@ pub async fn cmd_view(env: crate::util::Env, rest: &[String]) -> Result<()> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| err("herdr-mirror view must run inside a Herdr pane (HERDR_PANE_ID unset)"))?;
 
-    let cfg = crate::config::load_config(&env.config_search)?;
-    let maps: Vec<(String, crate::state::HostState)> = cfg
-        .hosts
-        .iter()
-        .map(|h| (h.name.clone(), crate::state::load_state(&env.state_dir, &h.name)))
-        .collect();
-    let local = crate::api::ApiClient::at(&env.local_socket);
-    let agents = if maps.iter().any(|(_, s)| s.panes.values().any(|e| e.local_id == target)) {
-        Vec::new()
-    } else {
-        local
-            .request("agent.list", json!({}))
-            .await?
-            .get("agents")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-    };
-    let found = resolve(&target, &agents, &maps).ok_or_else(|| {
-        err(format!("{target}: not a mirrored agent or mirror pane in {}", env.state_dir.display()))
-    })?;
-    if found.sidebar_pane_id == tile {
-        return Err(err("refusing to view a mirror pane inside itself"));
-    }
-    let host = cfg
-        .hosts
-        .iter()
-        .find(|h| h.name == found.host)
-        .ok_or_else(|| err(format!("host {} missing from hosts.toml", found.host)))?;
-    // The same argv the daemon types into the sidebar copy: one source of
-    // truth for transport, session, control and caps.
-    let argv = crate::mirror::cmd_for_pane(host, &env.state_dir, &std::collections::HashMap::new())(
-        &found.remote_pane_id,
-    );
-    let args = crate::pane::parse_args(&argv[2..])?;
+    // (host, remote pane) the previous round streamed until it was gone
+    let mut gone: Option<(String, String)> = None;
+    loop {
+        let (cfg, found) = match resolve_now(&env, &target, gone.as_ref()).await {
+            Ok((cfg, Some(found))) => (cfg, found),
+            // at startup a bad target is the user's mistake: say so and stop
+            Ok((_, None)) if gone.is_none() => {
+                return Err(err(format!(
+                    "{target}: not a mirrored agent or mirror pane in {}",
+                    env.state_dir.display()
+                )))
+            }
+            // after a move, keep looking (the daemon may not have remapped it
+            // yet, or local Herdr may be briefly unreachable)
+            unresolved => {
+                let (host, pane) = gone.as_ref().expect("only after a gone target");
+                let why = match unresolved {
+                    Err(e) => format!(" ({e})"),
+                    _ => String::new(),
+                };
+                println!(
+                    "remote pane {pane} on {host} is gone; {target} does not resolve to another \
+                     mirrored pane yet{why} — retrying in {}s",
+                    RERESOLVE_INTERVAL.as_secs()
+                );
+                if wait_or_quit(RERESOLVE_INTERVAL).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        if found.sidebar_pane_id == tile {
+            return Err(err("refusing to view a mirror pane inside itself"));
+        }
+        let host = cfg
+            .hosts
+            .iter()
+            .find(|h| h.name == found.host)
+            .ok_or_else(|| err(format!("host {} missing from hosts.toml", found.host)))?;
+        // The same argv the daemon types into the sidebar copy: one source of
+        // truth for transport, session, control and caps.
+        let argv = crate::mirror::cmd_for_pane(host, &env.state_dir, &std::collections::HashMap::new())(
+            &found.remote_pane_id,
+        );
+        let args = crate::pane::parse_args(&argv[2..])?;
+        if let Some((h, p)) = &gone {
+            println!("{target} moved from {p} on {h} to {} on {}", found.remote_pane_id, found.host);
+        }
 
-    let herdr_socket = env.local_socket.display().to_string();
-    // keyed by the remote pane, so the claim survives the sidebar copy being
-    // recreated under a new local pane id
-    let key = claim_key_for(&args);
-    let (guard, listener) = create_claim(&env.state_dir, &key, &tile, Some(&herdr_socket))?;
+        let herdr_socket = env.local_socket.display().to_string();
+        // keyed by the remote pane, so the claim survives the sidebar copy being
+        // recreated under a new local pane id
+        let key = claim_key_for(&args);
+        let (guard, listener) = create_claim(&env.state_dir, &key, &tile, Some(&herdr_socket))?;
 
-    // Give the sidebar copy's stream its moment to let go; with no stream
-    // running (paused, or between respawns) nothing holds the terminal.
-    if crate::util::streamer_alive(&env.state_dir, &args.ssh_target, &args.pane_target) {
-        println!("waiting for {} to release {}…", found.sidebar_pane_id, found.remote_pane_id);
-        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
-        while !is_released(&env.state_dir, &key)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(RELEASE_POLL).await;
+        // Give the sidebar copy's stream its moment to let go; with no stream
+        // running (paused, or between respawns) nothing holds the terminal.
+        if crate::util::streamer_alive(&env.state_dir, &args.ssh_target, &args.pane_target) {
+            println!("waiting for {} to release {}…", found.sidebar_pane_id, found.remote_pane_id);
+            let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+            while !is_released(&env.state_dir, &key)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(RELEASE_POLL).await;
+            }
+        }
+
+        let result = crate::pane::run_view(
+            args,
+            crate::pane::ViewRuntime { listener, sidebar_pane_id: found.sidebar_pane_id.clone() },
+        )
+        .await;
+        // the old pane's claim goes before the next one is taken
+        drop(guard);
+        match result? {
+            crate::pane::ViewEnd::Done => return Ok(()),
+            crate::pane::ViewEnd::TargetGone => {
+                println!("remote pane {} on {} is gone; resolving {target} again…", found.remote_pane_id, found.host);
+                gone = Some((found.host, found.remote_pane_id));
+            }
         }
     }
+}
 
-    let result = crate::pane::run_view(
-        args,
-        crate::pane::ViewRuntime { listener, sidebar_pane_id: found.sidebar_pane_id.clone() },
-    )
-    .await;
-    drop(guard);
-    result
+/// Sleep, unless the view is told to quit first (`true`). The streamer
+/// installed handlers for these signals, so their default "terminate" no
+/// longer applies between rounds.
+async fn wait_or_quit(d: Duration) -> bool {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    ) else {
+        tokio::time::sleep(d).await;
+        return false;
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(d) => false,
+        _ = term.recv() => true,
+        _ = int.recv() => true,
+        _ = hup.recv() => true,
+    }
 }
 
 #[cfg(test)]
@@ -704,5 +794,35 @@ mod tests {
         assert_eq!(resolve("local-only", &agents, &maps), None);
         assert_eq!(resolve("closed", &agents, &maps), None);
         assert_eq!(resolve("nothing", &agents, &maps), None);
+    }
+
+    #[test]
+    fn a_view_whose_pane_moved_re_resolves_and_never_back_to_the_dead_pane() {
+        let agents = vec![json!({ "name": "cargo-vm-conductor", "pane_id": "wL:p3" })];
+        let gone = ("cargo-vm".to_string(), "w2:p1".to_string());
+        // the daemon has not remapped yet: the agent still points at the dead
+        // pane, which is no answer
+        let mut stale = crate::state::HostState::default();
+        stale.panes.insert(
+            "w2:p1".into(),
+            crate::state::PaneEntry { local_id: "wL:p3".into(), ..Default::default() },
+        );
+        let maps = vec![("cargo-vm".to_string(), stale)];
+        assert_eq!(resolve_excluding("cargo-vm-conductor", &agents, &maps, Some(&gone)), None);
+        // at startup the same map is a valid answer
+        assert!(resolve_excluding("cargo-vm-conductor", &agents, &maps, None).is_some());
+        // remapped: the agent now lives in w1:p1, and the claim key follows it
+        let mut moved = crate::state::HostState::default();
+        moved.panes.insert(
+            "w1:p1".into(),
+            crate::state::PaneEntry { local_id: "wL:p3".into(), ..Default::default() },
+        );
+        let maps = vec![("cargo-vm".to_string(), moved)];
+        let found = resolve_excluding("cargo-vm-conductor", &agents, &maps, Some(&gone)).unwrap();
+        assert_eq!(found.remote_pane_id, "w1:p1");
+        assert_eq!(claim_key(&found.host, &found.remote_pane_id), "cargo_vm--w1_p1");
+        // gone everywhere: unresolved, the caller keeps retrying
+        let maps = vec![("cargo-vm".to_string(), crate::state::HostState::default())];
+        assert_eq!(resolve_excluding("cargo-vm-conductor", &agents, &maps, Some(&gone)), None);
     }
 }
