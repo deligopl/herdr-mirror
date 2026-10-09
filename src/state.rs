@@ -303,8 +303,13 @@ pub fn publish_stream_health(state_dir: &Path, local_pane_id: &str, health: &Str
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Replaced, never rewritten in place: streamers wait on this directory
+    // for entries to change (`crate::watch`), and an in-place write is not one.
     if let Ok(text) = serde_json::to_string(health) {
-        let _ = std::fs::write(path, text);
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -412,10 +417,12 @@ pub struct HostHealth {
     pub next_retry_unix: Option<f64>,
 }
 
+pub(crate) fn host_health_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("host-health")
+}
+
 fn host_health_path(state_dir: &Path, host: &str) -> PathBuf {
-    state_dir
-        .join("host-health")
-        .join(format!("{}.json", crate::util::sane_component(host)))
+    host_health_dir(state_dir).join(format!("{}.json", crate::util::sane_component(host)))
 }
 
 pub fn publish_host_health(state_dir: &Path, host: &str, health: &HostHealth) {
@@ -423,8 +430,13 @@ pub fn publish_host_health(state_dir: &Path, host: &str, health: &HostHealth) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Replaced, never rewritten in place: streamers wait on this directory
+    // for entries to change (`crate::watch`), and an in-place write is not one.
     if let Ok(text) = serde_json::to_string(health) {
-        let _ = std::fs::write(path, text);
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 

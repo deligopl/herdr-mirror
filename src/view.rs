@@ -41,13 +41,9 @@ use tokio::io::AsyncWriteExt;
 
 use crate::util::{err, pid_alive, sane_component, Result};
 
-/// How often a sidebar copy looks for a claim on itself (and for its end).
-pub(crate) const VIEW_CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(300);
-
 /// How long a view waits for the sidebar copy to release the remote terminal
 /// before trying to attach anyway (attach conflicts are retried after that).
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
-const RELEASE_POLL: Duration = Duration::from_millis(100);
 
 /// Delay between view attach attempts refused because the sidebar copy's
 /// client still holds the terminal.
@@ -71,7 +67,7 @@ pub struct ViewClaim {
     pub started: f64,
 }
 
-fn claims_dir(state_dir: &Path) -> PathBuf {
+pub(crate) fn claims_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("view-claims")
 }
 
@@ -559,12 +555,15 @@ pub async fn cmd_view(env: crate::util::Env, rest: &[String]) -> Result<()> {
         // running (paused, or between respawns) nothing holds the terminal.
         if crate::util::streamer_alive(&env.state_dir, &args.ssh_target, &args.pane_target) {
             println!("waiting for {} to release {}…", found.sidebar_pane_id, found.remote_pane_id);
-            let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
-            while !is_released(&env.state_dir, &key)
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(RELEASE_POLL).await;
-            }
+            // the release marker is created in the claims directory: wait for it
+            let claims = claims_dir(&env.state_dir);
+            let watch = crate::watch::DirWatch::new(&[claims.as_path()]);
+            let _ = tokio::time::timeout(RELEASE_WAIT, async {
+                while !is_released(&env.state_dir, &key) {
+                    crate::watch::changed_or_tick(watch.as_ref(), RELEASE_WAIT).await;
+                }
+            })
+            .await;
         }
 
         let result = crate::pane::run_view(

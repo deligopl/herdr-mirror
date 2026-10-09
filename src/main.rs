@@ -39,6 +39,7 @@ mod state;
 mod util;
 mod view;
 mod visibility;
+mod watch;
 
 use util::{Env, Result};
 

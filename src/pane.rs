@@ -1187,9 +1187,9 @@ const SETTLE_DELAY: Duration = Duration::from_millis(350);
 const OUTPUT_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Explicit Mirror pause is a traffic boundary, not only a daemon switch.
-/// Stream children notice it quickly, leave through their normal attach-client
-/// cleanup, and let the stable supervisor keep the local pane alive.
-const STREAM_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Stream children notice it at once (they wait on the state directory, see
+/// `crate::watch`), leave through their normal attach-client cleanup, and let
+/// the stable supervisor keep the local pane alive.
 const HOST_HEALTH_WAIT: Duration = Duration::from_secs(1);
 
 /// Spread an explicit all-pane resume over eight seconds. This is deliberately
@@ -1256,11 +1256,29 @@ async fn wait_for_stream_resume_with_delay(
     if !pause_observed && stream_may_connect(state_dir) {
         return false;
     }
+    // The marker lives in the state directory itself: wait for that directory
+    // to change rather than stat the marker ten times a second (bug 85).
+    let watch = crate::watch::DirWatch::new(&[state_dir]);
     while !stream_may_connect(state_dir) {
-        tokio::time::sleep(STREAM_PAUSE_POLL_INTERVAL).await;
+        crate::watch::changed_or_tick(watch.as_ref(), crate::watch::FALLBACK_TICK).await;
     }
     tokio::time::sleep(delay).await;
     true
+}
+
+/// A change in the watched state directories, or the slow safety tick.
+async fn state_changed(watch: Option<&crate::watch::DirWatch>, tick: &mut tokio::time::Interval) {
+    match watch {
+        Some(w) => {
+            tokio::select! {
+                _ = w.changed() => {}
+                _ = tick.tick() => {}
+            }
+        }
+        None => {
+            tick.tick().await;
+        }
+    }
 }
 
 async fn wait_for_stream_resume(state_dir: &std::path::Path, local_pane_id: &str) -> bool {
@@ -2900,12 +2918,26 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
     // someone left a notice for this pane and wants it seen now
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
-    let mut pause_tick = tokio::time::interval(STREAM_PAUSE_POLL_INTERVAL);
-    pause_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Only a sidebar copy can be claimed by a view.
     let claimable = !app.is_view && !app.args.dump && app.local_pane_id.is_some();
-    let mut claim_tick = tokio::time::interval(crate::view::VIEW_CLAIM_POLL_INTERVAL);
-    claim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The pause marker, the host's health record, view claims and the
+    // visibility record change only when a file in one of these directories is
+    // created, replaced or removed. Wait for that, not on a 100 ms timer: forty
+    // streamers polling them were ~14k file operations per 15 s (bug 85). The
+    // slow tick re-checks what no directory event carries (a dead daemon's
+    // visibility record, the idle-release deadline).
+    let state_watch = crate::watch::DirWatch::new(&[
+        state_dir.as_path(),
+        crate::state::host_health_dir(&state_dir).as_path(),
+        crate::view::claims_dir(&state_dir).as_path(),
+    ]);
+    let mut state_tick = tokio::time::interval(if state_watch.is_some() {
+        crate::watch::FALLBACK_TICK
+    } else {
+        crate::watch::UNWATCHED_TICK
+    });
+    state_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    state_tick.tick().await; // the first tick is immediate; the checks below just ran
 
     // A view may already hold this pane (the supervisor replaced its child
     // while a tile was showing it): stand aside from the start.
@@ -2988,10 +3020,6 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
-            _ = claim_tick.tick(), if claimable => {
-                app.poll_view_claim().await;
-                app.poll_idle_release().await;
-            }
             _ = sigwinch.recv() => {
                 if app.claim.is_some() {
                     app.draw_view_notice();
@@ -3028,7 +3056,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
-            _ = pause_tick.tick() => {
+            _ = state_changed(state_watch.as_ref(), &mut state_tick) => {
                 if !stream_may_connect(&state_dir) {
                     if let Some(id) = local_pane_id.as_ref().filter(|_| !is_view) {
                         // The daemon reload may clear its global marker before
@@ -3048,6 +3076,10 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
                     app.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, app.mode));
                     app.renderer.status("waiting for Mirror host health trial");
                     app.paint();
+                }
+                if claimable {
+                    app.poll_view_claim().await;
+                    app.poll_idle_release().await;
                 }
             }
             _ = sleep => {
@@ -3996,7 +4028,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
             wait_for_stream_resume_with_delay(&waiting_dir, false, Duration::ZERO).await
         });
 
-        tokio::time::sleep(STREAM_PAUSE_POLL_INTERVAL * 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!waiter.is_finished(), "no child may respawn while pause is held");
         std::fs::remove_file(crate::daemon::pause_path(&state_dir)).unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
