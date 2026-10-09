@@ -103,21 +103,29 @@ impl Drop for DaemonOwner {
 // Sticky pause marker: blocks the focus-hook autostart until an explicit
 // start clears it (a crash leaves no marker, so it still auto-recovers).
 pub(crate) fn pause_path(state_dir: &std::path::Path) -> PathBuf {
-    state_dir.join("daemon.paused")
+    state_dir.join("pause").join("daemon.paused")
 }
 
 pub fn is_paused(env: &Env) -> bool {
     streams_paused(&env.state_dir)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAUSE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The explicit operator pause is shared with pane streamers. A daemon crash
 /// leaves no marker, so it must not quiesce otherwise healthy mirror panes.
 pub(crate) fn streams_paused(state_dir: &std::path::Path) -> bool {
+    #[cfg(test)]
+    PAUSE_STATS.with(|count| count.set(count.get() + 1));
     pause_path(state_dir).exists()
 }
 
 pub fn set_paused(env: &Env, paused: bool) {
     if paused {
+        let _ = fs::create_dir_all(env.state_dir.join("pause"));
         let _ = fs::write(pause_path(&env.state_dir), now_iso());
     } else {
         let _ = fs::remove_file(pause_path(&env.state_dir));
