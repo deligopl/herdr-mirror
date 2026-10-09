@@ -126,11 +126,9 @@ pub struct RosemaryRun {
 /// Marker for `hide`: this host's mirrors are off the sidebar until `show`.
 ///
 /// Deliberately its OWN file rather than a field on `HostState`. The map file is
-/// load-modify-written by the daemon, by every CLI subcommand, and by converge
-/// around a pass that spans dozens of awaits, with no lock anywhere — so a flag
-/// living inside it is silently reset by whoever saves last, and `hide` reports
-/// success having done nothing. A marker file has no such race: it is written by
-/// one process and only ever read by the others. Same shape as `daemon.paused`.
+/// changed by a transaction spanning a converge pass. A separate marker lets
+/// `hide` take effect immediately without waiting for that pass to finish.
+/// Same shape as `daemon.paused`.
 pub fn hidden_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}.hidden"))
 }
@@ -166,9 +164,7 @@ pub fn set_hidden(state_dir: &Path, host: &str, hidden: bool) -> std::io::Result
 /// waiting on the mirror. Marking the request keeps the two apart, so the
 /// backoff ladder still exists for everything that is not an explicit ask.
 ///
-/// Its own file for the same reason `hidden` is: the map file is written
-/// without a lock by the daemon, by converge, and by every CLI subcommand, so
-/// a flag living inside it is silently reset by whoever saves last.
+/// Its own file, like `hidden`, so a request need not wait for a map transaction.
 pub fn wake_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}.wake"))
 }
@@ -456,10 +452,75 @@ pub fn load_state(state_dir: &Path, host: &str) -> HostState {
         .unwrap_or_default()
 }
 
-pub fn save_state(state_dir: &Path, host: &str, state: &HostState) -> Result<()> {
+/// One host's read-modify-write transaction. Keep it alive across the entire
+/// converge pass, including its intermediate saves. Readers need no lock:
+/// publication uses rename, so they always see a complete map.
+pub struct StateTransaction {
+    state: HostState,
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl std::ops::Deref for StateTransaction {
+    type Target = HostState;
+    fn deref(&self) -> &HostState { &self.state }
+}
+impl std::ops::DerefMut for StateTransaction {
+    fn deref_mut(&mut self) -> &mut HostState { &mut self.state }
+}
+
+pub fn edit_state(state_dir: &Path, host: &str) -> Result<StateTransaction> {
+    use std::os::fd::AsRawFd;
     std::fs::create_dir_all(state_dir)?;
-    std::fs::write(state_path(state_dir, host), serde_json::to_string_pretty(state)?)?;
-    Ok(())
+    // This inode is permanent: replacing or unlinking it splits the lock.
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).open(state_dir.join(format!("{host}-map.lock")))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 { break; }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted { return Err(e.into()); }
+    }
+    let path = state_path(state_dir, host);
+    let state = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HostState::default(),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(StateTransaction { state, path, _lock: lock })
+}
+
+/// flock can wait for another task on this single-thread runtime. Acquire it
+/// on the blocking pool, so that task can finish its awaited RPC and unlock.
+pub async fn edit_state_async(state_dir: &Path, host: &str) -> Result<StateTransaction> {
+    let dir = state_dir.to_path_buf();
+    let host = host.to_owned();
+    tokio::task::spawn_blocking(move || edit_state(&dir, &host)).await?
+}
+
+pub fn save_state(state_dir: &Path, host: &str, state: &StateTransaction) -> Result<()> {
+    use std::io::Write;
+    if state.path != state_path(state_dir, host) {
+        return Err("map transaction belongs to another host".into());
+    }
+    // The held per-host lock also protects this temp name from other writers.
+    let tmp = state.path.with_extension("json.tmp");
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(serde_json::to_string_pretty(&state.state)?.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &state.path)?;
+        std::fs::File::open(state_dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
+}
+
+#[cfg(test)]
+pub fn seed_state(state_dir: &Path, host: &str, state: &HostState) -> Result<()> {
+    let mut edit = edit_state(state_dir, host)?;
+    edit.state = state.clone();
+    save_state(state_dir, host, &edit)
 }
 
 #[cfg(test)]
@@ -467,6 +528,71 @@ mod tests {
     use super::*;
 
     /// The exact shape the TS implementation writes must round-trip.
+    #[test]
+    fn two_map_writers_preserve_both_updates() {
+        let dir = std::env::temp_dir().join(format!("hm-map-writers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_dir = dir.clone();
+        let first = std::thread::spawn(move || {
+            let mut state = edit_state(&first_dir, "studio").unwrap();
+            state.panes.insert("first".into(), PaneEntry { local_id: "local-first".into(), ..PaneEntry::default() });
+            loaded_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            save_state(&first_dir, "studio", &state).unwrap();
+        });
+        loaded_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let second_dir = dir.clone();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let mut state = edit_state(&second_dir, "studio").unwrap();
+            state.panes.insert("second".into(), PaneEntry { local_id: "local-second".into(), ..PaneEntry::default() });
+            save_state(&second_dir, "studio", &state).unwrap();
+        });
+        attempt_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Give the second writer a chance to load and save while the first
+        // owns a stale snapshot. Without the transaction lock, first wins and
+        // silently removes second's entry.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        let state = load_state(&dir, "studio");
+        assert_eq!(state.panes.len(), 2);
+        assert_eq!(state.panes["first"].local_id, "local-first");
+        assert_eq!(state.panes["second"].local_id, "local-second");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_map_writer_does_not_block_its_runtime() {
+        let dir = std::env::temp_dir().join(format!("hm-map-async-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = edit_state_async(&dir, "studio").await.unwrap();
+        let second_dir = dir.clone();
+        let second = tokio::spawn(async move { edit_state_async(&second_dir, "studio").await.unwrap() });
+        // The runtime must remain able to release the first transaction while
+        // the other task is waiting in flock.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), second).await.unwrap().unwrap();
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_transaction_refuses_to_overwrite_an_unreadable_map() {
+        let dir = std::env::temp_dir().join(format!("hm-map-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(state_path(&dir, "studio"), "broken json").unwrap();
+        assert!(edit_state(&dir, "studio").is_err());
+        assert_eq!(std::fs::read_to_string(state_path(&dir, "studio")).unwrap(), "broken json");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn ts_state_shape_roundtrips() {
         let ts = r#"{
@@ -509,7 +635,7 @@ mod tests {
         assert!(is_hidden(&dir, "h"));
         // and it survives a map rewrite, which is the whole reason it is not a
         // field on HostState
-        save_state(&dir, "h", &HostState::default()).unwrap();
+        seed_state(&dir, "h", &HostState::default()).unwrap();
         assert!(is_hidden(&dir, "h"));
         set_hidden(&dir, "h", false).unwrap();
         assert!(!is_hidden(&dir, "h"));

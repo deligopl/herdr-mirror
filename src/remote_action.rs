@@ -642,7 +642,7 @@ mod cwd_live_tests {
         let mut state = crate::state::HostState::default();
         state.workspaces.insert(ws.into(), crate::state::WsEntry {local_id:"local-ws".into(), tombstone:None,root_tab_local_id:None,last_remote_label:None});
         state.panes.insert(pane.into(), crate::state::PaneEntry {local_id:"local-pane".into(),tombstone:None,seq:0,reported:None,..Default::default()});
-        crate::state::save_state(&root,&host.name,&state).unwrap();
+        crate::state::seed_state(&root,&host.name,&state).unwrap();
         std::env::set_var("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_id":"local-ws","focused_pane_id":"local-pane"}"#);
         for kind in ["tab", "workspace", "split"] {
             let before = api.request("pane.list",json!({})).await.unwrap();
