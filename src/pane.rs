@@ -1256,14 +1256,18 @@ async fn wait_for_stream_resume_with_delay(
     if !pause_observed && stream_may_connect(state_dir) {
         return false;
     }
-    // The marker lives in the state directory itself: wait for that directory
-    // to change rather than stat the marker ten times a second (bug 85).
-    let watch = crate::watch::DirWatch::new(&[state_dir]);
+    // Only pause changes wake paused supervisors; map and visibility writes
+    // in the state root must not turn this into another polling loop.
+    let watch = pause_watch(state_dir);
     while !stream_may_connect(state_dir) {
         crate::watch::changed_or_tick(watch.as_ref(), crate::watch::FALLBACK_TICK).await;
     }
     tokio::time::sleep(delay).await;
     true
+}
+
+fn pause_watch(state_dir: &std::path::Path) -> Option<crate::watch::DirWatch> {
+    crate::watch::DirWatch::new(&[state_dir.join("pause").as_path()])
 }
 
 /// A change in the watched state directories, or the slow safety tick.
@@ -2920,12 +2924,22 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
     let mut sigwinch = signal(SignalKind::window_change())?;
     // Only a sidebar copy can be claimed by a view.
     let claimable = !app.is_view && !app.args.dump && app.local_pane_id.is_some();
-    // The pause marker, the host's health record, view claims and the
+    // The host's health record, view claims and the
     // visibility record change only when a file in one of these directories is
     // created, replaced or removed. Wait for that, not on a 100 ms timer: forty
     // streamers polling them were ~14k file operations per 15 s (bug 85). The
     // slow tick re-checks what no directory event carries (a dead daemon's
     // visibility record, the idle-release deadline).
+    // The state root is busy with visibility and map replacements. Pause has
+    // its own directory and wake branch so those writes do not stat its marker.
+    let pause_watch = pause_watch(&state_dir);
+    let mut pause_tick = tokio::time::interval(if pause_watch.is_some() {
+        crate::watch::FALLBACK_TICK
+    } else {
+        crate::watch::UNWATCHED_TICK
+    });
+    pause_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    pause_tick.tick().await;
     let state_watch = crate::watch::DirWatch::new(&[
         state_dir.as_path(),
         crate::state::host_health_dir(&state_dir).as_path(),
@@ -3056,7 +3070,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
-            _ = state_changed(state_watch.as_ref(), &mut state_tick) => {
+            _ = state_changed(pause_watch.as_ref(), &mut pause_tick) => {
                 if !stream_may_connect(&state_dir) {
                     if let Some(id) = local_pane_id.as_ref().filter(|_| !is_view) {
                         // The daemon reload may clear its global marker before
@@ -3069,6 +3083,8 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
                     app.paint();
                     break;
                 }
+            }
+            _ = state_changed(state_watch.as_ref(), &mut state_tick) => {
                 if !host_admission_open(&state_dir, app.args.host_name.as_deref())
                     && app.session.is_some()
                 {
@@ -4006,10 +4022,48 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         ))
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiet_pause_marker_stats_are_bounded_for_34_streamers() {
+        let root = pause_test_dir("stat-count");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..34 {
+            let root = root.clone();
+            tasks.push(tokio::spawn(async move {
+                let watch = pause_watch(&root).expect("native pause watch");
+                let mut tick = tokio::time::interval(crate::watch::FALLBACK_TICK);
+                tick.tick().await;
+                assert!(stream_may_connect(&root));
+                loop {
+                    state_changed(Some(&watch), &mut tick).await;
+                    assert!(stream_may_connect(&root));
+                }
+            }));
+        }
+        // Let all watches arm; then count real exists/stat calls while the
+        // pause state is quiet but normal daemon root records keep changing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        crate::daemon::PAUSE_STATS.with(|count| count.set(0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            std::fs::write(root.join(".visible.tmp"), b"{}").unwrap();
+            std::fs::rename(root.join(".visible.tmp"), root.join("visible-panes.json")).unwrap();
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+        let stats = crate::daemon::PAUSE_STATS.with(|count| count.get());
+        for task in tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled(), "streamer must remain alive");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("34 streamers, quiet pause for 15 s: {stats} pause-marker stats");
+        assert!((34..=68).contains(&stats), "expected one or two safety reads per streamer, got {stats}");
+    }
+
     #[test]
     fn explicit_pause_blocks_stream_transport_but_a_daemon_crash_does_not() {
         let state_dir = pause_test_dir("transport-gate");
-        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(state_dir.join("pause")).unwrap();
 
         assert!(stream_may_connect(&state_dir), "no marker is an ordinary daemon crash");
         std::fs::write(crate::daemon::pause_path(&state_dir), b"paused\n").unwrap();
@@ -4021,7 +4075,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
     #[tokio::test]
     async fn a_paused_supervisor_holds_until_start_clears_the_marker() {
         let state_dir = pause_test_dir("hold");
-        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(state_dir.join("pause")).unwrap();
         std::fs::write(crate::daemon::pause_path(&state_dir), b"paused\n").unwrap();
         let waiting_dir = state_dir.clone();
         let waiter = tokio::spawn(async move {

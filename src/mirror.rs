@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::ApiClient;
 use crate::config::HostConfig;
-use crate::state::{load_state, save_state, HostState, PaneEntry, RosemaryRun, WsEntry};
+use crate::state::{load_state, save_state, edit_state_async, StateTransaction, HostState, PaneEntry, RosemaryRun, WsEntry};
 use crate::util::{Logger, Result};
 
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
@@ -322,7 +322,10 @@ pub async fn apply_hidden(
     if !hidden {
         return;
     }
-    let mut state = load_state(state_dir, host_name);
+    let mut state = match edit_state_async(state_dir, host_name).await {
+        Ok(state) => state,
+        Err(e) => { log.log(&format!("[{host_name}] cannot edit mirror map: {e}")); return; }
+    };
     // only ids herdr still shows. Note this filters ids that are GONE, not ids
     // that now belong to someone else: a local server restart can reassign one,
     // and this cannot tell. Converge's own close paths share that weakness.
@@ -1066,7 +1069,7 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
 /// away instead of at pass end, so the intercept hook's map read (250ms after
 /// pane.created) sees the daemon-built object as mapped instead of judging it
 /// native junk and closing it.
-fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String]) {
+fn note_mapped(deps: &ConvergeDeps, state: &StateTransaction, fresh_local_ids: &[String]) {
     if let Ok(mut t) = deps.closes.lock() {
         for id in fresh_local_ids {
             t.forget(id);
@@ -1100,14 +1103,14 @@ pub(crate) fn missing_local_action(observed_close: bool) -> MissingLocalAction {
 
 /// Returns the post-converge state so callers don't re-read the state file.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
-    let mut state = load_state(&deps.state_dir, &deps.host.name);
+    let mut state = edit_state_async(&deps.state_dir, &deps.host.name).await?;
     let result = converge_inner(deps, &mut state).await;
     // save even on error: a crash mid-pass must not orphan created mirrors
     save_state(&deps.state_dir, &deps.host.name, &state)?;
-    result.map(|()| state)
+    result.map(|()| (*state).clone())
 }
 
-async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
+async fn converge_inner(deps: &ConvergeDeps, state: &mut StateTransaction) -> Result<()> {
     let host = &deps.host;
     let log = &deps.log;
     // Hidden hosts freeze here and go no further. Deliberately BEFORE the
@@ -1223,9 +1226,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.tab_id.as_str())).collect();
     let mut drop_panes: Vec<String> = Vec::new();
     let mut pane_close_remote: Vec<String> = Vec::new();
-    for (rid, entry) in state.panes.iter_mut() {
+    let host_state: &mut HostState = state;
+    for (rid, entry) in host_state.panes.iter_mut() {
         if !entry.is_tombstoned() && !local_pane_ids.contains(entry.local_id.as_str()) && remote_pane_ids.contains(rid.as_str()) {
-            let ws_entry = pane_ws.get(rid.as_str()).and_then(|ws| state.workspaces.get(*ws));
+            let ws_entry = pane_ws.get(rid.as_str()).and_then(|ws| host_state.workspaces.get(*ws));
             // if the pane's whole mirror workspace is gone, the stale pane
             // entry is collateral — drop it (its tombstoned workspace already
             // blocks recreation)
@@ -1236,7 +1240,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     // it are claimed through their tab's mapped local id
                     let tab_closed = pane_tab
                         .get(rid.as_str())
-                        .and_then(|t| state.tabs.get(*t))
+                        .and_then(|t| host_state.tabs.get(*t))
                         .is_some_and(|e| user_closed.contains(&e.local_id));
                     let observed_close = user_closed.contains(&entry.local_id) || tab_closed;
                     match missing_local_action(observed_close) {
@@ -1889,7 +1893,7 @@ async fn keep_agent_ineligible(
     deps: &PaneStatusDeps<'_>,
     remote_id: &str,
     exact_remote_name: &str,
-    state: &mut HostState,
+    state: &mut StateTransaction,
     reason: &str,
 ) {
     let PaneStatusDeps { local, state_dir, host_name, log, .. } = deps;
@@ -1977,7 +1981,7 @@ async fn keep_agent_ineligible(
 pub async fn push_pane_status(
     deps: &PaneStatusDeps<'_>,
     remote_id: &str,
-    state: &mut HostState,
+    state: &mut StateTransaction,
     agent: Option<&AgentInfo>,
     desired_name: Option<String>,
     local_agent_present: bool,
@@ -2372,7 +2376,10 @@ pub async fn apply_remote_closes(
     if closed.is_empty() {
         return;
     }
-    let mut state = load_state(state_dir, host_name);
+    let mut state = match edit_state_async(state_dir, host_name).await {
+        Ok(state) => state,
+        Err(e) => { log.log(&format!("[{host_name}] cannot edit mirror map: {e}")); return; }
+    };
     let mut changed = false;
     for rid in closed {
         if let Some(entry) = state.workspaces.remove(rid) {
@@ -2402,7 +2409,7 @@ pub async fn push_statuses(
     deps: &ConvergeDeps,
     remote_snap: &Snapshot,
     local_snap: &Snapshot,
-    state: &mut HostState,
+    state: &mut StateTransaction,
 ) {
     let agent_by_pane: HashMap<&str, &AgentInfo> =
         remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
@@ -2443,7 +2450,10 @@ pub async fn push_statuses(
 /// Only panes we actually reported an agent onto; inventing agent rows for
 /// plain mirrored terminals pollutes the agents panel.
 pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_name: &str, reason: &str) {
-    let mut state = load_state(state_dir, host_name);
+    let mut state = match edit_state_async(state_dir, host_name).await {
+        Ok(state) => state,
+        Err(e) => { eprintln!("[{host_name}] cannot edit mirror map: {e}"); return; }
+    };
     let source = mirror_source(host_name);
     let custom = clamp_status(reason);
     for entry in state.panes.values_mut() {
@@ -2477,7 +2487,8 @@ pub async fn teardown(
     log: &Logger,
     closes: Option<&crate::closes::Closes>,
 ) -> Result<()> {
-    let state = load_state(state_dir, host_name);
+    let mut state = edit_state_async(state_dir, host_name).await?;
+    let previous = (*state).clone();
     // Wipe the id map BEFORE closing the local windows. teardown (and the
     // restart / zombie-heal that call it) means "stop mirroring here" — never
     // "close the remote sessions". But close_remote_on_local_close fires when a
@@ -2486,12 +2497,13 @@ pub async fn teardown(
     // nothing to attribute these closes to, so they cannot propagate to the
     // remote. Manual close is unaffected: there the entry is still mapped when
     // the user closes it, so the intent still reaches the remote.
-    save_state(state_dir, host_name, &HostState::default())?;
+    *state = HostState::default();
+    save_state(state_dir, host_name, &state)?;
     // teardown means "stop mirroring here entirely", which supersedes hide —
     // leaving the marker would make a later `start` bring back nothing with no
     // explanation of why
     let _ = crate::state::set_hidden(state_dir, host_name, false);
-    for entry in state.workspaces.values() {
+    for entry in previous.workspaces.values() {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         // ours, not the user's: the heal re-adopts these ids, so without the mark
         // the echoing close event would later read as "user closed the mirror"
@@ -2919,7 +2931,7 @@ mod tests {
         let remembered = remembered.unwrap();
         assert_eq!(remembered.binding, " run-1 ");
         state.rosemary_suppressions.insert("conductor".into(), remembered.clone());
-        save_state(&dir, "host", &state).unwrap();
+        crate::state::seed_state(&dir, "host", &state).unwrap();
 
         let mut restarted = load_state(&dir, "host");
         let (suppressed, cleared, projected_run) =
@@ -2991,7 +3003,7 @@ mod tests {
         .await;
         local.fail("agent.rename", 2);
         let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let mut state = HostState::default();
+        let mut state = edit_state_async(&state_dir, "configured-host").await.unwrap();
         state.panes.insert(
             "remote-pane".into(),
             PaneEntry {
@@ -3050,7 +3062,7 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
         let local = FakePeer::start("already-clean", json!({})).await;
         let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let mut state = HostState::default();
+        let mut state = edit_state_async(&state_dir, "configured-host").await.unwrap();
         state.panes.insert(
             "remote-pane".into(),
             PaneEntry {
@@ -3113,7 +3125,7 @@ mod tests {
         .await;
         local.fail("agent.rename", 10);
         let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let mut state = HostState::default();
+        let mut state = edit_state_async(&state_dir, "configured-host").await.unwrap();
         state.panes.insert(
             "remote-pane".into(),
             PaneEntry {
@@ -3187,7 +3199,7 @@ mod tests {
         )
         .await;
         let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let mut state = HostState::default();
+        let mut state = edit_state_async(&state_dir, "configured-host").await.unwrap();
         state.panes.insert(
             "remote-pane".into(),
             PaneEntry {
@@ -3279,7 +3291,7 @@ mod tests {
         local.fail("agent.rename", 10);
         local.fail("pane.clear_agent_authority", 10);
         let local_api = ApiClient::connect(&local.path).await.unwrap();
-        let mut state = HostState::default();
+        let mut state = edit_state_async(&state_dir, "configured-host").await.unwrap();
         state.panes.insert(
             "remote-pane".into(),
             PaneEntry {

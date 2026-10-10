@@ -237,3 +237,33 @@ fn detached_start_publishes_owner_and_pause_allows_restart() {
     f.detached_pids.push(next);
     assert_ne!(pid, next);
 }
+
+#[test]
+fn concurrent_restore_processes_keep_both_map_updates() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    fs::write(f.root.join("test-map.json"), serde_json::to_vec(&json!({
+        "panes": {
+            "first": {"localId":"local-first", "tombstone":true},
+            "second": {"localId":"local-second", "tombstone":true},
+            "keep": {"localId":"local-keep"}
+        }
+    })).unwrap()).unwrap();
+    // Gate both real CLI writers behind the same native lock before allowing
+    // either to load the map. The lock is separate from the replaced map inode.
+    let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(f.root.join("test-map.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let mut first = f.command("restore").args(["test", "first"]).spawn().unwrap();
+    let mut second = f.command("restore").args(["test", "second"]).spawn().unwrap();
+    thread::sleep(Duration::from_millis(200));
+    let first_waiting = first.try_wait().unwrap().is_none();
+    let second_waiting = second.try_wait().unwrap().is_none();
+    drop(lock);
+    let first_status = first.wait().unwrap();
+    let second_status = second.wait().unwrap();
+    assert!(first_waiting && second_waiting, "restore bypassed the host map lock");
+    assert!(first_status.success() && second_status.success());
+    let state: Value = serde_json::from_slice(&fs::read(f.root.join("test-map.json")).unwrap()).unwrap();
+    assert_eq!(state["panes"], json!({"keep":{"localId":"local-keep", "seq":0}}));
+}

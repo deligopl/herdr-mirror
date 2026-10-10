@@ -93,7 +93,7 @@ while :; do sleep 1; done
     wait_until(Duration::from_secs(3), || matching_calls(&calls, "attach") >= 1);
     assert_eq!(matching_calls(&calls, "attach"), 1, "one active attach before pause");
 
-    fs::write(state_dir.join("daemon.paused"), b"paused\n").expect("pause marker");
+    fs::write(state_dir.join("pause").join("daemon.paused"), b"paused\n").expect("pause marker");
     // The second call is the existing bounded, identity-guarded cleanup. Once
     // it completes, multiple pause ticks must not open a transport or poll.
     wait_until(Duration::from_secs(4), || matching_calls(&calls, "cleanup") >= 1);
@@ -102,7 +102,7 @@ while :; do sleep 1; done
     assert_eq!(call_count(&calls), paused_calls, "pause must quiesce transport attempts");
     assert!(supervisor.0.try_wait().expect("supervisor status").is_none(), "stable supervisor keeps the local pane alive");
 
-    fs::remove_file(state_dir.join("daemon.paused")).expect("resume marker");
+    fs::remove_file(state_dir.join("pause").join("daemon.paused")).expect("resume marker");
     wait_until(Duration::from_secs(2), || matching_calls(&calls, "attach") > 1);
     assert_eq!(matching_calls(&calls, "attach"), 2, "resume starts exactly one stream");
 
