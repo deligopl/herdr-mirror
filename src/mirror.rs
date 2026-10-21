@@ -889,8 +889,7 @@ pub(crate) async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Optio
 /// May we type a streamer exec line into this local pane?
 ///
 /// The one predicate behind both paths that type into an existing pane: the
-/// daemon healing zombie mirrors after a local server restart, and the startup
-/// retype in `spawn_streamer_pane`. Both fail SAFE — only a definite "nothing
+/// daemon healing zombie mirrors after a local server restart. It fails SAFE — only a definite "nothing
 /// of ours is running there", from BOTH herdr's per-pane process info and our
 /// pidfiles, permits typing.
 ///
@@ -971,71 +970,12 @@ pub(crate) async fn spawn_streamer_pane(
         return;
     }
 
-    // Typed input can be eaten by interactive shell startup (oh-my-zsh's
-    // update prompt swallows the first key — in EVERY new shell until it's
-    // answered). Verify the streamer registered its pidfile and retype the
-    // exec if not, off-loop so a slow shell never stalls reconcile.
-    //
-    // A missing pidfile alone does NOT mean the exec was eaten: an owner's
-    // plugin-laden zsh can take longer to reach the line than any timeout worth
-    // waiting, and the streamer publishes its pid only after that. So each
-    // resend is gated on herdr's own per-pane process info as well (the same
-    // question the zombie heal asks): retype only when herdr definitely reports
-    // a plain shell in the pane AND no pidfile is alive. Unknown is not
-    // permission — see `streamer_exec_needed`.
-    //
-    // The ladder is 3s+4s+8s so a slow shell gets a real chance before the last
-    // attempt, then a 4s settle; 19s total stays inside
-    // `util::SPAWN_PENDING_TTL` (30s), so an abandoned claim still expires.
-    let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
-    let pane_id = local_pane_id.to_string();
-    tokio::spawn(async move {
-        for wait_ms in [3000u64, 4000, 8000] {
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            let pidfile_live = crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
-                || crate::util::pane_streamer_alive(&state_dir, &pane_id);
-            if pidfile_live {
-                return;
-            }
-            let process_info_live = has_live_streamer(&local, &pane_id).await;
-            if !streamer_exec_needed(process_info_live, pidfile_live) {
-                // Some(true): the streamer is running and simply has not
-                // published its pid yet. None: herdr could not tell us. Either
-                // way, stop typing and let the pending claim expire; a pane
-                // that really is a dead shell is healed on the daemon's next
-                // reconnect to the local server, which cannot hurt a live
-                // remote session.
-                log.log(&format!(
-                    "streamer for {pane_target} not up in {pane_id} but herdr reports {} — not retyping",
-                    match process_info_live {
-                        Some(true) => "a live streamer",
-                        _ => "no usable process info",
-                    }
-                ));
-                return;
-            }
-            log.log(&format!(
-                "streamer for {pane_target} not up in {pane_id} and the pane is still a shell — retyping"
-            ));
-            if local
-                .request("pane.send_text", json!({ "pane_id": pane_id, "text": line }))
-                .await
-                .is_err()
-            {
-                crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
-                return; // pane gone (closed meanwhile) — nothing to heal
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
-            && !crate::util::pane_streamer_alive(&state_dir, &pane_id)
-        {
-            crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
-            log.log(&format!(
-                "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
-            ));
-        }
-    });
+    // A successful send only means the line is queued, not consumed. A slow
+    // shell still appears as a shell and has no streamer pidfile; replaying
+    // here queues a second exec that the first streamer forwards to the guest.
+    // Never replay terminal input. A genuinely dead wrapper is recovered on
+    // local server reconnect by heal_zombie_mirrors and its launch claim.
+
 }
 
 /// cwd every mirror pane runs in, doubling as the loop-guard marker: it's set at
@@ -2702,6 +2642,8 @@ mod tests {
                         } else {
                             let result = if request["method"] == "session.snapshot" {
                                 json!({"snapshot": snapshots.lock().unwrap().clone()})
+                            } else if request["method"] == "pane.process_info" {
+                                json!({"process_info": {"foreground_processes": []}})
                             } else {
                                 json!({"type": "ok"})
                             };
@@ -2745,6 +2687,26 @@ mod tests {
             api_transport: crate::config::ApiTransport::Auto,
             api_tcp_endpoint: None,
         }
+    }
+
+    #[tokio::test]
+    async fn slow_shell_startup_never_queues_a_second_streamer_exec() {
+        let dir = std::env::temp_dir().join(format!("hm-start-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let peer = FakePeer::start("slow-shell", json!({})).await;
+        let api = ApiClient::at(&peer.path);
+        let log = Logger::new(&dir, false);
+        let argv = vec!["herdr-mirror".into(), "pane".into(), "host".into(), "w1:p1".into()];
+        spawn_streamer_pane(&api, &dir, "w2:p1", &argv, None, &log).await;
+        // The first command is queued in shell startup: no pidfile and process
+        // info still says shell. Neither observation permits sending it again.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let sent: Vec<_> = peer.requests().into_iter()
+            .filter(|r| r["method"] == "pane.send_text").collect();
+        assert_eq!(sent.len(), 1, "a duplicate exec would be forwarded to the guest shell");
+        assert!(sent[0]["params"]["text"].as_str().unwrap().contains("exec env"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
