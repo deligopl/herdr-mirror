@@ -465,21 +465,14 @@ pub(crate) async fn reap_host_remote_clients(
     for pane_target in pane_targets {
         let argv = command_for(pane_target);
         let args = parse_args(&argv[2..])?;
-        let Some(pid) = crate::util::take_remote_client(
-            state_dir,
-            &args.ssh_target,
-            &args.pane_target,
-        ) else {
-            continue;
-        };
-        if !kill_remote_client_within(&args, pid, SUSPEND_REMOTE_KILL_TIMEOUT).await {
-            crate::util::record_remote_client(
-                state_dir,
-                &args.ssh_target,
-                &args.pane_target,
-                pid,
-            );
-            unresolved.push(pane_target.clone());
+        for record_target in [&args.ssh_target, &crate::view::view_record_target(&args.ssh_target)] {
+            let Some(pid) = crate::util::take_remote_client(state_dir, record_target, &args.pane_target) else {
+                continue;
+            };
+            if !kill_remote_client_within(&args, pid, SUSPEND_REMOTE_KILL_TIMEOUT).await {
+                crate::util::record_remote_client(state_dir, record_target, &args.pane_target, pid);
+                unresolved.push(pane_target.clone());
+            }
         }
     }
     if unresolved.is_empty() {
@@ -1070,6 +1063,7 @@ struct App {
     /// this pane's one metadata channel, shared with the tasks that poll on it.
     /// Unused by a pane whose host has an API forward: see `foreground::poll`.
     fg_poller: crate::foreground::Shared,
+    fg_task: Option<tokio::task::JoinHandle<()>>,
     /// when a frame last reached us
     last_frame_at: Instant,
     /// the remote pane's content revision as of the last successful poll, and
@@ -1104,6 +1098,9 @@ struct App {
     paste_original: Option<Vec<u8>>,
     /// this process is a `herdr-mirror view` in a tile, not a sidebar copy
     is_view: bool,
+    /// A transport spawn is not a connected terminal. Keep the reason visible
+    /// through retries and hints until an actual frame proves recovery.
+    disconnected_reason: Option<String>,
     /// view only: the remote pane is gone, so the view leaves this streamer to
     /// re-resolve its agent instead of retrying a dead pane id
     view_target_gone: bool,
@@ -1296,6 +1293,9 @@ async fn wait_for_stream_resume(state_dir: &std::path::Path, local_pane_id: &str
 
 impl App {
     fn paint(&mut self) {
+        if let Some(reason) = &self.disconnected_reason {
+            self.renderer.status(reason);
+        }
         // a sidebar copy standing aside shows only its notice
         if !self.tty || self.aside() {
             return;
@@ -1380,7 +1380,9 @@ impl App {
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
     fn spawn_foreground_poll(&mut self, force: bool) {
-        if !host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+        if self.view_wait_reason().is_some()
+            || !host_admission_open(&self.state_dir, self.args.host_name.as_deref())
+        {
             return;
         }
         let now = Instant::now();
@@ -1399,11 +1401,20 @@ impl App {
         let pane = self.args.pane_target.clone();
         let api_socket = self.args.api_socket.clone();
         let poller = self.fg_poller.clone();
-        tokio::spawn(async move {
+        let state_dir = self.state_dir.clone();
+        let host_name = self.args.host_name.clone();
+        let is_view = self.is_view;
+        self.fg_task = Some(tokio::spawn(async move {
             // dropped on completion or cancellation, so the gate never stays
             // shut on a poll that will not finish
             let permit = permit;
             loop {
+                if !host_admission_open(&state_dir, host_name.as_deref())
+                    || (is_view && (!stream_may_connect(&state_dir)
+                        || host_name.as_deref().is_some_and(|host| crate::state::is_hidden(&state_dir, host))))
+                {
+                    break;
+                }
                 let (fg, revision) = crate::foreground::poll(
                     &poller,
                     bin.as_deref(),
@@ -1418,7 +1429,7 @@ impl App {
                     break;
                 }
             }
-        });
+        }));
     }
 
     /// Record what a poll said about the remote pane's content revision.
@@ -1578,8 +1589,44 @@ impl App {
         }
     }
 
+    fn view_wait_reason(&self) -> Option<&'static str> {
+        if !self.is_view {
+            return None;
+        }
+        if self.args.host_name.as_deref()
+            .is_some_and(|host| crate::state::is_hidden(&self.state_dir, host))
+        {
+            Some("disconnected — host suspended")
+        } else if !stream_may_connect(&self.state_dir) {
+            Some("disconnected — Mirror paused")
+        } else if !host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+            Some("disconnected — guest unreachable; waiting for Mirror host health trial")
+        } else {
+            None
+        }
+    }
+
+    /// Views own their tile for their whole lifetime, including explicit
+    /// suspension and daemon pause/restart. Reuse the normal release path and
+    /// reconnect deadline; the remote-pane claim and input socket stay held.
+    async fn poll_view_lifecycle(&mut self) {
+        if let Some(reason) = self.view_wait_reason() {
+            self.release_stream().await;
+            self.disconnected_reason = Some(reason.into());
+            self.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, self.mode));
+            self.paint();
+        }
+    }
+
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
+        if let Some(reason) = self.view_wait_reason() {
+            self.disconnected_reason = Some(reason.into());
+            self.hint_clear_at = None;
+            self.paint();
+            self.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, m));
+            return;
+        }
         if self.aside() {
             // standing aside (for a view, or idle): no stream now
             return;
@@ -1608,6 +1655,13 @@ impl App {
         // a reconnect ladder against a half-broken transport from leaving one
         // more remote client per rung.
         self.reap_remote_clients().await;
+        // Cleanup awaits transport: suspend/pause may have arrived meanwhile.
+        if let Some(reason) = self.view_wait_reason() {
+            self.disconnected_reason = Some(reason.into());
+            self.paint();
+            self.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, m));
+            return;
+        }
         self.next_gen += 1;
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
@@ -1621,9 +1675,13 @@ impl App {
                     self.pending_input.clear();
                 }
                 self.session = Some(s);
+                self.health_at = Some(Instant::now() + OUTPUT_HEALTH_INTERVAL);
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
+                if self.is_view && self.disconnected_reason.is_none() {
+                    self.disconnected_reason = Some("disconnected — waiting for terminal stream".into());
+                }
                 self.renderer.status(
                     if m == Mode::Control && !self.args.always_control {
                         "CONTROL — ctrl+\\ to release"
@@ -1631,6 +1689,7 @@ impl App {
                         ""
                     },
                 );
+                self.paint();
             }
             Err(e) => self.schedule_reconnect(m, &e.to_string()),
         }
@@ -1652,6 +1711,10 @@ impl App {
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
         if self.leave_gone_view(reason) {
             return;
+        }
+        if self.is_view {
+            self.disconnected_reason = Some(format!("disconnected — guest unreachable: {reason}"));
+            self.hint_clear_at = None;
         }
         // Only slow down once we are back in observe. In control the existing
         // quick-failure fallback needs its fast retries to reach two failures
@@ -1720,6 +1783,7 @@ impl App {
         self.backoff_idx = 0;
         // frames are flowing, so whatever was holding the terminal is gone
         self.attach_conflict_retried = false;
+        self.disconnected_reason = None;
         self.renderer.status("");
         let (fw, fh) = (
             frame.width.unwrap_or(self.grid.width),
@@ -1787,6 +1851,13 @@ impl App {
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
         if self.leave_gone_view(&reason) {
             return;
+        }
+        if self.is_view {
+            self.disconnected_reason = Some(
+                self.view_wait_reason().map(str::to_owned)
+                    .unwrap_or_else(|| format!("disconnected — guest unreachable: {reason_line}")),
+            );
+            self.hint_clear_at = None;
         }
         // A view attaching while the sidebar copy is still letting go: wait
         // for it, without spending the control-failure budget on it.
@@ -2236,6 +2307,13 @@ impl App {
         self.hint_clear_at = None;
         // standing aside: no remote traffic and no output health to report
         self.health_at = None;
+        if let Some(task) = self.fg_task.take() {
+            task.abort();
+        }
+        // Cancellation releases the poller's mutex before this await returns.
+        // Dropping its shell prevents an in-flight retry from dialing a host
+        // after this view has acknowledged suspension locally.
+        self.fg_poller.lock().await.close();
         self.pending_input.clear();
         self.select.clear();
         if let Some(mut s) = self.retire_session() {
@@ -2245,7 +2323,9 @@ impl App {
             }
             kill_session_process_group(s.process_group);
         }
-        if host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+        if host_admission_open(&self.state_dir, self.args.host_name.as_deref())
+            && self.view_wait_reason().is_none()
+        {
             self.reap_remote_clients().await;
         }
         if let Some(id) = &self.local_pane_id {
@@ -2700,7 +2780,7 @@ pub struct ViewRuntime {
 /// How a view's streamer ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ViewEnd {
-    /// signal, closed tile, pause: the view is over
+    /// signal or closed tile: the view is over
     Done,
     /// the remote pane it streamed no longer exists; re-resolve the target
     TargetGone,
@@ -2855,6 +2935,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
         fg_poll_at: None,
         fg_poll_gate: crate::foreground::PollGate::new(),
         fg_poller,
+        fg_task: None,
         last_frame_at: Instant::now(),
         remote_revision: None,
         remote_advanced_at: None,
@@ -2871,6 +2952,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
         paste_queue: Vec::new(),
         paste_original: None,
         is_view,
+        disconnected_reason: None,
         view_target_gone: false,
         record_target: record_target.clone(),
         local_pane_id: local_pane_id.clone(),
@@ -3004,6 +3086,9 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
                     Some(Msg::RemotePid { gen, pid }) => app.handle_remote_pid(gen, pid),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    Some(Msg::Stdin(_)) if app.view_wait_reason().is_some() => {
+                        app.poll_view_lifecycle().await;
+                    },
                     Some(Msg::Stdin(buf)) => if app.claim.is_some() {
                         app.forward_to_view(buf).await;
                     } else if app.idle_released {
@@ -3071,6 +3156,10 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
             _ = state_changed(pause_watch.as_ref(), &mut pause_tick) => {
+                if app.is_view {
+                    app.poll_view_lifecycle().await;
+                    continue;
+                }
                 if !stream_may_connect(&state_dir) {
                     if let Some(id) = local_pane_id.as_ref().filter(|_| !is_view) {
                         // The daemon reload may clear its global marker before
@@ -3085,6 +3174,10 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
                 }
             }
             _ = state_changed(state_watch.as_ref(), &mut state_tick) => {
+                if app.is_view {
+                    app.poll_view_lifecycle().await;
+                    continue;
+                }
                 if !host_admission_open(&state_dir, app.args.host_name.as_deref())
                     && app.session.is_some()
                 {
@@ -3158,7 +3251,9 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
     // Bounded by REMOTE_KILL_TIMEOUT for the batch: a supervisor waiting to
     // replace this child, or a pane closing, must not be held up. Whatever is
     // left unconfirmed stays recorded for the next streamer of this pane.
-    if host_admission_open(&state_dir, app.args.host_name.as_deref()) {
+    if host_admission_open(&state_dir, app.args.host_name.as_deref())
+        && app.view_wait_reason().is_none()
+    {
         app.reap_remote_clients().await;
     }
     // A record outliving its streamer would let the sweep judge a pane that no
@@ -4525,6 +4620,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         fg_poll_at: None,
         fg_poll_gate: crate::foreground::PollGate::new(),
         fg_poller,
+        fg_task: None,
         last_frame_at: Instant::now(),
         remote_revision: None,
         remote_advanced_at: None,
@@ -4541,6 +4637,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         paste_queue: Vec::new(),
         paste_original: None,
         is_view: false,
+        disconnected_reason: None,
         view_target_gone: false,
         record_target: "unused".into(),
         local_pane_id: None,
