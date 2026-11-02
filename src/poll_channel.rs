@@ -198,6 +198,11 @@ impl Poller {
         (self.opens, self.channel.as_ref().map_or(0, PollChannel::asks))
     }
 
+    /// Release the metadata transport when its pane stops streaming.
+    pub fn close(&mut self) {
+        self.channel = None;
+    }
+
     /// Ask once, opening a channel if there is none and rebuilding exactly
     /// once if the one we had turns out to be dead.
     ///
