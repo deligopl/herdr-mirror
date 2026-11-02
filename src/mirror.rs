@@ -575,10 +575,21 @@ impl SessionNamePlanner {
                 .iter()
                 .flat_map(|host| load_state(state_dir, host).panes.into_values().map(|entry| entry.local_id))
                 .collect();
+            // A mirror pane replaced by a re-show or roll can outlive its map
+            // entry with the mirrored name still on it. That stale holder is a
+            // retired mirror, not a native agent; push_statuses closes it so the
+            // replacement pane can take the identity over.
+            let mirror_panes: HashSet<&str> = local
+                .panes
+                .iter()
+                .filter(|pane| pane_is_mirror(pane))
+                .map(|pane| pane.pane_id.as_str())
+                .collect();
             let native_names: HashSet<String> = local
                 .agents
                 .iter()
                 .filter(|agent| !mapped_panes.contains(&agent.pane_id))
+                .filter(|agent| !mirror_panes.contains(agent.pane_id.as_str()))
                 .filter_map(|agent| agent.name.clone())
                 .collect();
             let mut final_owners: HashMap<String, Vec<usize>> = HashMap::new();
@@ -2360,6 +2371,13 @@ pub async fn push_statuses(
         &deps.state_dir,
         &deps.log,
     );
+    for pane in stale_identity_holders(local_snap, state, &names) {
+        deps.log.log(&format!(
+            "[{}] closing retired mirror pane {pane}: it still holds a name its replacement takes over",
+            deps.host.name
+        ));
+        retire_identity_holder(&deps.local, &pane, |id| mark_self_close(deps, id)).await;
+    }
     let remote_ids: Vec<String> = state.panes.keys().cloned().collect();
     for remote_id in remote_ids {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
@@ -2384,6 +2402,38 @@ pub async fn push_statuses(
         )
         .await;
     }
+}
+
+/// Local mirror panes outside this host's map that hold a name the plan gives
+/// to one of its mapped panes: the pane a re-show or roll replaced.
+fn stale_identity_holders(
+    local_snap: &Snapshot,
+    state: &StateTransaction,
+    names: &HashMap<String, Option<String>>,
+) -> Vec<String> {
+    let mapped: HashSet<&str> = state.panes.values().map(|entry| entry.local_id.as_str()).collect();
+    let mirror_panes: HashSet<&str> = local_snap
+        .panes
+        .iter()
+        .filter(|pane| pane_is_mirror(pane))
+        .map(|pane| pane.pane_id.as_str())
+        .collect();
+    let planned: HashSet<&str> = names.values().flatten().map(String::as_str).collect();
+    local_snap
+        .agents
+        .iter()
+        .filter(|agent| mirror_panes.contains(agent.pane_id.as_str()))
+        .filter(|agent| !mapped.contains(agent.pane_id.as_str()))
+        .filter(|agent| agent.name.as_deref().is_some_and(|name| planned.contains(name)))
+        .map(|agent| agent.pane_id.clone())
+        .collect()
+}
+
+/// Free the name, then close the pane as the plugin's own close.
+async fn retire_identity_holder(local: &ApiClient, pane: &str, mark_close: impl Fn(&str)) {
+    let _ = local.request("agent.rename", json!({ "target": pane, "name": Value::Null })).await;
+    mark_close(pane);
+    let _ = local.request("pane.close", json!({ "pane_id": pane })).await;
 }
 
 /// Mark mirrored agents unknown (ssh drop) — statuses recover on reconnect.
@@ -2937,6 +2987,59 @@ mod tests {
         })).unwrap();
         assert!(!absent.interactive_ready);
         assert!(absent.agent_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reshown_pane_takes_over_the_name_its_retired_mirror_still_holds() {
+        // gr-metal 2026-11-02: a roll mapped remote w1:p1 to a new local pane while
+        // the old mirror pane kept "gr-metal-mr-conductor"; the plan read that stale
+        // holder as a native name and kept the new pane ineligible on every pass.
+        let state_dir = std::env::temp_dir().join(format!("hm-name-takeover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let marker = state_dir.join(".mirror-pane").display().to_string();
+        let snapshot = json!({
+            "panes": [
+                {"pane_id": "old-pane", "tab_id": "t2", "workspace_id": "w", "cwd": marker},
+                {"pane_id": "new-pane", "tab_id": "t4", "workspace_id": "w", "cwd": marker}
+            ],
+            "agents": [
+                {"pane_id": "old-pane", "agent": "claude", "name": "gr-metal-mr-conductor"},
+                {"pane_id": "new-pane", "agent": "claude"}
+            ]
+        });
+        let local_snap: Snapshot = serde_json::from_value(snapshot.clone()).unwrap();
+        let mut state = edit_state_async(&state_dir, "gr-metal-mr").await.unwrap();
+        state.panes.insert(
+            "w1:p1".into(),
+            PaneEntry { local_id: "new-pane".into(), identity_ineligible: true, ..PaneEntry::default() },
+        );
+        save_state(&state_dir, "gr-metal-mr", &state).unwrap();
+        let remote = vec![AgentInfo {
+            pane_id: "w1:p1".into(),
+            agent: Some("claude".into()),
+            name: Some("conductor".into()),
+            ..AgentInfo::default()
+        }];
+        let log = Logger::new(&state_dir, false);
+        let names = SessionNamePlanner::new(["gr-metal-mr".to_string()])
+            .update("gr-metal-mr", &remote, &local_snap, &state_dir, &log);
+        assert_eq!(names["w1:p1"].as_deref(), Some("gr-metal-mr-conductor"));
+        assert_eq!(stale_identity_holders(&local_snap, &state, &names), vec!["old-pane".to_string()]);
+
+        let local = FakePeer::start("takeover", snapshot).await;
+        let local_api = ApiClient::connect(&local.path).await.unwrap();
+        let closed = std::sync::Mutex::new(Vec::new());
+        retire_identity_holder(&local_api, "old-pane", |id| closed.lock().unwrap().push(id.to_string())).await;
+        let methods: Vec<(String, Value)> = local
+            .requests()
+            .iter()
+            .filter(|request| request["method"] != "ping")
+            .map(|request| (request["method"].as_str().unwrap_or("").to_string(), request["params"].clone()))
+            .collect();
+        assert_eq!(methods[0], ("agent.rename".into(), json!({"target": "old-pane", "name": null})));
+        assert_eq!(methods[1], ("pane.close".into(), json!({"pane_id": "old-pane"})));
+        assert_eq!(*closed.lock().unwrap(), vec!["old-pane".to_string()]);
     }
 
     #[tokio::test]
