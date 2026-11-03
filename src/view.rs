@@ -508,6 +508,7 @@ pub async fn cmd_view(env: crate::util::Env, rest: &[String]) -> Result<()> {
                     env.state_dir.display()
                 )))
             }
+            Err(e) if gone.is_none() => return Err(e),
             // after a move, keep looking (the daemon may not have remapped it
             // yet, or local Herdr may be briefly unreachable)
             unresolved => {
