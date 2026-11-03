@@ -288,6 +288,25 @@ fn wait(mut predicate: impl FnMut() -> bool) {
 }
 
 #[test]
+fn first_resolve_error_reports_invalid_config_without_panicking() {
+    let f = Fixture::new();
+    fs::write(f.root.join("hosts.toml"), "[hosts.test\ntarget = 'fake-host'\n").unwrap();
+
+    let out = f
+        .command("view")
+        .arg("sidebar:p1")
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("hosts.toml"), "{stderr}");
+    assert!(stderr.contains("TOML parse error"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(f.text("calls").is_empty(), "startup failure must not dial the host");
+}
+
+#[test]
 fn one_view_survives_suspend_show_without_dialing_the_hidden_host() {
     let mut f = Fixture::new();
     f.daemon();
