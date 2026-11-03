@@ -1,12 +1,5 @@
 // One long-lived shell per mirrored pane, for the streamer's metadata polls.
 //
-// 2026-09-15. Every foreground poll used to be its own `ssh <target> <cmd>`.
-// On the ControlMaster that is cheap in handshakes and NOT cheap anywhere
-// else: each one is a fresh multiplexed session, and for a guest behind the
-// loopback bridge each session is its own port forward and its own guest
-// `exec`. On cfo-studio that came to 36.8 forwards/min sustained, against a
-// guest whose exec service is the thing that wedged twice in a day.
-//
 // The fix is to stop paying per question. Open ONE shell per pane, keep it,
 // and write each poll's script into it, reading the answer back to a sentinel
 // line. The transport cost then belongs to the streamer's lifetime rather than
@@ -136,8 +129,8 @@ pub enum AskFailure {
 /// How to open a channel to the pane's host.
 #[derive(Clone, Debug)]
 pub enum Transport {
-    /// ssh, reusing the daemon's ControlMaster when it has one
-    Ssh { target: String, ctl_path: Option<String> },
+    /// A command carried by the workspace connection owner.
+    Owner { target: String },
     /// a local container; `docker exec` is local, so there is no handshake to
     /// amortize — but there IS a guest exec per call, which is the whole point
     Docker { docker_bin: String, kind: crate::config::HostKind },
@@ -151,14 +144,7 @@ pub enum Transport {
 impl Transport {
     async fn command(&self) -> Option<Command> {
         match self {
-            Transport::Ssh { target, ctl_path } => {
-                let mut c = Command::new("ssh");
-                if let Some(path) = ctl_path {
-                    c.arg("-S").arg(path);
-                }
-                c.args(crate::remote::SSH_COMMON_OPTS).arg(target).arg("sh");
-                Some(c)
-            }
+            Transport::Owner { target } => Some(crate::owner_transport::command(target, "sh")),
             Transport::Docker { docker_bin, kind } => {
                 let id = crate::docker::resolve(docker_bin, kind)
                     .await

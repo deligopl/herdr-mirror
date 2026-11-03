@@ -1,7 +1,6 @@
 // hosts.toml loader. Real TOML via the `toml` crate (the TS version hand-rolled
 // a subset only because it had to stay dependency-free).
 
-use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -57,37 +56,6 @@ impl HostKind {
     }
 }
 
-/// How an ssh host's API socket is reached. Meaningless for docker hosts,
-/// which always bridge through `docker exec` (see docker.rs) — present on
-/// every host regardless of kind for the same reason `docker_bin` is present
-/// on ssh hosts: a field that is a no-op for the other kind is simpler than
-/// rejecting it.
-///
-/// `Auto` (the default) is what most hosts want: try the streamlocal `-L`
-/// socket forward first, since it is one process cheaper per connection, and
-/// fall back to an exec relay only if that turns out not to work. Some ssh
-/// servers — notably embedded Go sshds fronting container/VM workspaces —
-/// accept a direct-streamlocal channel open but never service it, which
-/// without a fallback looks like the remote herdr hanging rather than what it
-/// actually is: the transport silently going nowhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiTransport {
-    Auto,
-    Socket,
-    Exec,
-}
-
-impl ApiTransport {
-    fn parse(s: &str) -> Option<ApiTransport> {
-        match s {
-            "auto" => Some(ApiTransport::Auto),
-            "socket" => Some(ApiTransport::Socket),
-            "exec" => Some(ApiTransport::Exec),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub name: String,
@@ -102,12 +70,6 @@ pub struct HostConfig {
     pub remote_bin: Option<String>,
     /// Herdr session name on the remote. `None` selects the default session.
     pub session: Option<String>,
-    /// ssh hosts only; see `ApiTransport`. Default `Auto`.
-    pub api_transport: ApiTransport,
-    /// Optional private Herdr API endpoint on the remote host.  This is not the
-    /// server's native Unix socket and never replaces status discovery: it is
-    /// an explicitly-owned loopback bridge selected for OpenSSH direct-tcpip.
-    pub api_tcp_endpoint: Option<SocketAddrV4>,
     /// keep each mirror pane in control (writable, no idle release, and sized to
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
@@ -190,8 +152,6 @@ struct RawHost {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
-    api_transport: Option<String>,
-    api_tcp_endpoint: Option<String>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -309,43 +269,6 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 continue;
             }
         };
-        let api_transport = match h.api_transport.as_deref() {
-            None => ApiTransport::Auto,
-            Some(s) => match ApiTransport::parse(s) {
-                Some(t) => t,
-                None => {
-                    warnings.push(format!(
-                        "skipping host: [hosts.{name}]: unknown api_transport \"{s}\" \
-                         (expected auto, socket, or exec)"
-                    ));
-                    continue;
-                }
-            },
-        };
-        let api_tcp_endpoint = match h.api_tcp_endpoint.as_deref() {
-            None => None,
-            Some(raw) => match raw.parse::<SocketAddrV4>() {
-                Ok(endpoint)
-                    if endpoint.ip() == &Ipv4Addr::LOCALHOST && endpoint.port() != 0 =>
-                {
-                    Some(endpoint)
-                }
-                _ => {
-                    warnings.push(format!(
-                        "skipping host: [hosts.{name}]: api_tcp_endpoint must be canonical \
-                         IPv4 loopback 127.0.0.1:<port>, with port 1-65535"
-                    ));
-                    continue;
-                }
-            },
-        };
-        if api_tcp_endpoint.is_some() && api_transport != ApiTransport::Socket {
-            warnings.push(format!(
-                "skipping host: [hosts.{name}]: api_tcp_endpoint requires \
-                 api_transport = \"socket\""
-            ));
-            continue;
-        }
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
@@ -355,8 +278,6 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
-            api_transport,
-            api_tcp_endpoint,
             kind,
             target,
             name,
@@ -582,58 +503,6 @@ mod tests {
         for case in cases {
             assert!(parse_config(case).is_err(), "should reject: {case}");
         }
-    }
-
-    #[test]
-    fn api_transport_defaults_to_auto_and_parses_overrides() {
-        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
-        assert_eq!(c.hosts[0].api_transport, ApiTransport::Auto);
-
-        let c = parse_config("[hosts.a]\ntarget = \"a\"\napi_transport = \"socket\"\n").unwrap();
-        assert_eq!(c.hosts[0].api_transport, ApiTransport::Socket);
-
-        let c = parse_config("[hosts.a]\ntarget = \"a\"\napi_transport = \"exec\"\n").unwrap();
-        assert_eq!(c.hosts[0].api_transport, ApiTransport::Exec);
-    }
-
-    #[test]
-    fn tcp_api_endpoint_is_private_explicit_and_paired_with_socket_transport() {
-        let c = parse_config(
-            "[hosts.cargo]\ntarget = \"odx-cargo.sbx\"\n\
-             api_transport = \"socket\"\napi_tcp_endpoint = \"127.0.0.1:24680\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            c.hosts[0].api_tcp_endpoint,
-            Some("127.0.0.1:24680".parse().unwrap())
-        );
-
-        for endpoint in ["0.0.0.0:24680", "127.0.0.1:0", "[::1]:24680", "localhost:24680"] {
-            let text = format!(
-                "[hosts.cargo]\ntarget = \"odx-cargo.sbx\"\napi_transport = \"socket\"\napi_tcp_endpoint = \"{endpoint}\"\n"
-            );
-            assert!(parse_config(&text).unwrap_err().to_string().contains("127.0.0.1"));
-        }
-        let wrong_transport =
-            "[hosts.cargo]\ntarget = \"odx-cargo.sbx\"\napi_transport = \"exec\"\napi_tcp_endpoint = \"127.0.0.1:24680\"\n";
-        assert!(parse_config(wrong_transport)
-            .unwrap_err()
-            .to_string()
-            .contains("requires api_transport"));
-    }
-
-    /// An unknown value must be as loud as any other malformed host: skipped
-    /// with a named reason, not silently coerced to a default.
-    #[test]
-    fn unknown_api_transport_is_skipped_with_reason() {
-        let c = parse_config(
-            "[hosts.good]\ntarget = \"g\"\n\
-             [hosts.bad]\ntarget = \"b\"\napi_transport = \"turbo\"\n",
-        )
-        .unwrap();
-        assert_eq!(c.hosts.len(), 1);
-        assert_eq!(c.hosts[0].name, "good");
-        assert!(c.warnings[0].contains("unknown api_transport"), "{:?}", c.warnings);
     }
 
     #[test]

@@ -52,7 +52,7 @@ impl Fixture {
             r#"{"panes":{"remote:p1":{"localId":"sidebar:p1"}}}"#,
         )
         .unwrap();
-        fs::write(root.join("bin/ssh"), r#"#!/bin/sh
+        fs::write(root.join("bin/odx-connect"), r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HM_CALLS"
 case "$*" in
   *"ps -o args="*) printf 'cleanup\n' >> "$HM_EVENTS"; exit 0 ;;
@@ -73,7 +73,7 @@ while IFS= read -r line; do
   esac
 done
 "#).unwrap();
-        fs::set_permissions(root.join("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("bin/odx-connect"), fs::Permissions::from_mode(0o755)).unwrap();
         let listener = UnixListener::bind(root.join("api.sock")).unwrap();
         thread::spawn(move || {
             for stream in listener.incoming() {

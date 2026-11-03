@@ -160,8 +160,8 @@ pub async fn probe_socat(docker_bin: &str, cid: &str) -> Result<()> {
 /// the less-trusted side of the boundary, so it is validated rather than
 /// trusted.
 ///
-/// Shared with `ssh_relay`, whose socket path comes from `herdr status --json`
-/// over ssh instead of over `docker exec` — the same trust boundary, so the
+/// Shared with `owner_relay`, whose socket path comes from `herdr status --json`
+/// through odx-connect instead of over `docker exec` — the same trust boundary, so the
 /// same check.
 pub(crate) fn validate_socket_path(sock: &str) -> Result<()> {
     if !sock.starts_with('/') {

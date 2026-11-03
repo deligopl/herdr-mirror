@@ -20,17 +20,17 @@
 //                       remote with its own display: the remote keeps its own
 //                       geometry and the rest of the local pane stays blank.
 //
-// Every stream gets its own direct ssh connection (no shared ControlMaster):
-// isolated, and nothing persists to go stale on a flaky network.
+// Pane streams and control calls use odx-connect. The workspace owner
+// multiplexes them over its one guest session.
 //
 // The streamer OWNS the remote client it attaches. The remote
-// `herdr … terminal session …` process is not a child of the ssh (or docker
-// exec) that carries its stdio and does not die with it, so every path out of
+// `herdr … terminal session …` process is not a child of the odx-connect
+// (or docker exec) that carries its stdio and does not die with it, so every path out of
 // this process — and every reconnect — terminates it explicitly through the
 // same transport. See `remote_session_script` and `kill_remote_client`.
 //
 // One owner of all state, message-driven: frames, keystrokes, timers, and
-// ssh-child exits arrive on one channel; a session generation number tags
+// transport-child exits arrive on one channel; a session generation number tags
 // every message so stale ones are dropped.
 
 use std::process::Stdio;
@@ -77,10 +77,6 @@ pub struct Args {
     /// is never capped, since it doesn't resize anything.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
-    /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
-    /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
-    ///
-    pub ctl_path: Option<String>,
     /// Daemon-owned API forward used for pane metadata.  It is a local Unix
     /// socket even when its remote side is direct-tcpip.
     pub api_socket: Option<String>,
@@ -112,7 +108,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         always_control: false,
         max_cols: None,
         max_rows: None,
-        ctl_path: None,
         api_socket: None,
         host_name: None,
         container: None,
@@ -152,7 +147,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                 args.max_rows = Some(next("--max-rows")?.parse().map_err(|_| err("--max-rows must be a number"))?)
                     .filter(|&n| n > 0)
             }
-            "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--api-socket" => args.api_socket = Some(next("--api-socket")?),
             "--host-name" => args.host_name = Some(next("--host-name")?),
             "--container" => container_name = Some(next("--container")?),
@@ -270,19 +264,6 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
-    let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect();
-    // A pane stream is long-lived and interactive. It must not inherit a
-    // ControlPath from ~/.ssh/config: a stale shared master can hang
-    // the stream before the remote command starts. `-S none` disables control
-    // socket use without changing the daemon's intentional multiplexing.
-    argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]);
-    argv
-}
-
 /// Prefix the remote wrapper prints, on its own line, before it becomes the
 /// client. Chosen to be inert to the frame reader (not JSON) and unmistakable
 /// in a transcript.
@@ -397,14 +378,7 @@ async fn kill_remote_client_within(args: &Args, pid: i32, limit: Duration) -> bo
             c
         }
         None => {
-            let mut c = tokio::process::Command::new("ssh");
-            // reuse the daemon's ControlMaster when we were given one: this is
-            // a sub-second command and a fresh handshake would dominate it
-            if let Some(path) = &args.ctl_path {
-                c.arg("-S").arg(path);
-            }
-            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(sh_wrapped(&script));
-            c
+            crate::owner_transport::command(&args.ssh_target, &sh_wrapped(&script))
         }
     };
     // never onto the pane's tty: this runs while the streamer is drawing
@@ -492,9 +466,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     // contract (piped stdio, herdr's frames on stdout) is identical
     let mut builder = match &args.container {
         None => {
-            let mut c = tokio::process::Command::new("ssh");
-            c.args(ssh_stream_args(&args.ssh_target, &sh_wrapped(&cmd)));
-            c
+            crate::owner_transport::command(&args.ssh_target, &sh_wrapped(&cmd))
         }
         Some(ct) => {
             // resolve per spawn so a rebuilt container is picked up on
@@ -532,7 +504,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         // a terminal.closed frame on STDOUT — capture both
         let err_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let err_tail2 = err_tail.clone();
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(l)) = lines.next_line().await {
                 let mut buf = err_tail2.lock().unwrap();
@@ -564,6 +536,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             }
         }
         let _ = child.wait().await;
+        let _ = tokio::time::timeout(Duration::from_millis(200), &mut stderr_task).await;
         stderr_task.abort();
         let tail = err_tail.lock().unwrap().trim().to_string();
         let reason = if close_reason.is_empty() { tail } else { close_reason };
@@ -1040,6 +1013,7 @@ struct App {
     /// one-shot recovery from a control attach our own orphan is holding
     attach_conflict_retried: bool,
     /// consecutive quick control failures → fall back to observe
+    owner_admission: crate::owner_transport::Admission,
     control_failures: u32,
     control_sticky: bool,
     pending_input: Vec<Vec<u8>>,
@@ -1177,10 +1151,8 @@ const SETTLE_DELAY: Duration = Duration::from_millis(350);
 ///
 /// The existing foreground poll cannot answer this: it fires around input and
 /// mode changes, and the pane this exists for is precisely the one nobody is
-/// typing into any more. One extra multiplexed ssh exec every 20 seconds per
-/// mirrored pane is the whole cost, on the ControlMaster the daemon already
-/// holds, and it is bounded by the sweep it feeds: reporting faster than the
-/// daemon can act would buy nothing.
+/// typing into any more. Metadata travels through the owner's API relay;
+/// reporting faster than the daemon's sweep could act would buy nothing.
 const OUTPUT_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Explicit Mirror pause is a traffic boundary, not only a daemon switch.
@@ -1211,7 +1183,7 @@ fn host_admission_open(
 ) -> bool {
     host_name
         .and_then(|host| crate::state::read_host_health(state_dir, host))
-        .is_none_or(|health| health.next_retry_unix.is_none())
+        .is_none_or(|health| !health.waiting_for_running && health.next_retry_unix.is_none())
 }
 
 fn stream_resume_delay(local_pane_id: &str) -> Duration {
@@ -1380,7 +1352,8 @@ impl App {
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
     fn spawn_foreground_poll(&mut self, force: bool) {
-        if self.view_wait_reason().is_some()
+        if !self.owner_admission.may_connect(&self.args.ssh_target)
+            || self.view_wait_reason().is_some()
             || !host_admission_open(&self.state_dir, self.args.host_name.as_deref())
         {
             return;
@@ -1636,7 +1609,8 @@ impl App {
         // the new session repaints from scratch, so a span from the old one
         // points at text that no longer exists
         self.select.clear();
-        if !host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
+        if !self.owner_admission.may_connect(&self.args.ssh_target)
+            || !host_admission_open(&self.state_dir, self.args.host_name.as_deref()) {
             self.renderer.status("waiting for Mirror host health trial");
             self.paint();
             self.reconnect_at = Some((Instant::now() + HOST_HEALTH_WAIT, m));
@@ -1849,6 +1823,12 @@ impl App {
         self.retire_session();
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        if crate::owner_transport::stopped_refusal(&reason) {
+            self.owner_admission.refuse(&self.args.ssh_target);
+            self.control_failures = 0;
+            self.schedule_reconnect(exited_mode, "workspace stopped; waiting for running projection");
+            return;
+        }
         if self.leave_gone_view(&reason) {
             return;
         }
@@ -2002,11 +1982,10 @@ impl App {
         self.hint_sticky(&format!("uploading {} file(s)…", paths.len()));
         let tx = self.tx.clone();
         let ssh = self.args.ssh_target.clone();
-        let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
         tokio::spawn(async move {
             let result =
-                crate::paste::files_to_remote(&paths, &ssh, ctl.as_deref(), container.as_ref())
+                crate::paste::files_to_remote(&paths, &ssh, container.as_ref())
                     .await;
             let _ = tx.send(Msg::Drop(result)).await;
         });
@@ -2054,11 +2033,10 @@ impl App {
             self.paste_inflight = true;
             let tx = self.tx.clone();
             let ssh = self.args.ssh_target.clone();
-            let ctl = self.args.ctl_path.clone();
-            let container = self.args.container.clone();
+                let container = self.args.container.clone();
             tokio::spawn(async move {
                 let outcome =
-                    crate::paste::clipboard_to_remote(&ssh, ctl.as_deref(), container.as_ref())
+                    crate::paste::clipboard_to_remote(&ssh, container.as_ref())
                         .await;
                 let _ = tx.send(Msg::Paste(outcome)).await;
             });
@@ -2901,9 +2879,8 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
             docker_bin: ct.docker_bin.clone(),
             kind: ct.kind.clone(),
         },
-        None => crate::poll_channel::Transport::Ssh {
+        None => crate::poll_channel::Transport::Owner {
             target: args.ssh_target.clone(),
-            ctl_path: args.ctl_path.clone(),
         },
     });
 
@@ -2923,6 +2900,7 @@ async fn run_with(args: Args, view: Option<ViewRuntime>) -> Result<ViewEnd> {
         reconnect_at: None,
         pending_remote_kills: Vec::new(),
         attach_conflict_retried: false,
+        owner_admission: crate::owner_transport::Admission::default(),
         control_failures: 0,
         control_sticky: false,
         pending_input: Vec::new(),
@@ -3287,7 +3265,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn pane_transport_cleanup_terminates_proxy_command() {
+    async fn pane_transport_cleanup_terminates_its_descendants() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3296,19 +3274,13 @@ mod tests {
             "herdr-mirror-pane-proxy-{}-{nonce}.pid",
             std::process::id()
         ));
-        let proxy = format!(
-            "ProxyCommand=sh -c 'echo $$ > {}; exec sleep 30'",
-            pid_path.display()
-        );
-        let mut command = tokio::process::Command::new("ssh");
+        let mut command = tokio::process::Command::new("/bin/sh");
         command
             .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                &proxy,
-                "proxy-test.invalid",
-                "true",
+                "-c",
+                "sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & wait",
+                "sh",
+                pid_path.to_str().unwrap(),
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -3332,7 +3304,7 @@ mod tests {
         kill_session_process_group(process_group);
         tokio::time::timeout(Duration::from_secs(1), child.wait())
             .await
-            .expect("ssh did not exit after its process group was killed")
+            .expect("transport did not exit after its process group was killed")
             .unwrap();
 
         let mut proxy_survived = false;
@@ -3348,21 +3320,6 @@ mod tests {
         }
         let _ = std::fs::remove_file(pid_path);
         assert!(!proxy_survived, "ProxyCommand survived pane transport cleanup");
-    }
-
-    #[test]
-    fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
-
-        assert_eq!(
-            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
-            [
-                "-S",
-                "none",
-                "work",
-                "exec herdr terminal session observe w5:pM",
-            ]
-        );
     }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
@@ -3822,6 +3779,7 @@ mod tests {
             &crate::state::HostHealth {
                 summary: "disconnected (hung transport)".into(),
                 at_iso: "2026-09-14T10:00:00Z".into(),
+                waiting_for_running: false,
                 next_retry_unix: Some(crate::state::unix_now() + 300.0),
             },
         );
@@ -3839,6 +3797,7 @@ mod tests {
             &crate::state::HostHealth {
                 summary: "connected and synced".into(),
                 at_iso: "2026-09-14T10:05:00Z".into(),
+                waiting_for_running: false,
                 next_retry_unix: None,
             },
         );
@@ -3893,8 +3852,7 @@ mod tests {
             always_control: true,
             max_cols: None,
             max_rows: None,
-            ctl_path: None,
-            api_socket: None,
+                api_socket: None,
             host_name: None,
             container,
         }
@@ -4240,6 +4198,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
             &crate::state::HostHealth {
                 summary: "test".into(),
                 at_iso: "test".into(),
+                waiting_for_running: false,
                 next_retry_unix: Some(1e12),
             },
         );
@@ -4588,10 +4547,9 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         tty: bool,
         tx: mpsc::Sender<Msg>,
     ) -> App {
-        let fg_poller = crate::foreground::shared(crate::poll_channel::Transport::Ssh {
+        let fg_poller = crate::foreground::shared(crate::poll_channel::Transport::Owner {
             target: args.ssh_target.clone(),
-            ctl_path: None,
-        });
+            });
     App {
         args,
         state_dir: state_dir.clone(),
@@ -4608,6 +4566,7 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         reconnect_at: None,
         pending_remote_kills: Vec::new(),
         attach_conflict_retried: false,
+        owner_admission: crate::owner_transport::Admission::default(),
         control_failures: 0,
         control_sticky: false,
         pending_input: Vec::new(),

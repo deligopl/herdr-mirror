@@ -650,15 +650,8 @@ pub(crate) fn cmd_for_pane(
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
     let host_name = host.name.clone();
-    let api_socket = host
-        .api_tcp_endpoint
-        .map(|_| crate::remote::forward_socket_path(state_dir, &host.name).display().to_string());
-    // daemon's ControlMaster socket for this host (see remote.rs); the streamer
-    // reuses it for cheap foreground polls
-    let ctl_path = crate::remote::control_path(state_dir, &host.name)
-        .display()
-        .to_string();
     let sizes = sizes.clone();
+    let state_dir = state_dir.to_path_buf();
     move |pane_id: &str| {
         let mut argv = vec![
             exe.clone(),
@@ -686,16 +679,11 @@ pub(crate) fn cmd_for_pane(
         if let Some(r) = max_rows {
             argv.extend(["--max-rows".into(), r.to_string()]);
         }
-        // ssh only: the pane reuses the daemon's ControlMaster for cheap
-        // foreground polls. Docker has no ControlMaster, and healing no longer
-        // needs a host-identity token in the argv at all — it asks herdr what
-        // is running in each pane instead (see daemon::has_live_streamer).
+        // Workspace metadata shares the daemon's owner-backed API relay.
+        // Docker panes carry the container reference for their native relay.
         match &kind {
             crate::config::HostKind::Ssh => {
-                argv.extend(["--ctl-path".into(), ctl_path.clone()]);
-                if let Some(socket) = &api_socket {
-                    argv.extend(["--api-socket".into(), socket.clone()]);
-                }
+                argv.extend(["--api-socket".into(), crate::remote::forward_socket_path(&state_dir, &host_name).display().to_string()]);
             }
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
@@ -2734,8 +2722,6 @@ mod tests {
             always_control: true,
             max_cols: None,
             max_rows: None,
-            api_transport: crate::config::ApiTransport::Auto,
-            api_tcp_endpoint: None,
         }
     }
 
@@ -3497,17 +3483,6 @@ mod tests {
         assert!(prune_closed(&tree, &panes).is_none());
     }
 
-    /// Characterization test: the ssh pane argv is a cross-process contract.
-    ///
-    /// The daemon spawns `herdr-mirror pane ...` as a separate process, and
-    /// `count_streamers` (daemon.rs) identifies a host's live streamers by
-    /// string-matching `--ctl-path` in that argv. Nothing else pins the shape,
-    /// so a change here silently breaks mirror healing on upgrade: streamers
-    /// started by the old binary carry the old argv, the new daemon fails to
-    /// match them, concludes they died, and re-execs over live panes.
-    ///
-    /// If this test fails, that is the question to answer — not a prompt to
-    /// update the expected value.
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
@@ -3523,8 +3498,8 @@ mod tests {
                 "vps",
                 // no --remote-bin: auto (PATH then ~/.local/bin/herdr)
                 "--always-control",
-                "--ctl-path",
-                "/state/vps.ctl",
+                "--api-socket",
+                "/state/vps-api.sock",
             ]
         );
         // argv[0] is the resolved exe path, which varies by install
@@ -3550,8 +3525,8 @@ mod tests {
                 "--remote-bin",
                 "/opt/herdr",
                 "--always-control",
-                "--ctl-path",
-                "/state/vps.ctl",
+                "--api-socket",
+                "/state/vps-api.sock",
             ]
         );
     }
@@ -3573,8 +3548,8 @@ mod tests {
                 "--session",
                 "work",
                 "--always-control",
-                "--ctl-path",
-                "/state/vps.ctl",
+                "--api-socket",
+                "/state/vps-api.sock",
             ]
         );
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
@@ -3626,14 +3601,12 @@ mod tests {
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
-        assert_eq!(parsed.ctl_path, None, "docker panes carry no ctl path");
         let ct = parsed.container.expect("container must survive the argv round trip");
         assert_eq!(ct.kind, crate::config::HostKind::DockerContainer("crazy_ride".into()));
         assert_eq!(ct.docker_bin, "/usr/local/bin/docker", "--docker-bin must round-trip");
     }
 
-    /// always_control is the only conditional flag; its absence must not
-    /// disturb the position of --ctl-path.
+    /// Read-only panes still receive their owner-backed metadata socket.
     #[test]
     fn ssh_pane_argv_without_always_control() {
         let mut host = ssh_host();
@@ -3642,15 +3615,13 @@ mod tests {
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--host-name", "vps", "--ctl-path", "/state/vps.ctl"]
+            ["pane", "vps", "w1:p1", "--host-name", "vps", "--api-socket", "/state/vps-api.sock"]
         );
     }
 
     #[test]
-    fn tcp_api_socket_reaches_the_streamer_metadata_path() {
-        let mut host = ssh_host();
-        host.api_transport = crate::config::ApiTransport::Socket;
-        host.api_tcp_endpoint = Some("127.0.0.1:24680".parse().unwrap());
+    fn owner_api_socket_reaches_the_streamer_metadata_path() {
+        let host = ssh_host();
         let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.host_name.as_deref(), Some("vps"));
