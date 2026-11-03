@@ -1,27 +1,4 @@
-// Exec-relay transport: reach a herdr server's unix socket over a plain ssh
-// exec channel, for ssh hosts whose sshd accepts `-L`-style direct-streamlocal
-// channel opens but never services them (observed against embedded Go sshds
-// fronting container/VM workspaces — e.g. DevPod-style remote dev
-// environments). `remote::connect_ssh_api` decides *when* to use this; this
-// module only implements the bridge once that decision is made.
-//
-// This is deliberately the same shape as docker.rs's container relay: one
-// exec (here, `ssh -S <ctlpath> <target> <relay-cmd>` instead of `docker exec
-// -i <cid> ...`) per accepted local connection, piping the child's
-// stdin/stdout to/from the unix socket at daemon → <state>/<host>-api.sock.
-//
-//   daemon → <state>/<host>-api.sock        (a local socket WE listen on)
-//              │ copy both directions
-//   ssh -S <ctlpath> <target> "<relay-cmd>"
-//              │ (multiplexed over the existing ControlMaster: no new
-//              │  handshake, and exec channels are the transport that is
-//              │  known to work where streamlocal is not)
-//              └→ /path/to/herdr.sock   (herdr, on the remote)
-//
-// `relay-cmd` is `socat - UNIX-CONNECT:<sock>` when the remote has socat, else
-// a small python3 stdio↔unix bridge (see `python_bridge_command`) — chosen
-// once per host by `detect_relay_command` and reused for every connection.
-
+// Relay each local API connection through the workspace owner.
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -31,7 +8,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -39,10 +15,7 @@ use crate::docker::validate_socket_path;
 use crate::remote::RemoteHost;
 use crate::util::{err, Logger, Result};
 
-/// A remote stdio↔unix bridge, run once and reused across probes: not worth
-/// re-detecting on every reconnect within a daemon's lifetime, and `remote`
-/// already remembers the *transport* choice across reconnects for the same
-/// reason.
+/// Guest stdio-to-Unix bridge selected for one owner connection.
 #[derive(Debug, Clone)]
 pub struct RelayCommand {
     cmd: String,
@@ -63,10 +36,10 @@ impl RelayCommand {
 /// Errors when neither exists — a clear "install one" beats a silent hang.
 pub async fn detect_relay_command(host: &RemoteHost, remote_sock: &str) -> Result<RelayCommand> {
     validate_socket_path(remote_sock)?;
-    if !host.exec("command -v socat", 8000).await.unwrap_or_default().trim().is_empty() {
+    if !host.exec("command -v socat || true", 8000).await?.trim().is_empty() {
         return Ok(RelayCommand { cmd: socat_bridge_command(remote_sock), tool: "socat" });
     }
-    if !host.exec("command -v python3", 8000).await.unwrap_or_default().trim().is_empty() {
+    if !host.exec("command -v python3 || true", 8000).await?.trim().is_empty() {
         return Ok(RelayCommand { cmd: python_bridge_command(remote_sock), tool: "python3" });
     }
     Err(err(
@@ -146,27 +119,15 @@ while True:
     format!("python3 -c '{BRIDGE}' '{sock_b64}'")
 }
 
-/// Where and how to reach the remote: reuses the daemon's own ControlMaster
-/// (`-S ctl_path`) so a relay exec costs no new ssh handshake, exactly like
-/// every other multiplexed exec this daemon already runs.
 #[derive(Debug, Clone)]
 struct ExecTarget {
-    ctl_path: PathBuf,
     ssh_target: String,
     relay_cmd: RelayCommand,
 }
 
 impl ExecTarget {
     fn relay_child(&self) -> Result<tokio::process::Child> {
-        let mut cmd = Command::new("ssh");
-        cmd.args([
-            "-S",
-            &self.ctl_path.display().to_string(),
-            "-o",
-            "BatchMode=yes",
-            &self.ssh_target,
-            &self.relay_cmd.cmd,
-        ]);
+        let mut cmd = crate::owner_transport::command(&self.ssh_target, &self.relay_cmd.cmd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // kept, not nulled: an sshd that killed the channel, or a relay
@@ -174,27 +135,26 @@ impl ExecTarget {
             // from a clean close and the real reason is lost
             .stderr(Stdio::piped())
             // if we drop the connection the child must die rather than linger
-            // holding an exec channel open on the ControlMaster
+            // holding an owner stream open
             .kill_on_drop(true);
-        cmd.spawn().map_err(|e| err(format!("ssh exec (relay) failed: {e}")))
+        cmd.spawn().map_err(|e| err(format!("odx-connect relay failed: {e}")))
     }
 }
 
 /// Serve `local_sock` by relaying every accepted connection into the remote
-/// over a fresh exec channel. Returns once the listener is bound, so callers
+/// over a fresh owner command. Returns once the listener is bound, so callers
 /// can connect immediately.
 ///
 /// Structurally identical to `docker::serve_relay` — see that function's
 /// comments for the accept-loop and shutdown reasoning, which apply unchanged
 /// here.
 pub fn serve_relay(
-    ctl_path: PathBuf,
     ssh_target: String,
     relay_cmd: RelayCommand,
     local_sock: PathBuf,
     log: Logger,
 ) -> Result<RelayHandle> {
-    let target = ExecTarget { ctl_path, ssh_target, relay_cmd };
+    let target = ExecTarget { ssh_target, relay_cmd };
     let _ = std::fs::remove_file(&local_sock);
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -380,52 +340,31 @@ mod tests {
         assert!(!inner.contains('\''), "script must not contain single quotes: {inner}");
     }
 
-    /// End-to-end relay check against a real unix socket over a real ssh
-    /// ControlMaster. Skipped unless the env vars below are set — this is the
+    /// End-to-end relay check against a real workspace owner. Skipped unless the env vars below are set — this is the
     /// piece unit tests cannot cover on their own machine, since it needs a
-    /// live ssh target with either socat or python3 and something herdr-like
+    /// running workspace with either socat or python3 and something herdr-like
     /// listening on a unix socket:
     ///
-    ///   HERDR_MIRROR_IT_SSH_TARGET=my-host.example \
-    ///   HERDR_MIRROR_IT_SSH_SOCK=/home/user/.config/herdr/herdr.sock \
-    ///   cargo test -- --ignored --nocapture relay_reaches_real_ssh_host
+    ///   HERDR_MIRROR_IT_WORKSPACE=demo \
+    ///   HERDR_MIRROR_IT_SOCKET=/home/user/.config/herdr/herdr.sock \
+    ///   cargo test -- --ignored --nocapture relay_reaches_real_workspace_owner
     #[tokio::test]
     #[ignore]
-    async fn relay_reaches_real_ssh_host() {
-        let Ok(ssh_target) = std::env::var("HERDR_MIRROR_IT_SSH_TARGET") else {
-            eprintln!("skipped: set HERDR_MIRROR_IT_SSH_TARGET");
+    async fn relay_reaches_real_workspace_owner() {
+        let Ok(ssh_target) = std::env::var("HERDR_MIRROR_IT_WORKSPACE") else {
+            eprintln!("skipped: set HERDR_MIRROR_IT_WORKSPACE");
             return;
         };
-        let sock = std::env::var("HERDR_MIRROR_IT_SSH_SOCK")
+        let sock = std::env::var("HERDR_MIRROR_IT_SOCKET")
             .unwrap_or_else(|_| "/home/vscode/.config/herdr/herdr.sock".into());
 
-        let dir = std::env::temp_dir().join(format!("herdr-mirror-it-ssh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("herdr-mirror-it-owner-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ctl_path = dir.join("it.ctl");
         let local_sock = dir.join("it-api.sock");
-
-        // establish a ControlMaster the relay child can multiplex onto
-        let start = Command::new("ssh")
-            .args([
-                "-M",
-                "-S",
-                ctl_path.to_str().unwrap(),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ControlPersist=yes",
-                "-f",
-                "-N",
-                &ssh_target,
-            ])
-            .status()
-            .await
-            .expect("ssh master spawn");
-        assert!(start.success(), "ssh ControlMaster failed to start");
 
         let relay_cmd =
             RelayCommand { cmd: python_bridge_command(&sock), tool: "python3" };
-        let handle = serve_relay(ctl_path.clone(), ssh_target.clone(), relay_cmd, local_sock.clone(), Logger::new(&dir, false))
+        let handle = serve_relay(ssh_target.clone(), relay_cmd, local_sock.clone(), Logger::new(&dir, false))
             .unwrap();
 
         let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
@@ -447,10 +386,6 @@ mod tests {
         eprintln!("5 sequential requests ok");
 
         drop(handle);
-        let _ = Command::new("ssh")
-            .args(["-S", ctl_path.to_str().unwrap(), "-O", "exit", &ssh_target])
-            .status()
-            .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

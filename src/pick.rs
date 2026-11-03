@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::api::ApiClient;
 use crate::config::{load_config, parse_config, remote_herdr_expr, HostConfig};
-use crate::remote::{version_supported, RemoteHost, SSH_COMMON_OPTS};
+use crate::remote::{version_supported, RemoteHost};
 use crate::util::{err, Env, Result};
 
 const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
@@ -882,16 +882,7 @@ fn expand_include(
 
 fn probe_ssh_args(target: &str) -> Vec<String> {
     let cmd = format!("exec {} status --json", remote_herdr_expr(None, None));
-    let mut args = SSH_COMMON_OPTS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    args.extend([
-        "-o".into(),
-        "ControlMaster=no".into(),
-        "-o".into(),
-        "ControlPath=none".into(),
-        target.into(),
-        cmd,
-    ]);
-    args
+    vec![target.into(), cmd]
 }
 
 fn validate_probe_status(target: &str, stdout: &[u8]) -> Result<()> {
@@ -912,11 +903,9 @@ fn validate_probe_status(target: &str, stdout: &[u8]) -> Result<()> {
     }
 }
 
-/// A one-shot check deliberately isolated from RemoteHost: that type owns the
-/// daemon's persistent ControlMaster, which an unsuccessful import must never
-/// leave running in the background.
+/// Probe Herdr through the workspace owner without starting an API relay.
 async fn probe_machine(target: &str) -> Result<()> {
-    let mut command = tokio::process::Command::new("ssh");
+    let mut command = tokio::process::Command::new(crate::owner_transport::PROGRAM);
     command
         .args(probe_ssh_args(target))
         .stdin(std::process::Stdio::null())
@@ -925,14 +914,14 @@ async fn probe_machine(target: &str) -> Result<()> {
         .kill_on_drop(true);
     let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
-        .map_err(|_| err(format!("ssh check for {target} timed out")))??;
+        .map_err(|_| err(format!("owner check for {target} timed out")))??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
         return Err(err(if detail.is_empty() {
-            format!("ssh check for {target} exited with {}", output.status)
+            format!("owner check for {target} exited with {}", output.status)
         } else {
-            format!("ssh check for {target} failed: {detail}")
+            format!("owner check for {target} failed: {detail}")
         }));
     }
     validate_probe_status(target, &output.stdout)
@@ -1523,10 +1512,9 @@ User bob
     }
 
     #[test]
-    fn candidate_probe_explicitly_disables_persistent_ssh_masters() {
+    fn candidate_probe_uses_owner_command_arguments() {
         let args = probe_ssh_args("work");
-        assert!(args.windows(2).any(|a| a == ["-o", "ControlMaster=no"]));
-        assert!(args.windows(2).any(|a| a == ["-o", "ControlPath=none"]));
+        assert_eq!(args.len(), 2);
         assert_eq!(args[args.len() - 2], "work");
         assert!(validate_probe_status(
             "work",

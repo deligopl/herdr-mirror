@@ -288,39 +288,12 @@ fn status_event_needs_snapshot(data: &Value) -> bool {
         .any(|key| data.get(*key).is_none())
 }
 
-/// Which transport the next reconnect should try first.
-///
-/// A fallback to the exec relay is only remembered once it has happened twice
-/// running. The probe fails for transient reasons too (the remote herdr
-/// restarting, a mux hiccup, one slow ping), and remembering the first one
-/// pins a healthy host to the slower transport for the daemon's whole life
-/// with a single log line as the only clue. A genuinely broken host wastes one
-/// probe on the next reconnect and then sticks, which is what the memory is
-/// for.
-fn remember_transport(
-    last: Option<crate::config::ApiTransport>,
-    exec_streak: &mut u32,
-) -> Option<crate::config::ApiTransport> {
-    match last {
-        Some(crate::config::ApiTransport::Exec) => {
-            *exec_streak += 1;
-            (*exec_streak >= 2).then_some(crate::config::ApiTransport::Exec)
-        }
-        other => {
-            *exec_streak = 0;
-            other
-        }
-    }
-}
-
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
 /// until the connection drops (returns Err).
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<HostSignal>,
     ladder: &mut ReconnectLadder,
-    remembered_transport: &mut Option<crate::config::ApiTransport>,
-    exec_streak: &mut u32,
 ) -> Result<()> {
     #[cfg(test)]
     if let Some(attempts) = &ctx.connect_attempts {
@@ -332,13 +305,7 @@ async fn run_connected(
         return connected_session(ctx, poke, remote.clone()).await;
     }
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
-    // a fresh RemoteHost is built on every reconnect, so what worked last
-    // time (specifically: an auto host that fell back to the exec relay)
-    // would otherwise be re-probed via streamlocal on every single reconnect
-    // for the life of the daemon
-    remote_host.hint_transport(*remembered_transport);
     let (remote, _status) = remote_host.connect_api().await?;
-    *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     ladder.reset();
     connected_session(ctx, poke, remote).await
 }
@@ -375,6 +342,7 @@ async fn connected_session(
         &crate::state::HostHealth {
             summary: "connected and synced".into(),
             at_iso: now_iso(),
+            waiting_for_running: false,
             next_retry_unix: None,
         },
     );
@@ -576,10 +544,7 @@ fn signal_restarts_ladder(signal: &HostSignal, hidden: bool) -> bool {
 
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
     let mut ladder = ReconnectLadder::default();
-    // persists across reconnects for the daemon's whole lifetime — the
-    // point of remembering at all (see `run_connected`)
-    let mut remembered_transport: Option<crate::config::ApiTransport> = None;
-    let mut exec_streak = 0u32;
+    let mut owner_admission = crate::owner_transport::Admission::default();
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -609,12 +574,30 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         if was_hidden {
             ladder.reset();
         }
+        if !ctx.host.kind.is_docker() && !owner_admission.may_connect(&ctx.host.target) {
+            if !crate::state::read_host_health(&ctx.env_state_dir, &ctx.host.name)
+                .is_some_and(|health| health.waiting_for_running)
+            {
+                crate::state::publish_host_health(
+                    &ctx.env_state_dir, &ctx.host.name,
+                    &crate::state::HostHealth {
+                        summary: "workspace stopped; waiting for running projection".into(),
+                        at_iso: now_iso(),
+                        waiting_for_running: true,
+                        next_retry_unix: None,
+                    },
+                );
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                signal = poke.recv() => if signal.is_none() { return },
+            }
+            continue;
+        }
         let e = match run_connected(
             &ctx,
             &mut poke,
             &mut ladder,
-            &mut remembered_transport,
-            &mut exec_streak,
         )
         .await
         {
@@ -628,21 +611,17 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         // substring test would make an ssh host named `dormant-box` back off
         // for 5 minutes and stop logging on every genuine failure.
         let reason = e.to_string();
+        if crate::owner_transport::stopped_refusal(&reason) {
+            owner_admission.refuse(&ctx.host.target);
+            ladder.reset();
+            continue;
+        }
         let dormant = reason.starts_with(crate::remote::DORMANT);
-        let RetryDecision { delay, log: worth_logging } =
+        let RetryDecision { mut delay, log: worth_logging } =
             if dormant { ladder.dormant(&reason) } else { ladder.fail(&reason) };
-        // End the transport this connection was using before anything starts a
-        // replacement beside it. Only when it can no longer serve — see
-        // `retire_unusable_master`. A dormant cycle never had an ssh master.
-        let retired = if dormant || ctx.host.kind.is_docker() {
-            None
-        } else {
-            crate::remote::retire_unusable_master(
-                &crate::remote::control_path(&ctx.env_state_dir, &ctx.host.name),
-                &ctx.host.target,
-            )
-            .await
-        };
+        if !ctx.host.kind.is_docker() {
+            delay = delay.min(10);
+        }
         // The record `status` reads. Published on every failed dial, including
         // the ones this loop deliberately no longer logs, so the owner's answer
         // to "why is this host not mirroring" never depends on how long it has
@@ -653,6 +632,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
             &crate::state::HostHealth {
                 summary: format!("disconnected ({reason})"),
                 at_iso: now_iso(),
+                waiting_for_running: false,
                 next_retry_unix: Some(crate::state::unix_now() + delay as f64),
             },
         );
@@ -660,16 +640,8 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<HostSignal>) {
         // delay, and a changed reason are news; the identical retry underneath
         // them is the line that buried everything else.
         if worth_logging {
-            // The cause and the pid belong on ONE line: this is the record an
-            // investigation reads to tell "the remote went away" from "we threw
-            // the transport away", and two lines can be minutes apart in a log
-            // nine hosts share.
-            let retired = match retired {
-                Some(pid) => format!(" — retired unusable ssh master pid {pid}"),
-                None => String::new(),
-            };
             ctx.log.log(&format!(
-                "[{}] disconnected ({e}){retired} — retrying in {delay}s",
+                "[{}] disconnected ({e}) — retrying in {delay}s",
                 ctx.host.name
             ));
         }
@@ -1538,6 +1510,7 @@ mod tests {
                 summary: "disconnected (ssh master to omnidev-greenroom-air failed: exit 255)"
                     .into(),
                 at_iso: "2026-09-09T11:42:42.000Z".into(),
+                waiting_for_running: false,
                 next_retry_unix: Some(now + 250.0),
             },
         );
@@ -1564,6 +1537,7 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             &crate::state::HostHealth {
                 summary: "connected and synced".into(),
                 at_iso: "2026-09-09T11:43:12.000Z".into(),
+                waiting_for_running: false,
                 next_retry_unix: None,
             },
         );
@@ -1897,8 +1871,6 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
             prefix: name.into(),
             remote_bin: None,
             session: None,
-            api_transport: crate::config::ApiTransport::Auto,
-            api_tcp_endpoint: None,
             always_control: true,
             max_cols: None,
             max_rows: None,
@@ -2205,35 +2177,6 @@ at 2026-09-09T11:42:42.000Z, next retry in 1s"
         drop(owner);
         assert_eq!(fs::read_to_string(pid_path(&env)).unwrap(), "123456");
         let _ = fs::remove_dir_all(&env.state_dir);
-    }
-
-    /// One fallback is not evidence: the probe also fails when the remote herdr
-    /// is restarting or the mux hiccups, and pinning a healthy host to the
-    /// slower transport for the daemon's life is worse than re-probing once.
-    #[test]
-    fn a_single_fallback_is_not_remembered() {
-        use crate::config::ApiTransport;
-        let mut streak = 0u32;
-
-        // transient: fell back once, then the forward worked again
-        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
-        assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
-        assert_eq!(streak, 0);
-
-        // genuinely broken: two in a row sticks, and stays stuck
-        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
-        assert_eq!(
-            remember_transport(Some(ApiTransport::Exec), &mut streak),
-            Some(ApiTransport::Exec)
-        );
-        assert_eq!(
-            remember_transport(Some(ApiTransport::Exec), &mut streak),
-            Some(ApiTransport::Exec)
-        );
-
-        // a later success clears it, so a fixed host returns to the forward
-        assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
-        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
     }
 
     /// The sweep is a backstop, not a second poll loop: a minute by default,

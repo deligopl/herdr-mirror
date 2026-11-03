@@ -18,8 +18,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "mirror-lock-{}-{}-{}",
+        let root = PathBuf::from(format!(
+            "/tmp/hm-lock-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -46,7 +46,7 @@ impl Fixture {
                         return;
                     };
                     let result = if v["method"] == "session.snapshot" {
-                        json!({"workspaces":[],"tabs":[],"panes":[],"agents":[]})
+                        json!({"snapshot":{"workspaces":[],"tabs":[],"panes":[],"agents":[]}})
                     } else {
                         json!({})
                     };
@@ -97,7 +97,14 @@ impl Drop for Fixture {
             }
         }
         for c in &mut self.children {
-            let _ = c.kill();
+            if matches!(c.try_wait(), Ok(None)) {
+                unsafe { libc::kill(c.id() as i32, libc::SIGTERM); }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while matches!(c.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                let _ = c.kill();
+            }
             let _ = c.wait();
         }
         let _ = fs::remove_dir_all(&self.root);
@@ -266,4 +273,80 @@ fn concurrent_restore_processes_keep_both_map_updates() {
     assert!(first_status.success() && second_status.success());
     let state: Value = serde_json::from_slice(&fs::read(f.root.join("test-map.json")).unwrap()).unwrap();
     assert_eq!(state["panes"], json!({"keep":{"localId":"local-keep", "seq":0}}));
+}
+
+#[test]
+fn owner_refusal_quiesces_controls_and_owner_return_reconnects_without_a_poke() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new();
+    fs::remove_file(f.root.join("test.hidden")).unwrap();
+    let projection = f.root.join("hosts.toml");
+    fs::write(&projection, "[hosts.test]\ntarget = 'demo'\ndesired_state = 'running'\n").unwrap();
+    let bin = f.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let transport = bin.join("odx-connect");
+    fs::write(&transport, r#"#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+root = Path(os.environ['TEST_OWNER_ROOT'])
+with (root / 'calls').open('a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\n')
+assert len(sys.argv) == 3 and sys.argv[1] == 'demo', sys.argv
+if not (root / 'running').exists():
+    print('odx-connect: workspace demo desired state is stopped', file=sys.stderr)
+    sys.exit(2)
+if (root / 'offline').exists():
+    print('owner unavailable', file=sys.stderr)
+    sys.exit(1)
+command = sys.argv[2]
+if 'status --json' in command:
+    print(json.dumps({'server': {'running': True, 'version': '0.8.0', 'socket': '/tmp/herdr.sock'}}))
+elif command == 'command -v socat || true':
+    print('/usr/bin/socat')
+elif command.startswith('socat - UNIX-CONNECT:'):
+    request = json.loads(sys.stdin.readline())
+    result = {'snapshot': {'workspaces': [], 'tabs': [], 'panes': [], 'agents': []}} if request['method'] == 'session.snapshot' else {}
+    print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+    if request['method'] == 'events.subscribe':
+        while not (root / 'offline').exists():
+            time.sleep(0.02)
+else:
+    raise AssertionError(command)
+"#).unwrap();
+    fs::set_permissions(&transport, fs::Permissions::from_mode(0o755)).unwrap();
+    // Any accidental SSH launch is visible, including a detached master.
+    fs::write(bin.join("ssh"), "#!/bin/sh\necho forbidden >> \"$TEST_OWNER_ROOT/ssh-calls\"\nexit 99\n").unwrap();
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let child = f.command("daemon")
+        .env("TEST_OWNER_ROOT", &f.root)
+        .env("PATH", std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited))).unwrap())
+        .spawn().unwrap();
+    f.children.push(child);
+    let health = f.root.join("host-health/test.json");
+    wait(|| fs::read_to_string(&health).unwrap_or_default().contains("waiting for running projection"));
+    let stopped: Value = serde_json::from_str(&fs::read_to_string(&health).unwrap()).unwrap();
+    assert!(stopped.get("nextRetryUnix").is_none(), "a stopped workspace has no retry deadline");
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(fs::read_to_string(f.root.join("calls")).unwrap().lines().count(), 1,
+        "owner refusal is not retried, including the status retry");
+    fs::write(f.root.join("running"), "yes").unwrap();
+    fs::write(&projection, "[hosts.test]\ntarget = 'demo'\ndesired_state = 'running'\n\n").unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !fs::read_to_string(&health).unwrap_or_default().contains("connected and synced") {
+        assert!(Instant::now() < until, "health: {:?}; log: {:?}; calls: {:?}",
+            fs::read_to_string(&health), fs::read_to_string(f.root.join("daemon.log")), fs::read_to_string(f.root.join("calls")));
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(f.root.join("offline"), "offline").unwrap();
+    wait(|| fs::read_to_string(&health).unwrap_or_default().contains("disconnected"));
+    fs::remove_file(f.root.join("offline")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fs::read_to_string(&health).unwrap_or_default().contains("connected and synced") {
+        assert!(Instant::now() < deadline, "owner stream must reconnect without manual wake");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let calls = fs::read_to_string(f.root.join("calls")).unwrap();
+    assert!(calls.contains("status --json") && calls.contains("socat - UNIX-CONNECT:/tmp/herdr.sock"));
+    assert!(!f.root.join("ssh-calls").exists(), "no OpenSSH process is launched");
 }

@@ -6,7 +6,6 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::pane::ContainerArg;
-use crate::remote::SSH_COMMON_OPTS;
 use crate::util::{err, Result};
 
 const REMOTE_DIR: &str = ".cache/herdr-mirror/pastes";
@@ -22,14 +21,13 @@ pub enum Outcome {
 
 pub async fn clipboard_to_remote(
     ssh_target: &str,
-    ctl_path: Option<&str>,
     container: Option<&ContainerArg>,
 ) -> Outcome {
     let png = match read_clipboard_image().await {
         Some(b) if !b.is_empty() => b,
         _ => return Outcome::NoImage,
     };
-    match upload(&png, ssh_target, ctl_path, container).await {
+    match upload(&png, ssh_target, container).await {
         Ok(path) => Outcome::Pasted(path),
         Err(e) => Outcome::Failed(e.to_string()),
     }
@@ -80,10 +78,9 @@ fn parse_osascript_data(s: &str) -> Option<Vec<u8>> {
 async fn upload(
     png: &[u8],
     ssh_target: &str,
-    ctl_path: Option<&str>,
     container: Option<&ContainerArg>,
 ) -> Result<String> {
-    upload_named(png, Some("png"), ssh_target, ctl_path, container).await
+    upload_named(png, Some("png"), ssh_target, container).await
 }
 
 /// The name is generated, never taken from the source: a dropped file's own
@@ -94,7 +91,6 @@ async fn upload_named(
     png: &[u8],
     ext: Option<&str>,
     ssh_target: &str,
-    ctl_path: Option<&str>,
     container: Option<&ContainerArg>,
 ) -> Result<String> {
     let ext = ext
@@ -115,7 +111,7 @@ async fn upload_named(
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let cmd = format!("mkdir -p ~/{REMOTE_DIR} && cat > ~/{REMOTE_DIR}/{name} && echo \"$HOME\"");
-    let mut c = remote_command(&cmd, ssh_target, ctl_path, container).await?;
+    let mut c = remote_command(&cmd, ssh_target, container).await?;
     let mut child = c
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -143,7 +139,6 @@ async fn upload_named(
 async fn remote_command(
     cmd: &str,
     ssh_target: &str,
-    ctl_path: Option<&str>,
     container: Option<&ContainerArg>,
 ) -> Result<Command> {
     Ok(match container {
@@ -155,12 +150,7 @@ async fn remote_command(
             c
         }
         None => {
-            let mut c = Command::new("ssh");
-            if let Some(path) = ctl_path {
-                c.arg("-S").arg(path);
-            }
-            c.args(SSH_COMMON_OPTS).arg(ssh_target).arg(cmd);
-            c
+            crate::owner_transport::command(ssh_target, cmd)
         }
     })
 }
@@ -263,7 +253,6 @@ pub fn dropped_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
 async fn remote_has_all(
     paths: &[std::path::PathBuf],
     ssh_target: &str,
-    ctl_path: Option<&str>,
     container: Option<&ContainerArg>,
 ) -> Result<bool> {
     let quoted: Vec<String> = paths
@@ -274,7 +263,7 @@ async fn remote_has_all(
         "for p in {}; do [ -e \"$p\" ] && echo 1 || echo 0; done",
         quoted.join(" ")
     );
-    let mut c = remote_command(&cmd, ssh_target, ctl_path, container).await?;
+    let mut c = remote_command(&cmd, ssh_target, container).await?;
     let out = timeout(CLIPBOARD_TIMEOUT, c.stdin(Stdio::null()).output())
         .await
         .map_err(|_| err("remote existence check timed out"))??;
@@ -293,7 +282,6 @@ async fn remote_has_all(
 pub async fn files_to_remote(
     paths: &[std::path::PathBuf],
     ssh_target: &str,
-    ctl_path: Option<&str>,
     container: Option<&ContainerArg>,
 ) -> DropResult {
     // size-check everything before uploading anything, so a too-large file at
@@ -323,7 +311,7 @@ pub async fn files_to_remote(
         }
     }
 
-    match remote_has_all(paths, ssh_target, ctl_path, container).await {
+    match remote_has_all(paths, ssh_target, container).await {
         Ok(true) => {
             return DropResult { text: None, unchanged: true, error: None };
         }
@@ -345,7 +333,7 @@ pub async fn files_to_remote(
         // keep the extension: an agent on the other end usually decides how to
         // read a file from it
         let ext = path.extension().and_then(|e| e.to_str());
-        match upload_named(&bytes, ext, ssh_target, ctl_path, container).await {
+        match upload_named(&bytes, ext, ssh_target, container).await {
             Ok(p) => remote.push(p),
             Err(e) => failed.push(format!("{}: {e}", path.display())),
         }

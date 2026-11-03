@@ -411,6 +411,9 @@ pub struct HostHealth {
     /// when the next dial is due; absent while the host is connected
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_unix: Option<f64>,
+    /// No transport trials until the local workspace projection says running.
+    #[serde(default)]
+    pub waiting_for_running: bool,
 }
 
 pub(crate) fn host_health_dir(state_dir: &Path) -> PathBuf {
@@ -840,6 +843,7 @@ mod tests {
                 summary: "disconnected (ssh master to omnidev-greenroom-air failed: exit 255)"
                     .into(),
                 at_iso: "2026-09-09T11:42:42.000Z".into(),
+                waiting_for_running: false,
                 next_retry_unix: Some(1_000.5),
             },
         );
@@ -856,6 +860,7 @@ mod tests {
             &HostHealth {
                 summary: "connected and synced".into(),
                 at_iso: "2026-09-09T11:43:12.000Z".into(),
+                waiting_for_running: false,
                 next_retry_unix: None,
             },
         );
