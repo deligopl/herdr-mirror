@@ -10,7 +10,10 @@ use std::{
     },
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,14 +25,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
         // Short enough for the view's Unix input socket on macOS.
         let root = PathBuf::from(format!(
-            "/tmp/hmv620-{}-{}",
+            "/tmp/hmv620-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .subsec_nanos()
+                .subsec_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("daemon-config")).unwrap();
@@ -73,7 +78,11 @@ while IFS= read -r line; do
   esac
 done
 "#).unwrap();
-        fs::set_permissions(root.join("bin/odx-connect"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            root.join("bin/odx-connect"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let listener = UnixListener::bind(root.join("api.sock")).unwrap();
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -245,6 +254,63 @@ done
             libc::kill(pid, libc::SIGKILL);
         }
     }
+
+    // Run the actual remote wrapper and cleanup scripts. The relay can die
+    // independently of its guest-side controller, which releases slowly.
+    fn retain_guest_client(&self) {
+        fs::write(
+            self.root.join("bin/odx-connect"),
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HM_CALLS"
+case "$2" in
+  *"ps -o args="*) exec /bin/sh -c "$2" ;;
+  *"terminal session"*) ;;
+  *) exec /bin/sh ;;
+esac
+printf 'attach %s\n' "$$" >> "$HM_EVENTS"
+fifo="$HM_ROOT/stream-$$"
+mkfifo "$fifo"
+/bin/sh -c "$2" > "$fifo" &
+printf '%s\n' "$!" >> "$HM_ROOT/guest-pids"
+exec cat "$fifo"
+"#,
+        )
+        .unwrap();
+        fs::write(self.root.join("bin/herdr"), r#"#!/bin/sh
+if test -f "$HM_ROOT/controller"; then
+  echo 'terminal attach failed: terminal remote:p1 already has an attached client; retry with --takeover' >&2
+  printf 'refused\n' >> "$HM_EVENTS"
+  exit 1
+fi
+printf '%s\n' "$$" > "$HM_ROOT/controller"
+trap 'printf "releasing %s\n" "$$" >> "$HM_EVENTS"; sleep "$(cat "$HM_ROOT/release-delay" 2>/dev/null || echo 0.5)"; rm -f "$HM_ROOT/controller"; printf "released\n" >> "$HM_EVENTS"; exit 0' TERM
+if test -f "$HM_ROOT/attached-before"; then
+  printf '{"type":"terminal.frame","full":true,"width":80,"height":24,"bytes":"UkVBVFRBQ0hFRA=="}\n'
+else
+  touch "$HM_ROOT/attached-before"
+  printf '{"type":"terminal.frame","full":true,"width":80,"height":24,"bytes":"U1RSRUFNLVJFQURZ"}\n'
+fi
+# EOF on the old relay does not release the guest's controller.
+while :; do sleep 0.05; done
+"#).unwrap();
+        fs::set_permissions(
+            self.root.join("bin/herdr"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        // Model the guest process table alongside its terminal registry. Host
+        // process inspection is unavailable in the test sandbox.
+        fs::write(
+            self.root.join("bin/ps"),
+            r#"#!/bin/sh
+if test "$4" = "$(cat "$HM_ROOT/controller" 2>/dev/null)"; then
+  echo 'herdr terminal session control remote:p1'
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(self.root.join("bin/ps"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -255,6 +321,15 @@ impl Drop for Fixture {
         }
         for child in &mut self.children {
             let _ = child.wait();
+        }
+        for pid in self
+            .text("guest-pids")
+            .lines()
+            .filter_map(|p| p.parse::<i32>().ok())
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
         if thread::panicking() {
             eprintln!(
@@ -274,6 +349,71 @@ impl Drop for Fixture {
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn relay_loss_reclaims_our_retained_guest_client_without_an_attach_refusal() {
+    let mut f = Fixture::new();
+    f.retain_guest_client();
+    let tile = f.view();
+    wait(|| f.seen("STREAM-READY"));
+    let old_controller = f.text("controller");
+    f.clear_screen();
+    f.disconnect_transport();
+    assert_eq!(
+        f.text("controller"),
+        old_controller,
+        "guest still holds the old client"
+    );
+    wait(|| f.seen("REATTACHED"));
+    assert_ne!(f.text("controller"), old_controller);
+    assert!(
+        !f.text("events").contains("refused"),
+        "no refused attach during recovery"
+    );
+    assert!(!f.seen("already has an attached client"));
+    assert!(!f.text("calls").contains("--takeover"));
+    f.assert_live(tile);
+}
+
+#[test]
+fn a_guest_controller_owned_by_another_client_is_still_refused() {
+    let mut f = Fixture::new();
+    f.retain_guest_client();
+    fs::write(f.root.join("controller"), "another client").unwrap();
+    let tile = f.view();
+    wait(|| f.seen("already has an attached client"));
+    wait(|| f.attach_count() >= 2);
+    assert_eq!(f.text("controller"), "another client");
+    assert!(!f.seen("STREAM-READY"));
+    assert!(!f.text("calls").contains("--takeover"));
+    f.assert_live(tile);
+}
+
+#[test]
+fn a_slow_guest_release_keeps_its_owned_pid_until_cleanup_can_finish() {
+    let mut f = Fixture::new();
+    f.retain_guest_client();
+    fs::write(f.root.join("release-delay"), "2.5").unwrap();
+    let tile = f.view();
+    wait(|| f.seen("STREAM-READY"));
+    let old_controller = f.text("controller");
+    f.clear_screen();
+    f.disconnect_transport();
+    wait(|| f.seen("waiting for our previous terminal client to release"));
+    assert_eq!(
+        f.attach_count(),
+        1,
+        "no new attach while cleanup is unresolved"
+    );
+    assert_eq!(
+        f.text("remote-clients/fake_host_view--remote_p1.pid"),
+        old_controller.trim()
+    );
+    wait(|| f.seen("REATTACHED"));
+    assert!(!f.text("events").contains("refused"));
+    assert_ne!(f.text("controller"), old_controller);
+    f.assert_live(tile);
 }
 #[track_caller]
 fn wait(mut predicate: impl FnMut() -> bool) {

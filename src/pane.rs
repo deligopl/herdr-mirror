@@ -323,13 +323,30 @@ fn remote_session_script(args: &Args, mode: Mode, cols: usize, rows: usize) -> S
 /// carries `terminal session` is signalled. A recorded pid can be minutes or
 /// hours old, remote pids get reused, and the same host runs the herdr *server*
 /// — so an unguarded `kill` is how a cleanup turns into an outage. A remote
-/// without `ps` (a stripped container) falls back to the plain kill: there the
-/// pid was recorded by this process and the reuse window is the seconds since.
+/// without `ps` (a stripped container) falls back to checking pid liveness.
+/// Success means the client has exited, not merely that TERM was delivered:
+/// a relay can end well before the guest releases its terminal attachment.
 fn remote_kill_script(pid: i32) -> String {
     format!(
-        "p={pid}; if command -v ps >/dev/null 2>&1; then \
-case \"$(ps -o args= -p \"$p\" 2>/dev/null)\" in *\"terminal session\"*) kill -TERM \"$p\" ;; esac; \
-else kill -TERM \"$p\" 2>/dev/null || true; fi"
+        r#"p={pid}
+owned_client() {{
+    if command -v ps >/dev/null 2>&1; then
+        case "$(ps -o args= -p "$p" 2>/dev/null)" in
+            *"terminal session"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    else
+        kill -0 "$p" 2>/dev/null
+    fi
+}}
+owned_client || exit 0
+kill -TERM "$p" 2>/dev/null || {{ owned_client && exit 1; exit 0; }}
+n=0
+while owned_client; do
+    n=$((n + 1))
+    test "$n" -le 20 || exit 1
+    sleep 0.05
+done"#
     )
 }
 
@@ -1629,6 +1646,10 @@ impl App {
         // a reconnect ladder against a half-broken transport from leaving one
         // more remote client per rung.
         self.reap_remote_clients().await;
+        if !self.pending_remote_kills.is_empty() {
+            self.schedule_reconnect(m, "waiting for our previous terminal client to release");
+            return;
+        }
         // Cleanup awaits transport: suspend/pause may have arrived meanwhile.
         if let Some(reason) = self.view_wait_reason() {
             self.disconnected_reason = Some(reason.into());
@@ -3943,8 +3964,8 @@ exec /opt/herdr --session 'default' terminal session control 'w1:p3' --cols 100 
         assert!(script.contains("ps -o args= -p"));
         assert!(script.contains(r#"*"terminal session"*"#));
         assert!(script.contains("kill -TERM"));
-        // no unguarded kill except on a host with no ps at all
-        assert_eq!(script.matches("kill -TERM").count(), 2);
+        // The signal is guarded, and cleanup waits for the client to exit.
+        assert_eq!(script.matches("kill -TERM").count(), 1);
         assert!(script.contains("command -v ps"));
     }
 
